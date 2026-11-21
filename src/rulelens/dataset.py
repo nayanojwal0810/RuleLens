@@ -11,6 +11,7 @@ Produces:
 from __future__ import annotations
 
 import csv
+import datetime
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
+import pymupdf
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -1066,6 +1068,40 @@ DEPARTMENT_RULES_MAPPING: Dict[str, str] = {
     "Information Security": "security_rules.csv",
 }
 
+# Substrings in policy clause texts supporting specific rule outcomes
+OUTCOME_TEXT_SUPPORT: Dict[str, Tuple[str, ...]] = {
+    "standard_approval": ("standard approval",),
+    "additional_approval": ("additional approval",),
+    "standard_booking": ("advance", "fares"),
+    "expedited_approval_required": ("expedited approval",),
+    "vp_approval": ("Vice President",),
+    "cfo_approval": ("Chief Financial Officer",),
+    "eligible_reimbursement": ("regular reimbursement",),
+    "requires_late_exception": ("late submission",),
+    "no_receipt_required": ("do not require an itemized",),
+    "itemized_receipt_required": ("itemized tax invoice",),
+    "within_standard_card_limit": ("standard monthly spending limit",),
+    "card_limit_escalation_required": ("card limit escalation",),
+    "self_certification": ("self-certification",),
+    "medical_certificate_required": ("medical certificate",),
+    "remote_setup_compliant": ("remote work",),
+    "remediation_required": ("remediation",),
+    "standard_tuition_grant": ("standard reporting manager approval",),
+    "committee_review_required": ("Learning Committee",),
+    "single_quote_permitted": ("single qualified vendor quote",),
+    "three_competitive_quotes_required": ("three independent competitive bids",),
+    "department_lead_signoff": ("Department Functional Lead",),
+    "legal_and_procurement_signoff": ("Legal Counsel and Procurement",),
+    "director_emergency_approval": ("Director emergency approval",),
+    "board_procurement_committee": ("Board Procurement Committee",),
+    "aes_256_mandatory": ("AES-256",),
+    "hsm_tokenized_encryption": ("hardware security module", "tokenized encryption"),
+    "access_recertification_compliant": ("recertification review",),
+    "automatic_account_suspension": ("automatic account suspension",),
+    "sla_met": ("within 1 hour",),
+    "sla_breach_escalation": ("breach escalation",),
+}
+
 
 # ---------------------------------------------------------------------------
 # Deterministic PDF Canvas & Generation
@@ -1353,13 +1389,30 @@ def validate_dataset(root_dir: Path | str | None = None) -> bool:
     roles_path = data_dir / "roles.json"
     manifest_path = data_dir / "manifest.json"
 
-    # Check existence
+    # Check existence of source components
     if not policies_dir.exists() or not rules_dir.exists():
         raise ValueError("Data directories missing.")
     if not roles_path.exists() or not manifest_path.exists():
         raise ValueError("roles.json or manifest.json missing.")
 
-    # 1. Validate PDFs
+    # Helper: Validate ISO date string (YYYY-MM-DD)
+    def _validate_iso_date(d_str: str, ctx: str) -> None:
+        try:
+            datetime.date.fromisoformat(d_str)
+        except Exception as err:
+            raise ValueError(f"Invalid ISO date '{d_str}' in {ctx}: {err}")
+
+    # Check ISO dates and no duplicate clause IDs on canonical DOCUMENTS
+    for doc in DOCUMENTS:
+        _validate_iso_date(doc.effective_from, f"document {doc.doc_id} effective_from")
+        _validate_iso_date(doc.effective_to, f"document {doc.doc_id} effective_to")
+        if doc.effective_from > doc.effective_to:
+            raise ValueError(f"Document {doc.doc_id} effective_from > effective_to")
+        clause_ids = [c.clause_id for c in doc.clauses]
+        if len(clause_ids) != len(set(clause_ids)):
+            raise ValueError(f"Duplicate logical clause IDs found inside document {doc.doc_id}: {clause_ids}")
+
+    # 1. Validate PDFs (count, filenames, non-empty, and text extraction via PyMuPDF)
     pdf_files = list(policies_dir.glob("*.pdf"))
     if len(pdf_files) != 20:
         raise ValueError(f"Expected exactly 20 PDFs, found {len(pdf_files)}")
@@ -1369,75 +1422,199 @@ def validate_dataset(root_dir: Path | str | None = None) -> bool:
     if expected_filenames != found_filenames:
         raise ValueError(f"Filename mismatch: {expected_filenames ^ found_filenames}")
 
-    # Check non-empty
-    for p in pdf_files:
-        if p.stat().st_size == 0:
-            raise ValueError(f"PDF file is empty: {p.name}")
+    doc_map = {d.doc_id: d for d in DOCUMENTS}
 
-    # 2. Validate CSV Tables
+    for doc in DOCUMENTS:
+        pdf_path = policies_dir / doc.filename
+        if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+            raise ValueError(f"PDF missing or empty: {doc.filename}")
+
+        try:
+            reader = pymupdf.open(pdf_path)
+            if len(reader) < 1:
+                raise ValueError(f"PDF has no pages: {doc.filename}")
+            full_text = " ".join(" ".join(page.get_text().split()) for page in reader)
+            reader.close()
+        except Exception as e:
+            raise ValueError(f"Failed to open or extract text from PDF {doc.filename}: {e}")
+
+        # Confirm company name and document ID in extracted text
+        if COMPANY_NAME not in full_text:
+            raise ValueError(f"Company name '{COMPANY_NAME}' missing in PDF text: {doc.filename}")
+        if doc.doc_id not in full_text:
+            raise ValueError(f"Document ID '{doc.doc_id}' missing in PDF text: {doc.filename}")
+
+        # Confirm each clause ID and full statement in extracted text
+        for clause in doc.clauses:
+            if clause.clause_id not in full_text:
+                raise ValueError(f"Clause ID '{clause.clause_id}' missing in PDF text: {doc.filename}")
+            norm_clause_text = " ".join(clause.text.split())
+            if norm_clause_text not in full_text:
+                raise ValueError(
+                    f"Full statement for clause '{clause.clause_id}' missing in PDF text: {doc.filename}"
+                )
+
+    # 2. Validate CSV Tables (count, headers, exact match with canonical RULES)
     csv_files = list(rules_dir.glob("*.csv"))
-    if len(csv_files) != 5:
-        raise ValueError(f"Expected exactly 5 CSV files, found {len(csv_files)}")
+    expected_csvs = set(DEPARTMENT_RULES_MAPPING.values())
+    found_csvs = {f.name for f in csv_files}
+    if found_csvs != expected_csvs:
+        raise ValueError(f"CSV files mismatch: expected {expected_csvs}, got {found_csvs}")
 
-    all_csv_rules: List[Dict[str, str]] = []
-    for csv_file in csv_files:
-        with open(csv_file, mode="r", encoding="utf-8") as f:
+    all_csv_rules_by_id: Dict[str, Dict[str, str]] = {}
+    for dept, filename in DEPARTMENT_RULES_MAPPING.items():
+        csv_path = rules_dir / filename
+        with open(csv_path, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames != list(CSV_FIELDNAMES):
-                raise ValueError(f"CSV header mismatch in {csv_file.name}: {reader.fieldnames}")
+                raise ValueError(f"CSV header mismatch in {filename}: {reader.fieldnames}")
             rows = list(reader)
             if len(rows) < 4:
-                raise ValueError(f"Table {csv_file.name} has fewer than 4 rules ({len(rows)})")
-            all_csv_rules.extend(rows)
+                raise ValueError(f"Table {filename} has fewer than 4 rules ({len(rows)})")
+            for row in rows:
+                rid = row["rule_id"]
+                if rid in all_csv_rules_by_id:
+                    raise ValueError(f"Duplicate rule_id across CSV tables: {rid}")
+                all_csv_rules_by_id[rid] = row
 
-    # 3. Validate Roles
+    if len(all_csv_rules_by_id) != len(RULES):
+        raise ValueError(f"Rule count mismatch: expected {len(RULES)}, got {len(all_csv_rules_by_id)}")
+
+    canonical_rules_by_id = {r.rule_id: r for r in RULES}
+    for rid, canon_rule in canonical_rules_by_id.items():
+        if rid not in all_csv_rules_by_id:
+            raise ValueError(f"Canonical rule {rid} missing from CSV tables")
+        csv_row = all_csv_rules_by_id[rid]
+
+        # Verify exact field values against canonical rule
+        for field in CSV_FIELDNAMES:
+            expected_val = getattr(canon_rule, field)
+            actual_val = csv_row[field]
+            if actual_val != expected_val:
+                raise ValueError(
+                    f"Rule {rid} field '{field}' mismatch: expected '{expected_val}', got '{actual_val}'"
+                )
+
+        _validate_iso_date(csv_row["effective_from"], f"rule {rid} effective_from")
+        _validate_iso_date(csv_row["effective_to"], f"rule {rid} effective_to")
+        if csv_row["effective_from"] > csv_row["effective_to"]:
+            raise ValueError(f"Rule {rid} effective_from > effective_to")
+
+    # 3. Validate Rule Textual Support in Clauses (Numerical and Categorical)
+    for rule in RULES:
+        doc = doc_map[rule.doc_id]
+        matching_clause = next((c for c in doc.clauses if c.clause_id == rule.clause_id), None)
+        if matching_clause is None:
+            raise ValueError(f"Rule {rule.rule_id} references nonexistent clause {rule.clause_id} in {doc.doc_id}")
+
+        clause_text = matching_clause.text
+        val = rule.threshold_value
+
+        # Check numerical or categorical threshold representation in clause
+        try:
+            int_val = int(val)
+            comma_val = f"{int_val:,}"
+            has_val = (val in clause_text) or (comma_val in clause_text)
+        except ValueError:
+            has_val = val in clause_text
+
+        if not has_val:
+            raise ValueError(
+                f"Rule {rule.rule_id} threshold value '{val}' not found in clause {rule.clause_id} text"
+            )
+
+        # Check outcome support in clause text
+        expected_phrases = OUTCOME_TEXT_SUPPORT.get(rule.outcome)
+        if expected_phrases:
+            if not any(phrase.lower() in clause_text.lower() for phrase in expected_phrases):
+                raise ValueError(
+                    f"Rule {rule.rule_id} outcome '{rule.outcome}' not supported in clause {rule.clause_id} text"
+                )
+
+    # 4. Check for Conflicting / Overlapping Conditions in Same Document, Field, and Effective Period
+    for doc in DOCUMENTS:
+        doc_rules = [r for r in RULES if r.doc_id == doc.doc_id]
+        by_field: Dict[str, List[Rule]] = {}
+        for r in doc_rules:
+            by_field.setdefault(r.condition_field, []).append(r)
+
+        for field, field_rules in by_field.items():
+            for i in range(len(field_rules)):
+                for j in range(i + 1, len(field_rules)):
+                    r1 = field_rules[i]
+                    r2 = field_rules[j]
+                    # Check active date interval overlap
+                    overlap = max(r1.effective_from, r2.effective_from) <= min(r1.effective_to, r2.effective_to)
+                    if overlap:
+                        if r1.operator == r2.operator and r1.threshold_value == r2.threshold_value:
+                            raise ValueError(
+                                f"Conflicting identical conditions in {doc.doc_id} for field '{field}': "
+                                f"{r1.rule_id} and {r2.rule_id}"
+                            )
+
+    # 5. Validate Roles (exact match against canonical permissions and document_count)
     with open(roles_path, mode="r", encoding="utf-8") as f:
         roles_json = json.load(f)
-    role_keys = set(roles_json.get("roles", {}).keys())
-    if role_keys != set(ROLES):
-        raise ValueError(f"Role mismatch in roles.json: expected {set(ROLES)}, got {role_keys}")
 
-    # Verify meaningful restrictions
-    employee_allowed = set(roles_json["roles"]["employee"]["allowed_documents"])
-    if "DOC-TRV-004" in employee_allowed or "DOC-FIN-003" in employee_allowed or "DOC-SEC-004" in employee_allowed:
-        raise ValueError("Employee role has unauthorized access to restricted documents.")
-    auditor_allowed = set(roles_json["roles"]["auditor"]["allowed_documents"])
-    if "DOC-PPO-004" in auditor_allowed:
-        raise ValueError("Auditor role must have explicit, restricted access (DOC-PPO-004 forbidden).")
+    if set(roles_json.get("roles", {}).keys()) != set(ROLES):
+        raise ValueError(
+            f"Roles mismatch in roles.json: expected {set(ROLES)}, got {set(roles_json.get('roles', {}).keys())}"
+        )
 
-    # 4. Validate Manifest
+    for role in ROLES:
+        role_data = roles_json["roles"][role]
+        canonical_allowed = sorted([d.doc_id for d in DOCUMENTS if role in d.permitted_roles])
+        actual_allowed = sorted(role_data.get("allowed_documents", []))
+        if actual_allowed != canonical_allowed:
+            raise ValueError(
+                f"Role '{role}' allowed_documents mismatch: expected {canonical_allowed}, got {actual_allowed}"
+            )
+        doc_count = role_data.get("document_count")
+        if doc_count != len(canonical_allowed):
+            raise ValueError(
+                f"Role '{role}' document_count ({doc_count}) != actual allowed count ({len(canonical_allowed)})"
+            )
+
+    # 6. Validate Manifest Metadata against Canonical Specification
     with open(manifest_path, mode="r", encoding="utf-8") as f:
         manifest_json = json.load(f)
-    if manifest_json.get("document_count") != 20:
-        raise ValueError("Manifest document_count mismatch.")
+
+    if manifest_json.get("company") != COMPANY_NAME:
+        raise ValueError("Manifest company mismatch.")
+    if manifest_json.get("document_count") != len(DOCUMENTS):
+        raise ValueError(f"Manifest document_count mismatch: expected {len(DOCUMENTS)}, got {manifest_json.get('document_count')}")
     if manifest_json.get("rule_count") != len(RULES):
-        raise ValueError("Manifest rule_count mismatch.")
+        raise ValueError(f"Manifest rule_count mismatch: expected {len(RULES)}, got {manifest_json.get('rule_count')}")
+    if manifest_json.get("roles") != list(ROLES):
+        raise ValueError(f"Manifest roles mismatch: expected {list(ROLES)}, got {manifest_json.get('roles')}")
 
-    # 5. ID Uniqueness
-    doc_ids = [d.doc_id for d in DOCUMENTS]
-    if len(doc_ids) != len(set(doc_ids)):
-        raise ValueError("Duplicate document IDs found.")
+    manifest_docs = {d["doc_id"]: d for d in manifest_json.get("documents", [])}
+    if len(manifest_docs) != len(DOCUMENTS):
+        raise ValueError("Manifest documents count mismatch.")
 
-    rule_ids = [r["rule_id"] for r in all_csv_rules]
-    if len(rule_ids) != len(set(rule_ids)):
-        raise ValueError("Duplicate rule IDs found.")
-
-    # 6. Clause and Rule cross-referencing
-    doc_map = {d.doc_id: d for d in DOCUMENTS}
-    for rule in all_csv_rules:
-        if rule["doc_id"] not in doc_map:
-            raise ValueError(f"Rule references nonexistent doc_id: {rule['doc_id']}")
-        doc = doc_map[rule["doc_id"]]
-        clause_ids = {c.clause_id for c in doc.clauses}
-        if rule["clause_id"] not in clause_ids:
-            raise ValueError(
-                f"Rule {rule['rule_id']} references nonexistent clause {rule['clause_id']} in {rule['doc_id']}"
-            )
-        # Check date intervals
-        if rule["effective_from"] > rule["effective_to"]:
-            raise ValueError(f"Invalid date interval in rule {rule['rule_id']}")
-        if rule["effective_from"] < doc.effective_from or rule["effective_to"] > doc.effective_to:
-            raise ValueError(f"Rule {rule['rule_id']} dates out of document bounds")
+    for doc in DOCUMENTS:
+        if doc.doc_id not in manifest_docs:
+            raise ValueError(f"Document {doc.doc_id} missing from manifest")
+        m_doc = manifest_docs[doc.doc_id]
+        if m_doc.get("filename") != doc.filename:
+            raise ValueError(f"Manifest filename mismatch for {doc.doc_id}")
+        if m_doc.get("title") != doc.title:
+            raise ValueError(f"Manifest title mismatch for {doc.doc_id}")
+        if m_doc.get("department") != doc.department:
+            raise ValueError(f"Manifest department mismatch for {doc.doc_id}")
+        if m_doc.get("version") != doc.version:
+            raise ValueError(f"Manifest version mismatch for {doc.doc_id}")
+        if m_doc.get("effective_from") != doc.effective_from:
+            raise ValueError(f"Manifest effective_from mismatch for {doc.doc_id}")
+        if m_doc.get("effective_to") != doc.effective_to:
+            raise ValueError(f"Manifest effective_to mismatch for {doc.doc_id}")
+        if sorted(m_doc.get("permitted_roles", [])) != sorted(doc.permitted_roles):
+            raise ValueError(f"Manifest permitted_roles mismatch for {doc.doc_id}")
+        if m_doc.get("clause_ids") != [c.clause_id for c in doc.clauses]:
+            raise ValueError(f"Manifest clause_ids mismatch for {doc.doc_id}")
+        expected_rule_ids = sorted([r.rule_id for r in RULES if r.doc_id == doc.doc_id])
+        if sorted(m_doc.get("related_rule_ids", [])) != expected_rule_ids:
+            raise ValueError(f"Manifest related_rule_ids mismatch for {doc.doc_id}")
 
     # 7. Travel v1 vs v2 Checks
     v1 = doc_map["DOC-TRV-001"]
@@ -1445,15 +1622,13 @@ def validate_dataset(root_dir: Path | str | None = None) -> bool:
     if v1.effective_to >= v2.effective_from:
         raise ValueError("Travel Policy v1 and v2 active dates overlap.")
 
-    # Check stable clause IDs between v1 and v2
     v1_clauses = {c.clause_id for c in v1.clauses}
     v2_clauses = {c.clause_id for c in v2.clauses}
     if v1_clauses != v2_clauses:
         raise ValueError("Travel Policy v1 and v2 must retain identical logical clause IDs.")
 
-    # Threshold checks
-    v1_rules = {r["rule_id"]: r for r in all_csv_rules if r["doc_id"] == "DOC-TRV-001" and r["clause_id"] == "TRV-C04"}
-    v2_rules = {r["rule_id"]: r for r in all_csv_rules if r["doc_id"] == "DOC-TRV-002" and r["clause_id"] == "TRV-C04"}
+    v1_rules = {r["rule_id"]: r for r in all_csv_rules_by_id.values() if r["doc_id"] == "DOC-TRV-001" and r["clause_id"] == "TRV-C04"}
+    v2_rules = {r["rule_id"]: r for r in all_csv_rules_by_id.values() if r["doc_id"] == "DOC-TRV-002" and r["clause_id"] == "TRV-C04"}
 
     v1_std = [r for r in v1_rules.values() if r["outcome"] == "standard_approval"]
     v2_std = [r for r in v2_rules.values() if r["outcome"] == "standard_approval"]
