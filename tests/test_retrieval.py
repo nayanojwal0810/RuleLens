@@ -2,12 +2,14 @@
 
 Verifies:
 - Tokenization (lowercase, number retention, no stopword removal, empty queries).
-- BM25 indexing, exact keyword search, numerical queries, tie-breaking.
-- BGE embedding interface contract (CPU, dim 384, normalized, offline fake/mock).
-- Reciprocal Rank Fusion (pure function, manual formula checks, deduplication, ties).
+- BM25 indexing, exact keyword search, numerical queries, tie-breaking, safe empty corpus handling.
+- BGE embedding interface contract (CPU, dim 384, normalized, finite values, blank query rejection).
+- Reciprocal Rank Fusion (pure function, manual formula checks, deduplication, ties, rank/limit validation).
 - Role-based permissions across all 6 roles, explicit role restrictions.
-- Date boundary filtering and historical version availability.
-- Citation metadata preservation.
+- Date boundary filtering, historical version availability, explicit empty date rejection.
+- Security enforcement: exclusion of real unauthorized restricted chunk (DOC-TRV-004_TRV-E01) for employee,
+  acceptance for manager, and exclusion of expired dense candidate versions.
+- Full citation metadata preservation including department.
 - Strict offline execution with blocked network sockets.
 """
 
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import shutil
 import socket
 from pathlib import Path
 from typing import Any, Dict, List
@@ -65,7 +68,7 @@ def sample_chunks(repo_root: Path) -> List[Dict[str, Any]]:
 
 
 # ==============================================================================
-# 1. Corpus Loading & Fingerprint Verification
+# 1. Corpus Loading & Integrity Verification
 # ==============================================================================
 
 
@@ -79,6 +82,7 @@ def test_load_validated_corpus_loads_all_64_chunks(repo_root: Path):
         assert "doc_id" in chunk
         assert "clause_id" in chunk
         assert "title" in chunk
+        assert "department" in chunk
         assert "version" in chunk
         assert "source_file" in chunk
         assert "source_page" in chunk
@@ -88,17 +92,61 @@ def test_load_validated_corpus_loads_all_64_chunks(repo_root: Path):
 
 def test_load_validated_corpus_rejects_corrupted_fingerprint(tmp_path: Path, repo_root: Path):
     """Corpus loader must raise ValueError if corpus_manifest.json fingerprint does not match."""
-    import shutil
+    shutil.copytree(repo_root / "data" / "source", tmp_path / "data" / "source")
+    shutil.copytree(repo_root / "data" / "processed", tmp_path / "data" / "processed")
 
-    processed_dir = tmp_path / "data" / "processed"
-    shutil.copytree(repo_root / "data" / "processed", processed_dir)
-
-    manifest_path = processed_dir / "corpus_manifest.json"
+    manifest_path = tmp_path / "data" / "processed" / "corpus_manifest.json"
     content = manifest_path.read_text(encoding="utf-8")
     corrupted = content.replace('"processed_fingerprint": "', '"processed_fingerprint": "corrupted_')
     manifest_path.write_text(corrupted, encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Corpus fingerprint mismatch"):
+    with pytest.raises(ValueError):
+        load_validated_corpus(tmp_path)
+
+
+def test_load_validated_corpus_rejects_tampered_corpus_despite_recomputed_fingerprint(tmp_path: Path, repo_root: Path):
+    """Corpus loader must call Stage C validate_corpus and reject tampered content even with recomputed fingerprints."""
+    import json
+    from rulelens.ingestion import calculate_processed_fingerprint, calculate_source_fingerprint
+
+    shutil.copytree(repo_root / "data" / "source", tmp_path / "data" / "source")
+    shutil.copytree(repo_root / "data" / "processed", tmp_path / "data" / "processed")
+
+    chunks_path = tmp_path / "data" / "processed" / "chunks.jsonl"
+    rules_path = tmp_path / "data" / "processed" / "rules.jsonl"
+    manifest_path = tmp_path / "data" / "processed" / "corpus_manifest.json"
+
+    # Tamper with chunk text
+    chunks = []
+    with open(chunks_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                chunks.append(json.loads(line))
+
+    chunks[0]["text"] = chunks[0]["text"] + " TAMPERED POLICY CONTENT"
+
+    with open(chunks_path, "w", encoding="utf-8") as f:
+        for c in chunks:
+            f.write(json.dumps(c, sort_keys=True) + "\n")
+
+    rules = []
+    with open(rules_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rules.append(json.loads(line))
+
+    # Recompute fingerprints so simple fingerprint checks would naively pass
+    new_fp = calculate_processed_fingerprint(chunks, rules)
+    source_fp = calculate_source_fingerprint(tmp_path / "data" / "source")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest["processed_fingerprint"] = new_fp
+    manifest["source_fingerprint"] = source_fp
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+
+    # validate_corpus() must detect mismatch against PDF ground truth and reject
+    with pytest.raises(ValueError):
         load_validated_corpus(tmp_path)
 
 
@@ -108,8 +156,8 @@ def test_load_validated_corpus_rejects_corrupted_fingerprint(tmp_path: Path, rep
 
 
 def test_tokenize_lowercase_and_retains_numbers():
-    """Tokenize must lowercase terms, retain numbers, and split on word boundaries."""
-    tokens = tokenize("Asterline Travel Policy v1 limits hotel to 250 USD and flight to 40000 USD.")
+    """Tokenize must lowercase terms, retain numbers, and normalize comma-separated numbers."""
+    tokens = tokenize("Asterline Travel Policy v1 limits hotel to 250 USD and flight to 40,000 USD.")
     assert "asterline" in tokens
     assert "travel" in tokens
     assert "policy" in tokens
@@ -134,6 +182,20 @@ def test_bm25_empty_query_returns_no_results(sample_chunks: List[Dict[str, Any]]
     assert index.search("\t\n") == []
 
 
+def test_bm25_empty_corpus_handled_safely():
+    """BM25Index over an empty corpus must handle searches safely without division by zero."""
+    empty_index = BM25Index([])
+    assert empty_index.search("anything") == []
+    assert empty_index.search("") == []
+
+
+def test_bm25_rejects_negative_top_k(sample_chunks: List[Dict[str, Any]]):
+    """BM25Index must raise ValueError on negative top_k."""
+    index = BM25Index(sample_chunks)
+    with pytest.raises(ValueError, match="Invalid top_k"):
+        index.search("flight", top_k=-1)
+
+
 def test_bm25_exact_keyword_search(sample_chunks: List[Dict[str, Any]]):
     """BM25 search must find relevant chunks by exact keyword."""
     index = BM25Index(sample_chunks)
@@ -141,7 +203,6 @@ def test_bm25_exact_keyword_search(sample_chunks: List[Dict[str, Any]]):
     assert len(results) > 0
     top_result = results[0]
     assert top_result.score > 0.0
-    # Domestic air travel is in Travel Policy TRV-C02
     assert "TRV-C02" in top_result.chunk_id
     assert "economy" in top_result.chunk["text"].lower()
 
@@ -170,6 +231,7 @@ def test_bm25_deterministic_tie_breaking():
             "doc_id": "D1",
             "clause_id": "C1",
             "title": "T1",
+            "department": "Travel",
             "version": "1.0",
             "source_file": "f1.pdf",
             "source_page": 1,
@@ -183,6 +245,7 @@ def test_bm25_deterministic_tie_breaking():
             "doc_id": "D2",
             "clause_id": "C2",
             "title": "T2",
+            "department": "Travel",
             "version": "1.0",
             "source_file": "f2.pdf",
             "source_page": 1,
@@ -196,6 +259,7 @@ def test_bm25_deterministic_tie_breaking():
             "doc_id": "D3",
             "clause_id": "C3",
             "title": "T3",
+            "department": "Travel",
             "version": "1.0",
             "source_file": "f3.pdf",
             "source_page": 1,
@@ -228,6 +292,7 @@ def test_rrf_pure_calculation_with_known_ranks():
         "doc_id": "D1",
         "clause_id": "C1",
         "title": "T1",
+        "department": "Travel",
         "version": "1.0",
         "source_file": "f.pdf",
         "source_page": 1,
@@ -240,6 +305,7 @@ def test_rrf_pure_calculation_with_known_ranks():
         "doc_id": "D2",
         "clause_id": "C2",
         "title": "T2",
+        "department": "Travel",
         "version": "1.0",
         "source_file": "f.pdf",
         "source_page": 1,
@@ -252,6 +318,7 @@ def test_rrf_pure_calculation_with_known_ranks():
         "doc_id": "D3",
         "clause_id": "C3",
         "title": "T3",
+        "department": "Travel",
         "version": "1.0",
         "source_file": "f.pdf",
         "source_page": 1,
@@ -274,6 +341,7 @@ def test_rrf_pure_calculation_with_known_ranks():
     results = reciprocal_rank_fusion(
         bm25_candidates=bm25_cands,
         dense_candidates=dense_cands,
+        chunks_lookup={"C-A": chunk_a, "C-B": chunk_b, "C-C": chunk_c},
         k=60,
         limit=4,
     )
@@ -299,27 +367,145 @@ def test_rrf_pure_calculation_with_known_ranks():
     assert results[2].dense_rank is None
 
 
-def test_rrf_duplicate_elimination_and_limit():
-    """RRF must deduplicate chunks and return at most the requested limit."""
+def test_rrf_same_modality_repeated_candidate_cannot_inflate_score():
+    """A candidate duplicated within the same retrieval method must be counted once and not inflate score."""
     chunk = {
         "chunk_id": "C-1",
         "text": "Text 1",
         "doc_id": "D1",
         "clause_id": "C1",
         "title": "T1",
+        "department": "Finance",
         "version": "1.0",
         "source_file": "f.pdf",
         "source_page": 1,
         "effective_from": "2026-01-01",
         "allowed_roles": ["employee"],
     }
-    cands1 = [Candidate(chunk_id="C-1", score=5.0, rank=1, chunk=chunk)]
-    cands2 = [Candidate(chunk_id="C-1", score=0.8, rank=1, chunk=chunk)]
+    # Duplicate C-1 in BM25 candidates list with different ranks
+    cands_bm25 = [
+        Candidate(chunk_id="C-1", score=10.0, rank=1, chunk=chunk),
+        Candidate(chunk_id="C-1", score=8.0, rank=2, chunk=chunk),
+    ]
 
-    results = reciprocal_rank_fusion(cands1, cands2, limit=4)
+    results = reciprocal_rank_fusion(
+        bm25_candidates=cands_bm25,
+        dense_candidates=[],
+        chunks_lookup={"C-1": chunk},
+        k=60,
+        limit=4,
+    )
     assert len(results) == 1
-    assert results[0].chunk_id == "C-1"
-    assert math.isclose(results[0].rrf_score, 2 / 61, rel_tol=1e-9)
+    # Must only receive 1/(60+1) = 1/61, NOT (1/61 + 1/62)
+    assert math.isclose(results[0].rrf_score, 1 / 61, rel_tol=1e-9)
+    assert results[0].bm25_rank == 1
+
+
+def test_rrf_rejects_invalid_ranks_and_duplicate_ranks_for_different_chunks():
+    """RRF must reject ranks < 1 and duplicate ranks assigned to different chunks within a method."""
+    chunk1 = {
+        "chunk_id": "C-1",
+        "text": "1",
+        "doc_id": "D",
+        "clause_id": "C1",
+        "title": "T",
+        "department": "Finance",
+        "version": "1",
+        "source_file": "f.pdf",
+        "source_page": 1,
+        "effective_from": "2026-01-01",
+        "allowed_roles": ["employee"],
+    }
+    chunk2 = {
+        "chunk_id": "C-2",
+        "text": "2",
+        "doc_id": "D",
+        "clause_id": "C2",
+        "title": "T",
+        "department": "Finance",
+        "version": "1",
+        "source_file": "f.pdf",
+        "source_page": 1,
+        "effective_from": "2026-01-01",
+        "allowed_roles": ["employee"],
+    }
+    lookup = {"C-1": chunk1, "C-2": chunk2}
+
+    # Rank 0 is invalid
+    with pytest.raises(ValueError, match="Ranks must be >= 1"):
+        reciprocal_rank_fusion(
+            [Candidate(chunk_id="C-1", score=5.0, rank=0)],
+            [],
+            chunks_lookup=lookup,
+        )
+
+    # Rank -1 is invalid
+    with pytest.raises(ValueError, match="Ranks must be >= 1"):
+        reciprocal_rank_fusion(
+            [Candidate(chunk_id="C-1", score=5.0, rank=-1)],
+            [],
+            chunks_lookup=lookup,
+        )
+
+    # Duplicate rank 1 assigned to different chunks within BM25
+    with pytest.raises(ValueError, match="Duplicate rank 1 assigned to different chunks"):
+        reciprocal_rank_fusion(
+            [
+                Candidate(chunk_id="C-1", score=5.0, rank=1),
+                Candidate(chunk_id="C-2", score=4.0, rank=1),
+            ],
+            [],
+            chunks_lookup=lookup,
+        )
+
+
+def test_rrf_rejects_invalid_k_limit_and_candidate_depth():
+    """RRF must reject k <= 0, negative limit, and candidate_depth <= 0."""
+    with pytest.raises(ValueError, match="Invalid RRF constant"):
+        reciprocal_rank_fusion([], [], k=0)
+
+    with pytest.raises(ValueError, match="Invalid limit"):
+        reciprocal_rank_fusion([], [], limit=-1)
+
+    with pytest.raises(ValueError, match="Invalid candidate_depth"):
+        reciprocal_rank_fusion([], [], candidate_depth=0)
+
+
+def test_rrf_never_trusts_arbitrary_candidate_metadata_over_lookup():
+    """RRF must strictly use canonical chunks_lookup and ignore arbitrary candidate metadata."""
+    canonical_chunk = {
+        "chunk_id": "C-TRUST",
+        "text": "Canonical Text",
+        "doc_id": "DOC-AUTH",
+        "clause_id": "AUTH-01",
+        "title": "Canonical Authoritative Title",
+        "department": "Security",
+        "version": "1.0",
+        "source_file": "auth.pdf",
+        "source_page": 1,
+        "effective_from": "2026-01-01",
+        "allowed_roles": ["security"],
+    }
+
+    tampered_candidate_metadata = {
+        "chunk_id": "C-TRUST",
+        "score": 0.99,
+        "rank": 1,
+        "chunk": {
+            "chunk_id": "C-TRUST",
+            "title": "Spoofed Fake Title",
+            "department": "Fake Department",
+        },
+    }
+
+    results = reciprocal_rank_fusion(
+        bm25_candidates=[],
+        dense_candidates=[tampered_candidate_metadata],
+        chunks_lookup={"C-TRUST": canonical_chunk},
+    )
+    assert len(results) == 1
+    assert results[0].title == "Canonical Authoritative Title"
+    assert results[0].department == "Security"
 
 
 def test_rrf_single_modality_bm25_only_and_dense_only():
@@ -330,6 +516,7 @@ def test_rrf_single_modality_bm25_only_and_dense_only():
         "doc_id": "D1",
         "clause_id": "C1",
         "title": "T1",
+        "department": "Finance",
         "version": "1.0",
         "source_file": "f.pdf",
         "source_page": 1,
@@ -338,13 +525,17 @@ def test_rrf_single_modality_bm25_only_and_dense_only():
     }
     cand = Candidate(chunk_id="C-1", score=4.5, rank=1, chunk=chunk)
 
-    res_bm25_only = reciprocal_rank_fusion(bm25_candidates=[cand], dense_candidates=[], limit=4)
+    res_bm25_only = reciprocal_rank_fusion(
+        bm25_candidates=[cand], dense_candidates=[], chunks_lookup={"C-1": chunk}, limit=4
+    )
     assert len(res_bm25_only) == 1
     assert res_bm25_only[0].bm25_rank == 1
     assert res_bm25_only[0].dense_rank is None
     assert math.isclose(res_bm25_only[0].rrf_score, 1 / 61, rel_tol=1e-9)
 
-    res_dense_only = reciprocal_rank_fusion(bm25_candidates=[], dense_candidates=[cand], limit=4)
+    res_dense_only = reciprocal_rank_fusion(
+        bm25_candidates=[], dense_candidates=[cand], chunks_lookup={"C-1": chunk}, limit=4
+    )
     assert len(res_dense_only) == 1
     assert res_dense_only[0].bm25_rank is None
     assert res_dense_only[0].dense_rank == 1
@@ -359,6 +550,7 @@ def test_rrf_merged_rank_ordering_and_tie_breaking():
         "doc_id": "D",
         "clause_id": "C",
         "title": "T",
+        "department": "Travel",
         "version": "1.0",
         "source_file": "f.pdf",
         "source_page": 1,
@@ -371,6 +563,7 @@ def test_rrf_merged_rank_ordering_and_tie_breaking():
         "doc_id": "D",
         "clause_id": "C",
         "title": "T",
+        "department": "Travel",
         "version": "1.0",
         "source_file": "f.pdf",
         "source_page": 1,
@@ -378,11 +571,12 @@ def test_rrf_merged_rank_ordering_and_tie_breaking():
         "allowed_roles": ["employee"],
     }
 
-    # Both have identical rank 1 in their respective single modality
     bm25_cands = [Candidate(chunk_id="DOC-Y", score=2.0, rank=1, chunk=chunk_y)]
     dense_cands = [Candidate(chunk_id="DOC-X", score=0.9, rank=1, chunk=chunk_x)]
 
-    results = reciprocal_rank_fusion(bm25_cands, dense_cands, limit=2)
+    results = reciprocal_rank_fusion(
+        bm25_cands, dense_cands, chunks_lookup={"DOC-X": chunk_x, "DOC-Y": chunk_y}, limit=2
+    )
     # Both have RRF score 1/61; DOC-X should come before DOC-Y alphabetically
     assert [r.chunk_id for r in results] == ["DOC-X", "DOC-Y"]
 
@@ -459,7 +653,7 @@ def test_correct_version_boundaries_2026_06_30_and_2026_07_01(sample_chunks: Lis
 
 
 def test_invalid_role_and_date_rejection(sample_chunks: List[Dict[str, Any]]):
-    """Unknown roles and malformed dates must raise ValueError."""
+    """Unknown roles, malformed dates, and explicit empty strings must raise ValueError."""
     sample = sample_chunks[0]
 
     with pytest.raises(ValueError, match="Unknown role 'contractor'"):
@@ -474,9 +668,15 @@ def test_invalid_role_and_date_rejection(sample_chunks: List[Dict[str, Any]]):
     with pytest.raises(ValueError, match="Malformed query date '2026/05/10'"):
         parse_query_date("2026/05/10")
 
+    with pytest.raises(ValueError, match="explicit empty string"):
+        parse_query_date("")
 
-def test_preservation_of_citation_metadata(sample_chunks: List[Dict[str, Any]]):
-    """Returned RetrievalResult must preserve all required citation fields."""
+    with pytest.raises(ValueError, match="explicit empty string"):
+        parse_query_date("   ")
+
+
+def test_preservation_of_citation_and_department_metadata(sample_chunks: List[Dict[str, Any]]):
+    """Returned RetrievalResult must preserve all required citation fields including department."""
     retriever = HybridRetriever(chunks=sample_chunks)
     results = retriever.search(query="domestic air travel", role="employee", query_date="2026-11-22", top_k=2)
 
@@ -486,6 +686,7 @@ def test_preservation_of_citation_metadata(sample_chunks: List[Dict[str, Any]]):
     assert top.doc_id.startswith("DOC-")
     assert top.clause_id != ""
     assert top.title != ""
+    assert top.department == "Travel"
     assert top.version != ""
     assert top.source_file.endswith(".pdf")
     assert top.source_page >= 1
@@ -493,9 +694,126 @@ def test_preservation_of_citation_metadata(sample_chunks: List[Dict[str, Any]]):
     assert "employee" in top.allowed_roles
     assert top.rrf_score > 0.0
 
+    as_dict = top.to_dict()
+    assert as_dict["department"] == "Travel"
+    assert as_dict["chunk_id"] == top.chunk_id
+
 
 # ==============================================================================
-# 5. Offline Fake Embedding Wrapper Interface
+# 5. Security Enforcements & Candidate Filtering
+# ==============================================================================
+
+
+def test_security_real_unauthorized_dense_candidate_excluded(sample_chunks: List[Dict[str, Any]]):
+    """Verify real restricted chunk DOC-TRV-004_TRV-E01 is excluded for employee, accepted for manager."""
+    retriever = HybridRetriever(chunks=sample_chunks)
+
+    # 1. Confirm DOC-TRV-004_TRV-E01 exists in the loaded corpus
+    target_id = "DOC-TRV-004_TRV-E01"
+    assert any(c["chunk_id"] == target_id for c in sample_chunks), f"{target_id} must exist in corpus"
+
+    permitted_id = "DOC-TRV-002_TRV-C02"
+
+    # Supply unauthorized chunk as top-scoring dense candidate
+    dense_candidates = [
+        Candidate(chunk_id=target_id, score=0.99, rank=1),
+        Candidate(chunk_id=permitted_id, score=0.85, rank=2),
+    ]
+
+    # For employee on 2026-11-22:
+    emp_results = retriever.search(
+        query="travel exception accommodation",
+        role="employee",
+        query_date="2026-11-22",
+        dense_candidates=dense_candidates,
+        top_k=4,
+    )
+    # Target restricted chunk must be completely excluded
+    assert all(r.chunk_id != target_id for r in emp_results)
+    assert all(r.doc_id != "DOC-TRV-004" for r in emp_results)
+
+    # Other permitted candidate must still be returned with consecutive dense rank 1
+    returned_cids = [r.chunk_id for r in emp_results]
+    assert permitted_id in returned_cids
+    perm_result = next(r for r in emp_results if r.chunk_id == permitted_id)
+    assert perm_result.dense_rank == 1
+    assert perm_result.dense_score == 0.85
+
+    # For manager on 2026-11-22 (manager has access to Travel Exceptions):
+    mgr_results = retriever.search(
+        query="travel exception accommodation",
+        role="manager",
+        query_date="2026-11-22",
+        dense_candidates=dense_candidates,
+        top_k=4,
+    )
+    mgr_cids = [r.chunk_id for r in mgr_results]
+    assert target_id in mgr_cids, "Authorized manager must be able to retrieve DOC-TRV-004_TRV-E01"
+
+
+def test_security_expired_dense_candidate_excluded(sample_chunks: List[Dict[str, Any]]):
+    """Dense candidate belonging to an expired policy version must be excluded."""
+    retriever = HybridRetriever(chunks=sample_chunks)
+
+    # DOC-TRV-001_TRV-C02 is Travel Policy v1 (expired on 2026-06-30)
+    expired_id = "DOC-TRV-001_TRV-C02"
+    active_id = "DOC-TRV-002_TRV-C02"
+
+    dense_candidates = [
+        Candidate(chunk_id=expired_id, score=0.98, rank=1),
+        Candidate(chunk_id=active_id, score=0.85, rank=2),
+    ]
+
+    # Query on 2026-11-22 (v1 is expired):
+    results = retriever.search(
+        query="domestic flight economy",
+        role="employee",
+        query_date="2026-11-22",
+        dense_candidates=dense_candidates,
+        top_k=4,
+    )
+    result_cids = [r.chunk_id for r in results]
+    assert expired_id not in result_cids, "Expired v1 candidate must not be returned on current date"
+    assert active_id in result_cids
+
+    # Query on 2026-03-15 (v1 is active, v2 is inactive):
+    hist_results = retriever.search(
+        query="domestic flight economy",
+        role="employee",
+        query_date="2026-03-15",
+        dense_candidates=dense_candidates,
+        top_k=4,
+    )
+    hist_cids = [r.chunk_id for r in hist_results]
+    assert expired_id in hist_cids, "v1 candidate must be returned for historical date"
+    assert active_id not in hist_cids, "v2 candidate must not be returned for historical date"
+
+
+def test_empty_or_whitespace_query_produces_no_results_even_with_dense(sample_chunks: List[Dict[str, Any]]):
+    """Empty or whitespace query string must return [] immediately without evaluating candidates."""
+    retriever = HybridRetriever(chunks=sample_chunks)
+    dense_candidates = [
+        Candidate(chunk_id="DOC-TRV-002_TRV-C02", score=0.99, rank=1),
+    ]
+
+    assert retriever.search("", role="employee", dense_candidates=dense_candidates) == []
+    assert retriever.search("   ", role="employee", dense_candidates=dense_candidates) == []
+    assert retriever.search("\t\n", role="employee", dense_candidates=dense_candidates) == []
+
+
+def test_hybrid_retriever_rejects_negative_limits_and_depth(sample_chunks: List[Dict[str, Any]]):
+    """HybridRetriever must reject negative top_k and candidate_depth <= 0."""
+    retriever = HybridRetriever(chunks=sample_chunks)
+
+    with pytest.raises(ValueError, match="Invalid top_k"):
+        retriever.search("flight", role="employee", top_k=-1)
+
+    with pytest.raises(ValueError, match="Invalid candidate_depth"):
+        retriever.search("flight", role="employee", candidate_depth=0)
+
+
+# ==============================================================================
+# 6. Offline Fake Embedding Wrapper Interface
 # ==============================================================================
 
 
@@ -512,16 +830,13 @@ class FakeSentenceTransformerModel:
         convert_to_numpy: bool = True,
         show_progress_bar: bool = False,
     ):
+        import hashlib
         import numpy as np
 
         embeddings = []
         for s in sentences:
-            # Deterministic vector based on hash of string
-            import hashlib
-
             h = hashlib.sha256(s.encode("utf-8")).digest()
             vec = [(b / 255.0) - 0.5 for b in h[:16]]
-            # Repeat to reach 384 dimensions
             full_vec = (vec * (self.dimension // len(vec) + 1))[: self.dimension]
             arr = np.array(full_vec, dtype=np.float32)
             if normalize_embeddings:
@@ -539,9 +854,6 @@ def test_bge_embedder_interface_with_fake_model():
 
     query_vec = embedder.embed_query("hotel accommodation expense")
     assert len(query_vec) == 384
-    # Check normalization: Euclidean norm should be ~1.0
-    import math
-
     norm = math.sqrt(sum(x * x for x in query_vec))
     assert math.isclose(norm, 1.0, rel_tol=1e-5)
 
@@ -551,49 +863,40 @@ def test_bge_embedder_interface_with_fake_model():
     assert len(batch_vecs[1]) == 384
 
 
-def test_hybrid_retriever_with_supplied_dense_candidates(sample_chunks: List[Dict[str, Any]]):
-    """Verify HybridRetriever fuses BM25 and supplied dense candidates correctly."""
-    retriever = HybridRetriever(chunks=sample_chunks)
+def test_bge_embed_query_rejects_blank_queries():
+    """BGEEmbedder.embed_query must raise ValueError on blank or whitespace queries."""
+    fake_model = FakeSentenceTransformerModel(dimension=384)
+    embedder = BGEEmbedder(model_instance=fake_model)
 
-    # Provide candidate list from external / dense source
-    dense_cands = [
-        Candidate(chunk_id="DOC-TRV-002_TRV-C02", score=0.92, rank=1),
-        Candidate(chunk_id="DOC-TRV-002_TRV-C01", score=0.85, rank=2),
-    ]
+    with pytest.raises(ValueError, match="Query string cannot be empty"):
+        embedder.embed_query("")
 
-    results = retriever.search(
-        query="domestic flight",
-        role="employee",
-        query_date="2026-11-22",
-        dense_candidates=dense_cands,
-        top_k=2,
-    )
-    assert len(results) <= 2
-    # The top result should have both bm25 and dense ranks
-    top = results[0]
-    assert top.chunk_id == "DOC-TRV-002_TRV-C02"
-    assert top.dense_rank == 1
-    assert top.dense_score == 0.92
-    assert top.bm25_rank is not None
-    assert top.rrf_score > 0.0
+    with pytest.raises(ValueError, match="Query string cannot be empty"):
+        embedder.embed_query("   \t\n")
 
 
-def test_unauthorized_chunk_never_in_final_ranking(sample_chunks: List[Dict[str, Any]]):
-    """Even if an unauthorized chunk is supplied in dense candidates, it must be filtered out."""
-    retriever = HybridRetriever(chunks=sample_chunks)
+def test_bge_wrapper_validates_dimension_and_finite_values():
+    """BGEEmbedder must reject invalid embedding dimensions and non-finite values."""
+    # Wrong dimension
+    class WrongDimModel:
+        def encode(self, *args, **kwargs):
+            import numpy as np
 
-    # DOC-TRV-004 is Travel Exceptions (unauthorized for employee)
-    unauthorized_cands = [
-        Candidate(chunk_id="DOC-TRV-004_TRV-C01", score=0.99, rank=1),
-    ]
+            return np.ones((1, 512), dtype=np.float32)
 
-    results = retriever.search(
-        query="exception approval",
-        role="employee",
-        query_date="2026-11-22",
-        dense_candidates=unauthorized_cands,
-        top_k=4,
-    )
+    embedder_wrong_dim = BGEEmbedder(model_instance=WrongDimModel())
+    with pytest.raises(ValueError, match="Expected embedding dimension 384"):
+        embedder_wrong_dim.embed_texts(["test text"])
 
-    # None of the results should be from DOC-TRV-004
-    assert all(r.doc_id != "DOC-TRV-004" for r in results)
+    # Non-finite values
+    class NonFiniteModel:
+        def encode(self, *args, **kwargs):
+            import numpy as np
+
+            arr = np.ones((1, 384), dtype=np.float32)
+            arr[0, 5] = float("nan")
+            return arr
+
+    embedder_non_finite = BGEEmbedder(model_instance=NonFiniteModel())
+    with pytest.raises(ValueError, match="non-finite values"):
+        embedder_non_finite.embed_texts(["test text"])

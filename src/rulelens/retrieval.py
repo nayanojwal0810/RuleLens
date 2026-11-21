@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from rulelens.config import EMBEDDING_MODEL, GENERATION_EVIDENCE_LIMIT
 from rulelens.dataset import ROLES
-from rulelens.ingestion import calculate_processed_fingerprint
+from rulelens.ingestion import calculate_processed_fingerprint, validate_corpus
 
 # Default parameters
 RRF_K: int = 60
@@ -48,7 +49,7 @@ def parse_query_date(query_date: Optional[Union[str, datetime.date]] = None) -> 
     """Parse and validate an ISO query date, defaulting to today if None.
 
     Raises:
-        ValueError: If query_date is a malformed string or invalid type.
+        ValueError: If query_date is a malformed string, explicit empty string, or invalid type.
     """
     if query_date is None:
         return datetime.date.today()
@@ -57,7 +58,7 @@ def parse_query_date(query_date: Optional[Union[str, datetime.date]] = None) -> 
     if isinstance(query_date, str):
         cleaned = query_date.strip()
         if not cleaned:
-            return datetime.date.today()
+            raise ValueError("Malformed query date: explicit empty string provided. Only None defaults to today.")
         try:
             return datetime.date.fromisoformat(cleaned)
         except (ValueError, TypeError) as exc:
@@ -140,6 +141,7 @@ class RetrievalResult:
     doc_id: str
     clause_id: str
     title: str
+    department: str
     version: str
     source_file: str
     source_page: int
@@ -172,13 +174,16 @@ class BM25Index:
 
     def __init__(self, chunks: Sequence[Dict[str, Any]]) -> None:
         """Initialize BM25 index over the provided chunks."""
-        from rank_bm25 import BM25Okapi
-
         self.chunks = list(chunks)
         self.chunk_by_id = {c["chunk_id"]: c for c in self.chunks}
         self.corpus_tokens = [tokenize(c["text"]) for c in self.chunks]
         self.corpus_token_sets = [set(tokens) for tokens in self.corpus_tokens]
-        self._bm25 = BM25Okapi(self.corpus_tokens)
+        if self.chunks:
+            from rank_bm25 import BM25Okapi
+
+            self._bm25 = BM25Okapi(self.corpus_tokens)
+        else:
+            self._bm25 = None
 
     def search(self, query: str, top_k: int = DEFAULT_CANDIDATE_DEPTH) -> List[Candidate]:
         """Search the BM25 index.
@@ -189,10 +194,15 @@ class BM25Index:
 
         Returns:
             Ranked Candidate list with 1-based ranks and scores.
-            Empty queries or queries with no matches return an empty list.
+            Empty queries, empty index, or queries with no matches return an empty list.
         """
+        if not isinstance(top_k, int) or top_k < 0:
+            raise ValueError(f"Invalid top_k={top_k}. Must be a non-negative integer.")
+        if not self.chunks or self._bm25 is None:
+            return []
+
         query_tokens = tokenize(query)
-        if not query_tokens or not self.chunks:
+        if not query_tokens:
             return []
 
         scores = self._bm25.get_scores(query_tokens)
@@ -271,13 +281,21 @@ class BGEEmbedder:
         if dim != EMBEDDING_DIMENSION:
             raise ValueError(f"Expected embedding dimension {EMBEDDING_DIMENSION}, got {dim}")
 
-        return embeddings.tolist() if hasattr(embeddings, "tolist") else [list(vec) for vec in embeddings]
+        raw_vectors = embeddings.tolist() if hasattr(embeddings, "tolist") else [list(vec) for vec in embeddings]
+        validated_vectors: List[List[float]] = []
+        for vec in raw_vectors:
+            if len(vec) != EMBEDDING_DIMENSION:
+                raise ValueError(f"Expected embedding dimension {EMBEDDING_DIMENSION}, got {len(vec)}")
+            if not all(math.isfinite(x) for x in vec):
+                raise ValueError("Embedding vector contains non-finite values (NaN or Inf)")
+            validated_vectors.append([float(x) for x in vec])
+
+        return validated_vectors
 
     def embed_query(self, query: str) -> List[float]:
         """Embed a single query string into a 384-dimensional normalized vector."""
         if not query or not query.strip():
-            # Return a zero vector or embed empty string
-            pass
+            raise ValueError("Query string cannot be empty or whitespace only")
         return self.embed_texts([query])[0]
 
 
@@ -305,48 +323,69 @@ def reciprocal_rank_fusion(
     Returns:
         Top `limit` RetrievalResult objects sorted by (-rrf_score, chunk_id).
     """
+    if not isinstance(k, int) or k <= 0:
+        raise ValueError(f"Invalid RRF constant k={k}. Must be a positive integer.")
+    if not isinstance(limit, int) or limit < 0:
+        raise ValueError(f"Invalid limit={limit}. Must be a non-negative integer.")
+    if not isinstance(candidate_depth, int) or candidate_depth <= 0:
+        raise ValueError(f"Invalid candidate_depth={candidate_depth}. Must be a positive integer.")
+
     lookup: Dict[str, Dict[str, Any]] = dict(chunks_lookup or {})
 
-    # Helper to normalize Candidate objects
-    def normalize_list(raw_list: Sequence[Union[Candidate, Dict[str, Any]]]) -> List[Tuple[str, float, int, Optional[Dict[str, Any]]]]:
-        normalized = []
+    def process_method_candidates(
+        raw_list: Sequence[Union[Candidate, Dict[str, Any]]],
+        method_name: str,
+    ) -> List[Tuple[str, float, int]]:
+        processed: List[Tuple[str, float, int]] = []
+        seen_chunks: Set[str] = set()
+        ranks_assigned: Dict[int, str] = {}
+
         for idx, item in enumerate(raw_list[:candidate_depth], start=1):
             if isinstance(item, Candidate):
                 cid = item.chunk_id
-                score = item.score
+                score = float(item.score)
                 rank = item.rank if item.rank is not None else idx
-                chunk_dict = item.chunk
             elif isinstance(item, dict):
-                cid = item["chunk_id"]
+                cid = str(item["chunk_id"])
                 score = float(item.get("score", 0.0))
                 rank = int(item.get("rank", idx))
-                chunk_dict = item.get("chunk", item)
             else:
-                raise TypeError(f"Unsupported candidate type: {type(item)}")
+                raise TypeError(f"Unsupported candidate type in {method_name}: {type(item)}")
 
-            if chunk_dict and cid not in lookup:
-                lookup[cid] = chunk_dict
-            normalized.append((cid, score, rank, chunk_dict))
-        return normalized
+            if rank < 1:
+                raise ValueError(f"Invalid rank {rank} for chunk '{cid}' in {method_name}. Ranks must be >= 1.")
 
-    bm25_norm = normalize_list(bm25_candidates)
-    dense_norm = normalize_list(dense_candidates)
+            # Reject duplicate ranks assigned to different chunks within the method
+            if rank in ranks_assigned and ranks_assigned[rank] != cid:
+                raise ValueError(
+                    f"Duplicate rank {rank} assigned to different chunks in {method_name}: "
+                    f"'{ranks_assigned[rank]}' and '{cid}'."
+                )
+            ranks_assigned[rank] = cid
+
+            # Count each chunk only once per retrieval method
+            if cid in seen_chunks:
+                continue
+            seen_chunks.add(cid)
+
+            processed.append((cid, score, rank))
+
+        return processed
+
+    bm25_processed = process_method_candidates(bm25_candidates, "bm25")
+    dense_processed = process_method_candidates(dense_candidates, "dense")
 
     scores_by_id: Dict[str, float] = {}
     bm25_info: Dict[str, Tuple[int, float]] = {}
     dense_info: Dict[str, Tuple[int, float]] = {}
 
-    for cid, score, rank, chunk_dict in bm25_norm:
-        if cid not in scores_by_id:
-            scores_by_id[cid] = 0.0
-        scores_by_id[cid] += 1.0 / (k + rank)
+    for cid, score, rank in bm25_processed:
+        scores_by_id[cid] = scores_by_id.get(cid, 0.0) + 1.0 / (k + rank)
         if cid not in bm25_info:
             bm25_info[cid] = (rank, score)
 
-    for cid, score, rank, chunk_dict in dense_norm:
-        if cid not in scores_by_id:
-            scores_by_id[cid] = 0.0
-        scores_by_id[cid] += 1.0 / (k + rank)
+    for cid, score, rank in dense_processed:
+        scores_by_id[cid] = scores_by_id.get(cid, 0.0) + 1.0 / (k + rank)
         if cid not in dense_info:
             dense_info[cid] = (rank, score)
 
@@ -357,7 +396,7 @@ def reciprocal_rank_fusion(
     for cid in sorted_chunk_ids[:limit]:
         chunk = lookup.get(cid)
         if not chunk:
-            raise KeyError(f"Chunk metadata for '{cid}' not found in candidate lookup")
+            raise KeyError(f"Chunk metadata for '{cid}' not found in canonical lookup")
 
         b_rank, b_score = bm25_info.get(cid, (None, None))
         d_rank, d_score = dense_info.get(cid, (None, None))
@@ -369,6 +408,7 @@ def reciprocal_rank_fusion(
                 doc_id=chunk["doc_id"],
                 clause_id=chunk["clause_id"],
                 title=chunk["title"],
+                department=chunk["department"],
                 version=chunk["version"],
                 source_file=chunk["source_file"],
                 source_page=int(chunk["source_page"]),
@@ -387,7 +427,7 @@ def reciprocal_rank_fusion(
 
 
 def load_validated_corpus(base_dir: Optional[Union[Path, str]] = None) -> List[Dict[str, Any]]:
-    """Load the 64 processed policy chunks from chunks.jsonl after verifying fingerprint integrity."""
+    """Load the 64 processed policy chunks from chunks.jsonl after Stage C corpus validation."""
     base = Path(base_dir) if base_dir else Path.cwd()
     processed_dir = base / "data" / "processed"
     chunks_path = processed_dir / "chunks.jsonl"
@@ -397,27 +437,15 @@ def load_validated_corpus(base_dir: Optional[Union[Path, str]] = None) -> List[D
     if not chunks_path.exists() or not rules_path.exists() or not manifest_path.exists():
         raise FileNotFoundError(f"Missing required processed files in {processed_dir}")
 
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
+    # Call Stage C validation to verify all source documents, PyMuPDF extraction,
+    # permissions, manifest metadata, and rule integrity
+    validate_corpus(base)
 
     chunks: List[Dict[str, Any]] = []
     with open(chunks_path, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 chunks.append(json.loads(line))
-
-    rules: List[Dict[str, Any]] = []
-    with open(rules_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                rules.append(json.loads(line))
-
-    # Verify corpus fingerprint integrity
-    computed_fp = calculate_processed_fingerprint(chunks, rules)
-    if computed_fp != manifest.get("processed_fingerprint"):
-        raise ValueError(
-            f"Corpus fingerprint mismatch: computed {computed_fp} != manifest {manifest.get('processed_fingerprint')}"
-        )
 
     if len(chunks) != 64:
         raise ValueError(f"Expected exactly 64 chunks in processed corpus, got {len(chunks)}")
@@ -461,6 +489,15 @@ class HybridRetriever:
         Returns:
             List of up to top_k RetrievalResult objects, filtered by permission and date.
         """
+        if not isinstance(top_k, int) or top_k < 0:
+            raise ValueError(f"Invalid top_k={top_k}. Must be a non-negative integer.")
+        if not isinstance(candidate_depth, int) or candidate_depth <= 0:
+            raise ValueError(f"Invalid candidate_depth={candidate_depth}. Must be a positive integer.")
+
+        # Blank or whitespace-only user questions produce no retrieval results, even when dense candidates are supplied
+        if not query or not query.strip():
+            return []
+
         # 1. Pre-filter eligible chunks before retrieval and ranking
         eligible_chunks = filter_eligible_chunks(self.chunks, role, query_date)
         if not eligible_chunks:
@@ -472,13 +509,35 @@ class HybridRetriever:
         bm25_index = BM25Index(eligible_chunks)
         bm25_candidates = bm25_index.search(query, top_k=candidate_depth)
 
-        # 3. Dense candidates handling
-        eligible_dense_candidates: List[Union[Candidate, Dict[str, Any]]] = []
+        # 3. Dense candidates handling: filter eligible and assign consecutive ranks 1..N preserving scores
+        eligible_dense_candidates: List[Candidate] = []
         if dense_candidates is not None:
+            raw_eligible: List[Tuple[str, float]] = []
+            seen_cids: Set[str] = set()
             for item in dense_candidates:
-                cid = item.chunk_id if isinstance(item, Candidate) else item["chunk_id"]
-                if cid in eligible_ids:
-                    eligible_dense_candidates.append(item)
+                if isinstance(item, Candidate):
+                    cid = item.chunk_id
+                    score = float(item.score)
+                elif isinstance(item, dict):
+                    cid = str(item["chunk_id"])
+                    score = float(item.get("score", 0.0))
+                else:
+                    continue
+
+                if cid in eligible_ids and cid not in seen_cids:
+                    seen_cids.add(cid)
+                    raw_eligible.append((cid, score))
+
+            # Assign sensible consecutive ranks (1, 2, 3, ...) while preserving original similarity scores
+            for rank_idx, (cid, score) in enumerate(raw_eligible[:candidate_depth], start=1):
+                eligible_dense_candidates.append(
+                    Candidate(
+                        chunk_id=cid,
+                        score=score,
+                        rank=rank_idx,
+                        chunk=self.chunks_by_id[cid],
+                    )
+                )
 
         # 4. RRF fusion
         return reciprocal_rank_fusion(
