@@ -680,7 +680,7 @@ def test_invalid_role_and_date_rejection(sample_chunks: List[Dict[str, Any]]):
 def test_preservation_of_citation_and_department_metadata(sample_chunks: List[Dict[str, Any]]):
     """Returned RetrievalResult must preserve all required citation fields including department."""
     retriever = HybridRetriever(chunks=sample_chunks)
-    results = retriever.search(query="domestic air travel", role="employee", query_date="2026-11-22", top_k=2)
+    results = retriever.search(query="domestic air travel", role="employee", query_date="2026-11-22", top_k=2, mode="bm25")
 
     assert len(results) > 0
     top = results[0]
@@ -827,14 +827,22 @@ def test_search_input_validation_order_and_empty_queries(sample_chunks: List[Dic
         retriever.search("", role="employee", query_date="")
 
     # 5. Valid role and date with empty query returns []
-    assert retriever.search("", role="employee", query_date="2026-11-22") == []
+    assert retriever.search("", role="employee", query_date="2026-11-22", mode="bm25") == []
+
+    # 5a. Empty query with invalid mode raises ValueError before returning []
+    with pytest.raises(ValueError, match="Unknown retrieval mode 'invalid'"):
+        retriever.search("", role="employee", query_date="2026-11-22", mode="invalid")
+
+    # 5b. Empty query with invalid dense_backend raises ValueError before returning []
+    with pytest.raises(ValueError, match="Unknown dense backend 'invalid'"):
+        retriever.search("", role="employee", query_date="2026-11-22", dense_backend="invalid")
 
     # 6. Valid role and date with whitespace query returns [], even when dense candidates are supplied
     assert retriever.search("   ", role="employee", query_date="2026-11-22", dense_candidates=dense_candidates) == []
     assert retriever.search("\t\n", role="employee", query_date="2026-11-22", dense_candidates=dense_candidates) == []
 
     # 7. A normal query still retrieves eligible chunks
-    results = retriever.search("domestic flight", role="employee", query_date="2026-11-22", top_k=2)
+    results = retriever.search("domestic flight", role="employee", query_date="2026-11-22", top_k=2, mode="bm25")
     assert len(results) > 0
     assert all("employee" in r.allowed_roles for r in results)
 

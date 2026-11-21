@@ -3,9 +3,8 @@
 Enterprise Policy Intelligence Engine with Hybrid Retrieval and Guarded Semantic Caching.
 
 ## Project Purpose
-RuleLens is an enterprise policy question-answering system designed to deliver verified, clause-grounded policy answers with role-based access control and safe semantic cache reuse. When uncertain or when policy evidence is insufficient, RuleLens safely refuses unsupported questions rather than generating unverified responses.
 
-> **Status:** Stage D2 Complete (Complete Hybrid Retrieval & Development Evaluation). BM25 lexical search, BGE-small dense embeddings, Reciprocal Rank Fusion, local vector search, and Qdrant Cloud integration implemented and evaluated.
+RuleLens is an enterprise policy question-answering system designed to deliver verified, clause-grounded policy answers with role-based access control and safe semantic cache reuse. When uncertain or when policy evidence is insufficient, RuleLens safely refuses unsupported questions rather than generating unverified responses.
 
 ## Architecture
 
@@ -34,11 +33,15 @@ User Query + Role + Effective Date
         Top-K Clause-Grounded Evidence Chunks
 ```
 
-- **Hybrid Retrieval:** Dense embeddings (`BAAI/bge-small-en-v1.5`, 384 dimensions) combined with lexical search (BM25) fused via Reciprocal Rank Fusion (RRF, $k=60$) over role-authorized, date-active documents.
-- **Dual Dense Backends:** High-performance local in-memory cosine similarity and remote Qdrant Cloud vector store with server-side payload filters.
-- **Rule Resolution:** Deterministic Python evaluation of structured conditions (amounts, approval thresholds, dates) linked to policy clauses.
-- **Guarded Semantic Cache:** Vector similarity caching with verification gates (role scope, active policy version, rule outcome, and evidence hash matching).
-- **Dataset:** Deterministic enterprise policy system (20 PDFs and 5 CSV rule tables across 6 employee roles: `employee`, `manager`, `hr`, `finance`, `security`, `auditor`).
+- **Hybrid as Primary Retrieval Architecture:** RuleLens uses Hybrid Retrieval as its standard mode, combining lexical precision (BM25) with semantic recall (`BAAI/bge-small-en-v1.5`, 384-dimensional normalized embeddings) fused via Reciprocal Rank Fusion (RRF, $k=60$).
+- **Supported Retrieval Modes:**
+  - `hybrid` (default): Fuses BM25 lexical candidates and BGE dense vector candidates via RRF.
+  - `bm25`: Fast lexical-only retrieval based on Okapi BM25 scoring.
+  - `dense`: Dense semantic vector retrieval using cosine similarity.
+- **Dual Dense Backends:**
+  - `local`: High-performance local in-memory cosine similarity over cached document embeddings (100% offline).
+  - `qdrant`: Vector database retrieval utilizing server-side payload filtering for permissions, dates, and corpus fingerprints.
+- **Security & Version Integrity:** Role-based permissions (across `employee`, `manager`, `hr`, `finance`, `legal`, `auditor`) and temporal version windows are enforced via deterministic pre-filtering before scoring.
 
 ## Installation & Setup
 
@@ -60,14 +63,16 @@ python -m pip install -e ".[dev]"
 ```
 
 ### Environment Configuration
-Copy `.env.example` to `.env` and provide your credentials (optional for offline local operation):
+Copy `.env.example` to `.env` to configure optional external services:
 ```bash
 cp .env.example .env
 ```
 Supported variables:
 - `GROQ_API_KEY`: API key for Groq LLM generation.
-- `QDRANT_URL`: Cluster URL for Qdrant Cloud (e.g. `https://xyz.cloud.qdrant.io:6333`).
+- `QDRANT_URL`: Cluster endpoint URL for Qdrant Cloud (e.g. `https://<cluster-id>.<region>.gcp.cloud.qdrant.io:6333`). Note: The marketing website `https://qdrant.io` is rejected.
 - `QDRANT_API_KEY`: API key for Qdrant Cloud.
+
+Local `.env` values are automatically loaded when environment variables are not set. Explicitly configured environment variables take precedence.
 
 ## CLI Commands
 
@@ -78,42 +83,41 @@ python -m rulelens.dataset validate
 ```
 
 ### 2. Validate Processed Corpus
-Verify PyMuPDF clause extraction, chunking, and content hashes:
+Verify clause extraction, chunking, and content hashes:
 ```bash
 python -m rulelens.ingestion validate
 ```
 
-### 3. Run Offline Test Suite
-Run 101 unit tests completely offline with network sockets blocked:
+### 3. Validate Development Evaluation Dataset
+Verify the public 50-question evaluation dataset without loading the embedding model:
+```bash
+python -m rulelens.retrieval_eval validate --questions data/evaluation/dev_questions.json
+```
+
+### 4. Run Offline Test Suite
+Run unit tests completely offline with network sockets blocked:
 ```bash
 python -m pytest -q
 ```
 
-### 4. Qdrant Cloud Collection Management
+### 5. Qdrant Collection Management
 Synchronize the 64 policy chunks to Qdrant:
 ```bash
 python -m rulelens.qdrant_store sync
 ```
-Verify Qdrant collection configuration and point data:
+
+Verify Qdrant collection configuration, point UUIDs, and payload fields:
 ```bash
 python -m rulelens.qdrant_store verify
 ```
 
-### 5. Run Retrieval Evaluation Harness
-Evaluate BM25, Dense, and Hybrid retrieval modes against the 30-question development dataset:
+### 6. Run Development Retrieval Evaluation
+Run evaluation across BM25, Dense, and Hybrid modes:
 ```bash
-python -m rulelens.retrieval_eval
+# Using local dense backend (default)
+python -m rulelens.retrieval_eval run --questions data/evaluation/dev_questions.json --backend local
+
+# Using Qdrant Cloud backend (requires active cluster credentials)
+python -m rulelens.retrieval_eval run --questions data/evaluation/dev_questions.json --backend qdrant
 ```
-Results and summaries are saved to `local_eval/development_results.json` and `local_eval/development_summary.md`.
-
-## Development Evaluation Results
-
-Evaluated over 30 questions (6 per department across all 5 departments) with top-5 cutoff:
-
-| Retrieval Method | Recall@5 | Hit@5 | MRR@5 | Median Latency (ms) | P95 Latency (ms) | Role Violations | Version Violations |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| BM25 (Lexical) | 1.0000 | 1.0000 | 0.9250 | 0.61 ms | 3.85 ms | 0 | 0 |
-| BGE Dense (Local) | 1.0000 | 1.0000 | 0.9750 | 39.72 ms | 87.88 ms | 0 | 0 |
-| **Hybrid (BM25 + Dense + RRF)** | 1.0000 | 1.0000 | 0.9500 | 44.37 ms | 112.00 ms | 0 | 0 |
-
-> Zero role violations and zero temporal version violations observed across all modes.
+Detailed results and markdown summaries are generated in `local_eval/development_results.json` and `local_eval/development_summary.md` (ignored by version control).

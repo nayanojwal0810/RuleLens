@@ -161,6 +161,15 @@ def test_get_qdrant_client_missing_url(monkeypatch):
         get_qdrant_client(url="   ")
 
 
+def test_get_qdrant_client_rejects_marketing_url():
+    """get_qdrant_client must reject https://qdrant.io marketing URL."""
+    with pytest.raises(ValueError, match="marketing website"):
+        get_qdrant_client(url="https://qdrant.io")
+
+    with pytest.raises(ValueError, match="marketing website"):
+        get_qdrant_client(url="http://qdrant.io/")
+
+
 def test_get_qdrant_client_initialization():
     """get_qdrant_client must instantiate QdrantClient with provided URL and key."""
     client = get_qdrant_client(url="http://localhost:6333", api_key="secret-key")
@@ -316,12 +325,13 @@ def test_search_qdrant_server_side_filtering(repo_root: Path, sample_chunks: Lis
     col_name = "test_search_filters"
     fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
 
-    sync_corpus(
+    sync_result = sync_corpus(
         client=client,
         base_dir=repo_root,
         collection_name=col_name,
         embedder=fake_embedder,
     )
+    fp = sync_result["corpus_fingerprint"]
 
     query_vec = fake_embedder.embed_query("travel exceptions approval process")
 
@@ -331,6 +341,7 @@ def test_search_qdrant_server_side_filtering(repo_root: Path, sample_chunks: Lis
         query_vector=query_vec,
         role="employee",
         query_date="2026-11-22",
+        corpus_fingerprint=fp,
         collection_name=col_name,
         top_k=64,
     )
@@ -343,6 +354,7 @@ def test_search_qdrant_server_side_filtering(repo_root: Path, sample_chunks: Lis
         query_vector=query_vec,
         role="manager",
         query_date="2026-11-22",
+        corpus_fingerprint=fp,
         collection_name=col_name,
         top_k=64,
     )
@@ -356,6 +368,7 @@ def test_search_qdrant_server_side_filtering(repo_root: Path, sample_chunks: Lis
         query_vector=v2_query_vec,
         role="employee",
         query_date="2026-03-15",
+        corpus_fingerprint=fp,
         collection_name=col_name,
         top_k=64,
     )
@@ -369,6 +382,111 @@ def test_search_qdrant_server_side_filtering(repo_root: Path, sample_chunks: Lis
         assert "2026-03-15" <= eff_to
 
 
+def test_search_qdrant_mandatory_auditor_filter(repo_root: Path):
+    """Mandatory test case: Auditor cannot retrieve Employee Transfers (DOC-PCO-003)."""
+    client = QdrantClient(":memory:")
+    col_name = "test_auditor_filter"
+    fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
+
+    sync_result = sync_corpus(
+        client=client,
+        base_dir=repo_root,
+        collection_name=col_name,
+        embedder=fake_embedder,
+    )
+    fp = sync_result["corpus_fingerprint"]
+
+    query_vec = fake_embedder.embed_query("employee transfer relocation procedures")
+    results = search_qdrant(
+        client=client,
+        query_vector=query_vec,
+        role="auditor",
+        query_date="2026-11-22",
+        corpus_fingerprint=fp,
+        collection_name=col_name,
+        top_k=64,
+    )
+    result_cids = {cid for cid, score in results}
+    # DOC-PCO-003 is Employee Transfers (accessible to employee, manager, hr, but NOT auditor)
+    for cid in result_cids:
+        assert not cid.startswith("DOC-PCO-003"), f"Auditor must not access DOC-PCO-003: {cid}"
+
+
+def test_search_qdrant_mandatory_date_boundaries(repo_root: Path):
+    """Mandatory test cases:
+    - 2026-06-30: Travel Policy v1 is eligible; v2 is not.
+    - 2026-07-01: Travel Policy v2 is eligible; v1 is not.
+    - 2026-11-22: Expired Travel Policy v1 must not appear.
+    """
+    client = QdrantClient(":memory:")
+    col_name = "test_date_boundaries"
+    fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
+
+    sync_result = sync_corpus(
+        client=client,
+        base_dir=repo_root,
+        collection_name=col_name,
+        embedder=fake_embedder,
+    )
+    fp = sync_result["corpus_fingerprint"]
+    query_vec = fake_embedder.embed_query("business travel expense allowance")
+
+    # Date 1: 2026-06-30
+    res_june = search_qdrant(
+        client=client,
+        query_vector=query_vec,
+        role="employee",
+        query_date="2026-06-30",
+        corpus_fingerprint=fp,
+        collection_name=col_name,
+        top_k=64,
+    )
+    cids_june = {cid for cid, score in res_june}
+    assert any(cid.startswith("DOC-TRV-001") for cid in cids_june), "v1 must be eligible on 2026-06-30"
+    assert not any(cid.startswith("DOC-TRV-002") for cid in cids_june), "v2 must not be eligible on 2026-06-30"
+
+    # Date 2: 2026-07-01
+    res_july = search_qdrant(
+        client=client,
+        query_vector=query_vec,
+        role="employee",
+        query_date="2026-07-01",
+        corpus_fingerprint=fp,
+        collection_name=col_name,
+        top_k=64,
+    )
+    cids_july = {cid for cid, score in res_july}
+    assert any(cid.startswith("DOC-TRV-002") for cid in cids_july), "v2 must be eligible on 2026-07-01"
+    assert not any(cid.startswith("DOC-TRV-001") for cid in cids_july), "v1 must not be eligible on 2026-07-01"
+
+    # Date 3: 2026-11-22
+    res_nov = search_qdrant(
+        client=client,
+        query_vector=query_vec,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint=fp,
+        collection_name=col_name,
+        top_k=64,
+    )
+    cids_nov = {cid for cid, score in res_nov}
+    assert any(cid.startswith("DOC-TRV-002") for cid in cids_nov), "v2 must be eligible on 2026-11-22"
+    assert not any(cid.startswith("DOC-TRV-001") for cid in cids_nov), "v1 must not appear on 2026-11-22"
+
+
+def test_search_qdrant_rejects_empty_fingerprint():
+    """search_qdrant must reject empty corpus_fingerprint with ValueError."""
+    mock_client = MagicMock()
+    with pytest.raises(ValueError, match="corpus_fingerprint must be a non-empty string"):
+        search_qdrant(
+            client=mock_client,
+            query_vector=[0.1] * 384,
+            role="employee",
+            query_date="2026-11-22",
+            corpus_fingerprint="",
+        )
+
+
 def test_search_qdrant_no_silent_fallback(repo_root: Path):
     """search_qdrant must propagate exceptions if Qdrant call fails (no silent fallback)."""
     mock_client = MagicMock()
@@ -380,7 +498,34 @@ def test_search_qdrant_no_silent_fallback(repo_root: Path):
             query_vector=[0.1] * 384,
             role="employee",
             query_date="2026-11-22",
+            corpus_fingerprint="test_fp_123",
         )
+
+
+def test_verify_collection_detects_payload_field_mismatch(repo_root: Path):
+    """verify_collection must raise ValueError if a point payload field is corrupted."""
+    client = QdrantClient(":memory:")
+    col_name = "test_tampered_payload"
+    fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
+
+    sync_corpus(
+        client=client,
+        base_dir=repo_root,
+        collection_name=col_name,
+        embedder=fake_embedder,
+    )
+
+    # Tamper with point 0 payload
+    points, _ = client.scroll(collection_name=col_name, limit=1, with_payload=True, with_vectors=True)
+    p = points[0]
+    p.payload["department"] = "CORRUPTED_DEPARTMENT"
+    client.upsert(
+        collection_name=col_name,
+        points=[models.PointStruct(id=p.id, vector=p.vector, payload=p.payload)],
+    )
+
+    with pytest.raises(ValueError, match="Payload mismatch"):
+        verify_collection(client=client, base_dir=repo_root, collection_name=col_name)
 
 
 # ==============================================================================

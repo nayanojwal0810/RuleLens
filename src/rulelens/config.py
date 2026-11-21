@@ -1,7 +1,8 @@
 """Configuration constants and environment variable helpers for RuleLens."""
 
 import os
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 # Environment variable names
 GROQ_API_KEY: str = "GROQ_API_KEY"
@@ -17,6 +18,55 @@ GENERATION_MODEL: str = "openai/gpt-oss-20b"
 
 # Evidence limits
 GENERATION_EVIDENCE_LIMIT: int = 4
+
+
+def load_dotenv_if_present(env_path: Optional[Union[Path, str]] = None) -> None:
+    """Load key-value pairs from a local .env file into os.environ if not already set.
+
+    Preserves any explicitly configured environment variables (never overrides them).
+    Silently ignores missing files. Never logs or prints credential values.
+    """
+    path = Path(env_path) if env_path else Path.cwd() / ".env"
+    if not path.is_file():
+        # Also check parent directory if cwd is inside tests or a subpackage
+        parent_env = Path.cwd().parent / ".env"
+        if parent_env.is_file():
+            path = parent_env
+        else:
+            return
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "=" in stripped:
+                    key, val = stripped.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    # Strip surrounding quotes if present
+                    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                        val = val[1:-1]
+                    if key and val and key not in os.environ:
+                        os.environ[key] = val
+    except Exception:
+        # Silently pass on read/encoding errors
+        pass
+
+
+# Automatically load local .env on import if not already set in environment and not under pytest
+if "PYTEST_CURRENT_TEST" not in os.environ:
+    load_dotenv_if_present()
+
+
+
+def is_invalid_qdrant_url(url: Optional[str]) -> bool:
+    """Check if the provided URL is the Qdrant marketing website rather than an API cluster endpoint."""
+    if not url:
+        return False
+    cleaned = url.strip().rstrip("/").lower()
+    return cleaned in ("https://qdrant.io", "http://qdrant.io")
 
 
 def get_env_var(name: str, default: Optional[str] = None) -> Optional[str]:

@@ -570,7 +570,18 @@ class HybridRetriever:
             texts = [c["text"] for c in self.chunks]
             cids = [c["chunk_id"] for c in self.chunks]
             vectors = self.embedder.embed_texts(texts)
-            self._dense_embeddings_cache = {cid: vec for cid, vec in zip(cids, vectors)}
+            if len(vectors) != len(self.chunks):
+                raise ValueError(f"Expected {len(self.chunks)} document vectors, got {len(vectors)}")
+            cache: Dict[str, List[float]] = {}
+            for cid, vec in zip(cids, vectors):
+                if len(vec) != EMBEDDING_DIMENSION:
+                    raise ValueError(
+                        f"Document vector for '{cid}' has dimension {len(vec)}; expected {EMBEDDING_DIMENSION}."
+                    )
+                if not all(math.isfinite(x) for x in vec):
+                    raise ValueError(f"Document vector for '{cid}' contains non-finite values.")
+                cache[cid] = vec
+            self._dense_embeddings_cache = cache
         return self._dense_embeddings_cache
 
     def dense_search(
@@ -581,6 +592,11 @@ class HybridRetriever:
     ) -> List[Candidate]:
         """Execute local dense retrieval using BGE-small embeddings and cosine similarity."""
         query_vec = self.embedder.embed_query(query)
+        if len(query_vec) != EMBEDDING_DIMENSION:
+            raise ValueError(f"Query vector has dimension {len(query_vec)}; expected {EMBEDDING_DIMENSION}.")
+        if not all(math.isfinite(x) for x in query_vec):
+            raise ValueError("Query vector contains non-finite values.")
+
         doc_embeddings = self.get_dense_embeddings()
 
         raw_candidates: List[Tuple[str, float]] = []
@@ -607,7 +623,7 @@ class HybridRetriever:
         role: str,
         query_date: Optional[Union[str, datetime.date]] = None,
         dense_candidates: Optional[Sequence[Union[Candidate, Dict[str, Any]]]] = None,
-        mode: Optional[str] = None,
+        mode: str = "hybrid",
         dense_backend: str = "local",
         qdrant_client: Optional[Any] = None,
         top_k: int = DEFAULT_TOP_K,
@@ -620,8 +636,7 @@ class HybridRetriever:
             role: Employee role requesting retrieval (must be one of ROLES).
             query_date: Policy effective date (defaults to today).
             dense_candidates: Optional dense candidates (e.g. from vector search or mock).
-            mode: Retrieval mode: 'bm25', 'dense', or 'hybrid' (defaults to 'hybrid' if dense
-                candidates/model available, else legacy BM25 compatibility).
+            mode: Retrieval mode: 'bm25', 'dense', or 'hybrid' (defaults to 'hybrid').
             dense_backend: Dense retrieval provider: 'local' (default) or 'qdrant'.
             qdrant_client: Optional QdrantClient instance for 'qdrant' dense backend.
             top_k: Number of final RRF results to return (default 4).
@@ -643,39 +658,34 @@ class HybridRetriever:
         # 3. Parse and validate query_date
         validated_date = parse_query_date(query_date)
 
-        # 4. Check if query is empty or whitespace-only (after validating role and date)
+        # 4. Validate retrieval mode (must be 'bm25', 'dense', or 'hybrid')
+        if mode not in ("bm25", "dense", "hybrid"):
+            raise ValueError(f"Unknown retrieval mode '{mode}'. Supported modes: 'bm25', 'dense', 'hybrid'.")
+
+        # 5. Validate dense backend (must be 'local' or 'qdrant')
+        if dense_backend not in ("local", "qdrant"):
+            raise ValueError(f"Unknown dense backend '{dense_backend}'. Supported backends: 'local', 'qdrant'.")
+
+        # 6. Check if query is empty or whitespace-only (ONLY AFTER all inputs above are validated)
         if not query or not query.strip():
             return []
 
-        # Validate mode if provided
-        if mode is not None and mode not in ("bm25", "dense", "hybrid"):
-            raise ValueError(f"Unknown retrieval mode '{mode}'. Supported modes: 'bm25', 'dense', 'hybrid'.")
-
-        effective_mode = mode
-        if effective_mode is None:
-            if dense_candidates is not None:
-                effective_mode = "hybrid"
-            elif getattr(self.embedder, "_model", None) is not None:
-                effective_mode = "hybrid"
-            else:
-                effective_mode = "bm25"
-
-        # 5. Pre-filter eligible chunks using validated role and date
+        # 7. Pre-filter eligible chunks using validated role and date
         eligible_chunks = filter_eligible_chunks(self.chunks, role, validated_date)
         if not eligible_chunks:
             return []
 
         eligible_ids: Set[str] = {c["chunk_id"] for c in eligible_chunks}
 
-        # 6. BM25 Search (using cached index for eligible chunk set)
+        # 8. BM25 Search (using cached index for eligible chunk set)
         bm25_candidates: List[Candidate] = []
-        if effective_mode in ("bm25", "hybrid"):
+        if mode in ("bm25", "hybrid"):
             bm25_index = self.get_bm25_index(eligible_chunks)
             bm25_candidates = bm25_index.search(query, top_k=candidate_depth)
 
-        # 7. Dense Search
+        # 9. Dense Search
         final_dense_candidates: List[Candidate] = []
-        if effective_mode in ("dense", "hybrid"):
+        if mode in ("dense", "hybrid"):
             if dense_candidates is not None:
                 final_dense_candidates = normalize_dense_candidates(
                     raw_candidates=dense_candidates,
@@ -693,6 +703,8 @@ class HybridRetriever:
 
                     query_vec = self.embedder.embed_query(query)
                     fp = self.corpus_manifest.get("processed_fingerprint", "") if self.corpus_manifest else ""
+                    if not fp:
+                        raise ValueError("Missing required corpus_fingerprint for Qdrant retrieval.")
                     raw_qdrant = search_qdrant(
                         client=qdrant_client,
                         query_vector=query_vec,
@@ -714,8 +726,8 @@ class HybridRetriever:
                         top_k=candidate_depth,
                     )
 
-        # 8. Return results based on effective mode
-        if effective_mode == "bm25":
+        # 10. Return results based on selected mode
+        if mode == "bm25":
             results: List[RetrievalResult] = []
             for cand in bm25_candidates[:top_k]:
                 c = self.chunks_by_id[cand.chunk_id]
@@ -742,7 +754,7 @@ class HybridRetriever:
                 )
             return results
 
-        if effective_mode == "dense":
+        if mode == "dense":
             results = []
             for cand in final_dense_candidates[:top_k]:
                 c = self.chunks_by_id[cand.chunk_id]

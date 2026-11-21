@@ -1,0 +1,812 @@
+{
+  "schema_version": "1.0",
+  "corpus_fingerprint": "4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3",
+  "questions": [
+    {
+      "question_id": "TRV-001",
+      "department": "Travel",
+      "question": "What is the maximum daily meal subsistence allowance permitted under Travel Policy v2?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "easy",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-002_TRV-C03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Direct factual lookup of daily per diem meal allowance in active policy v2.",
+      "evidence_reason": "Clause TRV-C03 specifies daily meal subsistence allowance capped at INR 2,000 per diem with itemized receipts."
+    },
+    {
+      "question_id": "TRV-002",
+      "department": "Travel",
+      "question": "How many continuous flight hours must an international leg exceed before premium economy seating becomes permissible?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "paraphrase",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-002_TRV-C02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires retrieving flight duration eligibility threshold under paraphrased phrasing.",
+      "evidence_reason": "Clause TRV-C02 establishes that flights exceeding eight continuous flight hours qualify for premium economy with written manager recommendation."
+    },
+    {
+      "question_id": "TRV-003",
+      "department": "Travel",
+      "question": "Under the original Travel Policy v1, what was the daily food subsistence allowance limit?",
+      "role": "employee",
+      "query_date": "2026-03-15",
+      "difficulty": "medium",
+      "question_type": "historical",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-001_TRV-C03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires querying historical date 2026-03-15 where Travel Policy v1 was active and v2 did not yet exist.",
+      "evidence_reason": "Clause TRV-C03 in Travel Policy v1 caps daily meal subsistence allowance at INR 1,500 per diem."
+    },
+    {
+      "question_id": "TRV-004",
+      "department": "Travel",
+      "question": "If a business traveler incurs 40,000 INR in travel expenses, is direct reporting manager approval sufficient under Travel Policy v1?",
+      "role": "employee",
+      "query_date": "2026-06-30",
+      "difficulty": "medium",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-001_TRV-C04"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests boundary condition at exactly INR 40,000 on the final active day of Travel Policy v1.",
+      "evidence_reason": "Clause TRV-C04 confirms travel expenses up to and including INR 40,000 follow standard approval by the direct reporting manager."
+    },
+    {
+      "question_id": "TRV-005",
+      "department": "Travel",
+      "question": "What are the combined booking portal requirements and advance ticket purchase windows for team members scheduling domestic client flights?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-003_TRV-B01",
+        "DOC-TRV-003_TRV-B02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires synthesizing both central portal reservation rules and the 14-day advance booking window.",
+      "evidence_reason": "Clause TRV-B01 mandates booking exclusively through the Asterline Travel Portal, while TRV-B02 enforces booking at least 14 days in advance."
+    },
+    {
+      "question_id": "TRV-006",
+      "department": "Travel",
+      "question": "On July 1, 2026, what are the newly effective hotel accommodation caps for metro cities and standard flight class rules?",
+      "role": "employee",
+      "query_date": "2026-07-01",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-002_TRV-C02",
+        "DOC-TRV-002_TRV-C03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Evaluates exact effective date transition from v1 to v2 requiring both lodging caps (INR 7,500) and economy air travel rules.",
+      "evidence_reason": "Clause TRV-C02 governs economy air travel standards and TRV-C03 establishes metro hotel allowance capped at INR 7,500 effective July 1, 2026."
+    },
+    {
+      "question_id": "TRV-007",
+      "department": "Travel",
+      "question": "If an employee's total travel expense is 50,001 INR, whose approval is required under Travel Policy v2?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-002_TRV-C04"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests strict near-boundary limit + 1 condition (INR 50,001 exceeding INR 50,000 threshold).",
+      "evidence_reason": "Clause TRV-C04 states expenses exceeding INR 50,000 require additional approval from the department director."
+    },
+    {
+      "question_id": "TRV-008",
+      "department": "Travel",
+      "question": "For emergency client deployments with under 48 hours notice where travel exceptions exceed 100,000 INR, what approval route and booking exemptions apply?",
+      "role": "manager",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-TRV-004_TRV-E01",
+        "DOC-TRV-004_TRV-E02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires manager-level access and combining the CFO approval threshold (> INR 100,000) with the under 48 hours advance booking exemption.",
+      "evidence_reason": "Clause TRV-E01 requires CFO approval for exceptions exceeding INR 100,000, and TRV-E02 provides advance booking exemption for emergency deployments under 48 hours notice."
+    },
+    {
+      "question_id": "TRV-009",
+      "department": "Travel",
+      "question": "What executive approval route is required for travel budget exceptions exceeding 100,000 INR?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "permission",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [
+        "DOC-TRV-004_TRV-E01"
+      ],
+      "difficulty_reason": "Diagnostic access boundary test: employee role is strictly barred from Travel Exceptions policy.",
+      "evidence_reason": "DOC-TRV-004 is restricted to manager, finance, and auditor roles. Employee role must receive no accessible evidence."
+    },
+    {
+      "question_id": "TRV-010",
+      "department": "Travel",
+      "question": "What is the reimbursement limit and quarantine allowance for employees traveling overseas with personal service pets?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "unsupported",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Plausible business query regarding pet travel that has no basis in Asterline policies.",
+      "evidence_reason": "Asterline travel policies contain no provisions for personal pet travel or animal quarantine reimbursement."
+    },
+    {
+      "question_id": "FIN-001",
+      "department": "Finance",
+      "question": "Within how many calendar days of incurring an expense must an employee submit their expense claim?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "easy",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-001_FIN-C02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Direct lookup of 30-day expense claim submission window.",
+      "evidence_reason": "Clause FIN-C02 specifies that expense claims must be submitted within 30 days of incurrence."
+    },
+    {
+      "question_id": "FIN-002",
+      "department": "Finance",
+      "question": "On which specific calendar days each month are approved employee expense reimbursements disbursed by direct deposit?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "paraphrase",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-002_FIN-R01"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Retrieves reimbursement payment cycle schedules under natural language enquiry.",
+      "evidence_reason": "Clause FIN-R01 establishes payments are disbursed twice monthly on the 15th and the final business day of each month."
+    },
+    {
+      "question_id": "FIN-003",
+      "department": "Finance",
+      "question": "What official exchange rate source is used to convert international expense claims incurred in foreign currencies into INR?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-002_FIN-R02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Retrieves currency settlement regulations and statutory rate source.",
+      "evidence_reason": "Clause FIN-R02 mandates settlement using the official Reserve Bank of India reference rate published on transaction date."
+    },
+    {
+      "question_id": "FIN-004",
+      "department": "Finance",
+      "question": "If an employee submits an incidental business expense receipt of exactly 1,000 INR, is a full itemized tax invoice required?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-002_FIN-R03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests boundary condition at exact limit of INR 1,000 for receipt verification threshold.",
+      "evidence_reason": "Clause FIN-R03 states incidental expenses up to and including INR 1,000 do not require an itemized tax receipt provided digital payment confirmation is attached."
+    },
+    {
+      "question_id": "FIN-005",
+      "department": "Finance",
+      "question": "What are the rules regarding supervisor SLA turnaround for claim approval and the subsequent reimbursement disbursement dates?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-001_FIN-C03",
+        "DOC-FIN-002_FIN-R01"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Synthesizes manager review SLA (5 working days in FIN-C03) with bi-monthly disbursement schedules in FIN-R01.",
+      "evidence_reason": "Clause FIN-C03 sets the 5-day manager approval SLA, and FIN-R01 defines payment disbursement on the 15th and final business day."
+    },
+    {
+      "question_id": "FIN-006",
+      "department": "Finance",
+      "question": "What monthly spend limit applies to corporate credit cards and what is the deadline for submitting monthly reconciliation statements?",
+      "role": "manager",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-003_FIN-K02",
+        "DOC-FIN-003_FIN-K03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires manager permission and joins monthly card limit (INR 200,000) with 10 business days reconciliation deadline.",
+      "evidence_reason": "Clause FIN-K02 establishes standard monthly limit of INR 200,000, and FIN-K03 sets reconciliation submission within 10 business days."
+    },
+    {
+      "question_id": "FIN-007",
+      "department": "Finance",
+      "question": "An employee incurred an incidental expense of 1,001 INR without an itemized tax invoice. Can this be reimbursed with payment confirmation alone?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-002_FIN-R03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Evaluates threshold boundary + 1 (INR 1,001 strictly exceeding INR 1,000 limit).",
+      "evidence_reason": "Clause FIN-R03 strictly mandates that incidental expenses exceeding INR 1,000 require an itemized tax invoice."
+    },
+    {
+      "question_id": "FIN-008",
+      "department": "Finance",
+      "question": "What minimum sample percentage must Internal Audit inspect during monthly expense reviews and for how long must audit working papers be preserved?",
+      "role": "auditor",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-FIN-004_FIN-A01",
+        "DOC-FIN-004_FIN-A03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires auditor-level authorization to combine the 10% sampling requirement with 7 fiscal years retention.",
+      "evidence_reason": "Clause FIN-A01 dictates sampling a minimum 10 percent of settled claims, and FIN-A03 mandates 7 fiscal years retention for audit working papers."
+    },
+    {
+      "question_id": "FIN-009",
+      "department": "Finance",
+      "question": "What criteria and protocols does Internal Audit follow when sampling employee reimbursement claims for discrepancy investigation?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "permission",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [
+        "DOC-FIN-004_FIN-A01"
+      ],
+      "difficulty_reason": "Diagnostic access boundary test: employee role is forbidden from viewing Expense Audits policy.",
+      "evidence_reason": "DOC-FIN-004 is restricted to finance and auditor roles only. Employee role must receive no accessible evidence."
+    },
+    {
+      "question_id": "FIN-010",
+      "department": "Finance",
+      "question": "What percentage matching does Asterline provide for employee salary deductions allocated to decentralized cryptocurrency index funds?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "unsupported",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Plausible investment question completely unsupported by Asterline finance policies.",
+      "evidence_reason": "Asterline policies do not offer cryptocurrency deductions, matching, or digital asset investment benefits."
+    },
+    {
+      "question_id": "PPO-001",
+      "department": "People Operations",
+      "question": "How many working days of paid annual vacation leave do full-time employees accrue in a year?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "easy",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-001_PPO-L01"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Direct lookup of 20 working days annual vacation leave entitlement.",
+      "evidence_reason": "Clause PPO-L01 establishes 20 working days paid annual vacation accrued pro-rata at 1.67 days per month."
+    },
+    {
+      "question_id": "PPO-002",
+      "department": "People Operations",
+      "question": "How many consecutive sick leave days can an employee take before a medical certificate from a registered practitioner becomes mandatory?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-001_PPO-L02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests sick leave threshold of up to 3 days self-certification versus >3 days medical certificate.",
+      "evidence_reason": "Clause PPO-L02 permits self-certification up to 3 consecutive days; exceeding 3 days requires a medical certificate."
+    },
+    {
+      "question_id": "PPO-003",
+      "department": "People Operations",
+      "question": "What are the designated daily core working hours during which remote team members must be accessible on company chat?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "paraphrase",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-002_PPO-R03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Locates remote work core availability schedule under paraphrased phrasing.",
+      "evidence_reason": "Clause PPO-R03 dictates remote employees must remain accessible between 10:00 AM and 4:00 PM local time."
+    },
+    {
+      "question_id": "PPO-004",
+      "department": "People Operations",
+      "question": "How many weeks of fully paid parental leave are granted to primary and secondary caregivers?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-001_PPO-L03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Direct query for parental leave breakdown for both caregivers.",
+      "evidence_reason": "Clause PPO-L03 provides 26 continuous weeks for primary caregivers and 4 weeks for secondary caregivers."
+    },
+    {
+      "question_id": "PPO-005",
+      "department": "People Operations",
+      "question": "What probationary milestone and home internet bandwidth standard must an employee satisfy to be eligible for three remote work days per week?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-002_PPO-R01",
+        "DOC-PPO-002_PPO-R02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires joining initial three-month probation completion with 50 mbps download bandwidth standard.",
+      "evidence_reason": "Clause PPO-R01 requires completing three-month probation to request up to three remote days, and PPO-R02 mandates 50 mbps download speed."
+    },
+    {
+      "question_id": "PPO-006",
+      "department": "People Operations",
+      "question": "What service tenure is required to claim course tuition assistance, and what is the annual educational assistance allowance cap?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-003_PPO-B01",
+        "DOC-PPO-003_PPO-B02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Combines 6 months continuous service requirement with the INR 75,000 annual educational assistance cap.",
+      "evidence_reason": "Clause PPO-B01 sets minimum tenure of six months, and PPO-B02 establishes educational allowance up to INR 75,000 under manager approval."
+    },
+    {
+      "question_id": "PPO-007",
+      "department": "People Operations",
+      "question": "An employee was absent for exactly 4 consecutive days due to illness. Is self-certification permissible upon return?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-001_PPO-L02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests boundary condition of 4 consecutive days (3 + 1 days exceeding the 3-day self-certification cap).",
+      "evidence_reason": "Clause PPO-L02 permits self-certification only up to 3 days; 4 consecutive days strictly requires a medical certificate."
+    },
+    {
+      "question_id": "PPO-008",
+      "department": "People Operations",
+      "question": "What minimum role tenure and authorization sign-offs are required before an employee can execute an internal transfer to another department?",
+      "role": "manager",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PPO-004_PPO-T01",
+        "DOC-PPO-004_PPO-T02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires manager/HR access and joins 12-month current role tenure with three-party agreement (releasing head, acquiring head, HRBP).",
+      "evidence_reason": "Clause PPO-T01 mandates 12 months minimum tenure, and PPO-T02 requires written agreement from releasing head, acquiring head, and HRBP."
+    },
+    {
+      "question_id": "PPO-009",
+      "department": "People Operations",
+      "question": "What is the maximum transition handover period a releasing department may retain an employee transferring to another group?",
+      "role": "auditor",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "permission",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [
+        "DOC-PPO-004_PPO-T03"
+      ],
+      "difficulty_reason": "Diagnostic access boundary test: auditor role is forbidden from viewing Employee Transfers policy.",
+      "evidence_reason": "DOC-PPO-004 is restricted to manager and hr roles. Auditor role must receive no accessible evidence."
+    },
+    {
+      "question_id": "PPO-010",
+      "department": "People Operations",
+      "question": "How many months of paid sabbatical leave are awarded to employees upon completing ten years of service?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "unsupported",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Plausible employment query about ten-year sabbatical leave absent from Asterline policies.",
+      "evidence_reason": "Asterline Leave and People Operations policies do not provide for sabbatical leave."
+    },
+    {
+      "question_id": "PRC-001",
+      "department": "Procurement",
+      "question": "Where must all commercial purchase requisitions for software, hardware, and services originate?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "easy",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-001_PRC-P01"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Direct query for purchase requisition origination system.",
+      "evidence_reason": "Clause PRC-P01 requires all commercial purchases to originate as approved electronic Purchase Requisitions in enterprise ERP."
+    },
+    {
+      "question_id": "PRC-002",
+      "department": "Procurement",
+      "question": "What minimum inspection warranty period from receipt must standard purchase orders incorporate?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-001_PRC-P03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Locates delivery terms and warranty timeframe requirements.",
+      "evidence_reason": "Clause PRC-P03 specifies standard freight terms and a minimum 30-day inspection warranty period from receipt."
+    },
+    {
+      "question_id": "PRC-003",
+      "department": "Procurement",
+      "question": "What statutory verification checks and tax filings are screened during prospective supplier due diligence?",
+      "role": "manager",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "paraphrase",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-002_PRC-V01"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Retrieves vendor onboarding due diligence criteria under manager role.",
+      "evidence_reason": "Clause PRC-V01 mandates statutory due diligence including corporate registration validation, tax compliance, and credit screening."
+    },
+    {
+      "question_id": "PRC-004",
+      "department": "Procurement",
+      "question": "Can a purchase order for exactly 150,000 INR be processed with a single qualified vendor quote?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-001_PRC-P02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests boundary condition at exactly INR 150,000 for competitive bidding threshold.",
+      "evidence_reason": "Clause PRC-P02 confirms purchase orders up to and including INR 150,000 may proceed with a single qualified vendor quote."
+    },
+    {
+      "question_id": "PRC-005",
+      "department": "Procurement",
+      "question": "For purchase requisitions exceeding 150,000 INR, how many competitive vendor bids are required and what minimum warranty period applies?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-001_PRC-P02",
+        "DOC-PRC-001_PRC-P03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Combines 3 competitive bids threshold with 30-day inspection warranty requirement.",
+      "evidence_reason": "Clause PRC-P02 requires at least three independent competitive bids for orders exceeding INR 150,000, and PRC-P03 mandates a 30-day warranty."
+    },
+    {
+      "question_id": "PRC-006",
+      "department": "Procurement",
+      "question": "What security assessment and compliance code execution are mandatory before onboarding vendors who handle proprietary data?",
+      "role": "manager",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-002_PRC-V02",
+        "DOC-PRC-002_PRC-V03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Synthesizes Information Security Supplier Assessment with Asterline Supplier Code of Conduct execution.",
+      "evidence_reason": "Clause PRC-V02 requires an Information Security Supplier Assessment, and PRC-V03 requires executing the Supplier Code of Conduct."
+    },
+    {
+      "question_id": "PRC-007",
+      "department": "Procurement",
+      "question": "If a procurement purchase order is valued at 150,001 INR, how many independent vendor quotes must be submitted?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-001_PRC-P02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests boundary + 1 condition (INR 150,001 strictly exceeding single-quote limit).",
+      "evidence_reason": "Clause PRC-P02 strictly mandates at least three independent competitive bids for purchases exceeding INR 150,000."
+    },
+    {
+      "question_id": "PRC-008",
+      "department": "Procurement",
+      "question": "Who holds sign-off authority for vendor contracts exceeding 12 months in duration, and what is the standard commercial liability cap?",
+      "role": "manager",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-PRC-003_PRC-C02",
+        "DOC-PRC-003_PRC-C03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires manager authorization and connects joint Legal/Procurement approval with twelve months fee liability limitation.",
+      "evidence_reason": "Clause PRC-C02 requires joint sign-off from Legal Counsel and Procurement for terms >12 months, and PRC-C03 caps mutual liability at twelve months fees."
+    },
+    {
+      "question_id": "PRC-009",
+      "department": "Procurement",
+      "question": "What is the maximum emergency purchase threshold that a Director can approve during operational crises without Board consent?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "permission",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [
+        "DOC-PRC-004_PRC-E01"
+      ],
+      "difficulty_reason": "Diagnostic access boundary test: employee role is excluded from Purchase Exceptions policy.",
+      "evidence_reason": "DOC-PRC-004 is restricted to manager, finance, and auditor roles. Employee role must receive no accessible evidence."
+    },
+    {
+      "question_id": "PRC-010",
+      "department": "Procurement",
+      "question": "What corporate fleet leasing discount rates are negotiated for executive vehicle purchases through commercial dealerships?",
+      "role": "manager",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "unsupported",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Plausible procurement question regarding vehicle fleet leasing absent from Asterline policies.",
+      "evidence_reason": "Asterline procurement policies contain no fleet leasing or executive vehicle discount agreements."
+    },
+    {
+      "question_id": "SEC-001",
+      "department": "Information Security",
+      "question": "What are the four classification tiers used for Asterline digital and physical information assets?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "easy",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-001_SEC-D01"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Direct query for the four data classification levels.",
+      "evidence_reason": "Clause SEC-D01 classifies all information assets into Public, Internal, Confidential, and Restricted tiers."
+    },
+    {
+      "question_id": "SEC-002",
+      "department": "Information Security",
+      "question": "What encryption standards are mandatory for company data classified under the Confidential tier?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "direct",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-001_SEC-D02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Locates technical cryptographic baseline for Confidential tier.",
+      "evidence_reason": "Clause SEC-D02 requires mandatory AES-256 encryption at rest and in transit for Confidential data."
+    },
+    {
+      "question_id": "SEC-003",
+      "department": "Information Security",
+      "question": "How frequently must privileged user permissions and system administrative rights undergo recertification review?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-002_SEC-A02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Tests retrieval of the 90-day recertification interval for administrative access.",
+      "evidence_reason": "Clause SEC-A02 mandates recertification review at intervals up to and including 90 days."
+    },
+    {
+      "question_id": "SEC-004",
+      "department": "Information Security",
+      "question": "What is the maximum allowed response and containment timeframe for Priority 1 critical security incidents?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "medium",
+      "question_type": "threshold",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-003_SEC-I02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Retrieves containment SLA for P1 incidents.",
+      "evidence_reason": "Clause SEC-I02 dictates Priority 1 critical incidents must be responded to and contained within 1 hour."
+    },
+    {
+      "question_id": "SEC-005",
+      "department": "Information Security",
+      "question": "What encryption standards apply to Restricted tier data and what classification headers are required on marked documents?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-001_SEC-D02",
+        "DOC-SEC-001_SEC-D03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Synthesizes HSM tokenized encryption rules with visual classification header labeling mandates.",
+      "evidence_reason": "Clause SEC-D02 requires HSM tokenized encryption for Restricted data, and SEC-D03 mandates prominent visual classification headers."
+    },
+    {
+      "question_id": "SEC-006",
+      "department": "Information Security",
+      "question": "What principle governs user account provisioning and what restriction prevents developers from deploying to production databases?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-002_SEC-A01",
+        "DOC-SEC-002_SEC-A03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Connects principle of least privilege with segregation of duties between development and production database deployment.",
+      "evidence_reason": "Clause SEC-A01 establishes the least privilege principle, and SEC-A03 prohibits developers holding production database deployment permissions."
+    },
+    {
+      "question_id": "SEC-007",
+      "department": "Information Security",
+      "question": "Within what timeframe must Priority 1 incidents be contained, and what is the deadline for publishing post-incident post-mortems to the CISO?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-003_SEC-I02",
+        "DOC-SEC-003_SEC-I03"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Joins 1-hour containment SLA with 72-hour CISO post-mortem publishing SLA.",
+      "evidence_reason": "Clause SEC-I02 mandates 1-hour containment for P1 incidents, and SEC-I03 requires publishing post-incident analysis to the CISO within 72 hours."
+    },
+    {
+      "question_id": "SEC-008",
+      "department": "Information Security",
+      "question": "For how many years must payroll records and customer connection logs be retained, and which NIST standard governs storage drive degaussing?",
+      "role": "security",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "multi_clause",
+      "answerability": true,
+      "gold_chunk_ids": [
+        "DOC-SEC-004_SEC-R01",
+        "DOC-SEC-004_SEC-R02"
+      ],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Requires security authorization to combine statutory retention (7 years payroll / 2 years logs) with NIST SP 800-88 sanitization.",
+      "evidence_reason": "Clause SEC-R01 specifies 7 years payroll and 2 years connection logs, and SEC-R02 mandates NIST SP 800-88 sanitization and degaussing."
+    },
+    {
+      "question_id": "SEC-009",
+      "department": "Information Security",
+      "question": "What statutory protocol exempts digital records related to active legal disputes from scheduled disposal destruction?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "permission",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [
+        "DOC-SEC-004_SEC-R03"
+      ],
+      "difficulty_reason": "Diagnostic access boundary test: employee role is excluded from Data Retention policy.",
+      "evidence_reason": "DOC-SEC-004 is restricted to security and auditor roles. Employee role must receive no accessible evidence."
+    },
+    {
+      "question_id": "SEC-010",
+      "department": "Information Security",
+      "question": "What security perimeter distance and flight clearance permits are required to operate personal recording drones around company campuses?",
+      "role": "employee",
+      "query_date": "2026-11-22",
+      "difficulty": "hard",
+      "question_type": "unsupported",
+      "answerability": false,
+      "gold_chunk_ids": [],
+      "restricted_target_chunk_ids": [],
+      "difficulty_reason": "Plausible physical security query absent from Asterline cybersecurity policies.",
+      "evidence_reason": "Asterline policies do not contain any drone flight permits, perimeter rules, or recreational aircraft guidelines."
+    }
+  ]
+}
