@@ -1,0 +1,10 @@
+{
+  "chunk_count": 64,
+  "chunking_strategy": "clause_level",
+  "document_count": 20,
+  "embedding_model": "BAAI/bge-small-en-v1.5",
+  "processed_fingerprint": "4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3",
+  "processing_schema_version": "1.0.0",
+  "rule_count": 32,
+  "source_fingerprint": "059437bd05830033ce79befc3a64f4ae80c20b45e0f199c69e1b049f110316c2"
+}
