@@ -489,17 +489,25 @@ class HybridRetriever:
         Returns:
             List of up to top_k RetrievalResult objects, filtered by permission and date.
         """
+        # 1. Validate top_k and candidate_depth
         if not isinstance(top_k, int) or top_k < 0:
             raise ValueError(f"Invalid top_k={top_k}. Must be a non-negative integer.")
         if not isinstance(candidate_depth, int) or candidate_depth <= 0:
             raise ValueError(f"Invalid candidate_depth={candidate_depth}. Must be a positive integer.")
 
-        # Blank or whitespace-only user questions produce no retrieval results, even when dense candidates are supplied
+        # 2. Validate role against approved enterprise roles
+        if role not in ALLOWED_ROLES_SET:
+            raise ValueError(f"Unknown role '{role}'. Allowed roles are: {sorted(ALLOWED_ROLES_SET)}")
+
+        # 3. Parse and validate query_date
+        validated_date = parse_query_date(query_date)
+
+        # 4. Check if query is empty or whitespace-only (after validating role and date)
         if not query or not query.strip():
             return []
 
-        # 1. Pre-filter eligible chunks before retrieval and ranking
-        eligible_chunks = filter_eligible_chunks(self.chunks, role, query_date)
+        # 5. Pre-filter eligible chunks using validated role and date
+        eligible_chunks = filter_eligible_chunks(self.chunks, role, validated_date)
         if not eligible_chunks:
             return []
 

@@ -790,7 +790,7 @@ def test_security_expired_dense_candidate_excluded(sample_chunks: List[Dict[str,
 
 
 def test_empty_or_whitespace_query_produces_no_results_even_with_dense(sample_chunks: List[Dict[str, Any]]):
-    """Empty or whitespace query string must return [] immediately without evaluating candidates."""
+    """Empty or whitespace query string must return [] when role and date are valid, even with dense candidates."""
     retriever = HybridRetriever(chunks=sample_chunks)
     dense_candidates = [
         Candidate(chunk_id="DOC-TRV-002_TRV-C02", score=0.99, rank=1),
@@ -799,6 +799,42 @@ def test_empty_or_whitespace_query_produces_no_results_even_with_dense(sample_ch
     assert retriever.search("", role="employee", dense_candidates=dense_candidates) == []
     assert retriever.search("   ", role="employee", dense_candidates=dense_candidates) == []
     assert retriever.search("\t\n", role="employee", dense_candidates=dense_candidates) == []
+
+
+def test_search_input_validation_order_and_empty_queries(sample_chunks: List[Dict[str, Any]]):
+    """Verify role and date validation precede empty query check in HybridRetriever.search."""
+    retriever = HybridRetriever(chunks=sample_chunks)
+    dense_candidates = [
+        Candidate(chunk_id="DOC-TRV-002_TRV-C02", score=0.99, rank=1),
+    ]
+
+    # 1. Empty query with unknown role 'contractor' raises ValueError
+    with pytest.raises(ValueError, match="Unknown role 'contractor'"):
+        retriever.search("", role="contractor", query_date="2026-11-22")
+
+    # 2. Whitespace query with unknown role 'superadmin' raises ValueError
+    with pytest.raises(ValueError, match="Unknown role 'superadmin'"):
+        retriever.search("   ", role="superadmin", query_date="2026-11-22")
+
+    # 3. Empty query with invalid date '2026/11/22' raises ValueError
+    with pytest.raises(ValueError, match="Malformed query date '2026/11/22'"):
+        retriever.search("", role="employee", query_date="2026/11/22")
+
+    # 4. Empty query with explicit empty date '' raises ValueError
+    with pytest.raises(ValueError, match="explicit empty string"):
+        retriever.search("", role="employee", query_date="")
+
+    # 5. Valid role and date with empty query returns []
+    assert retriever.search("", role="employee", query_date="2026-11-22") == []
+
+    # 6. Valid role and date with whitespace query returns [], even when dense candidates are supplied
+    assert retriever.search("   ", role="employee", query_date="2026-11-22", dense_candidates=dense_candidates) == []
+    assert retriever.search("\t\n", role="employee", query_date="2026-11-22", dense_candidates=dense_candidates) == []
+
+    # 7. A normal query still retrieves eligible chunks
+    results = retriever.search("domestic flight", role="employee", query_date="2026-11-22", top_k=2)
+    assert len(results) > 0
+    assert all("employee" in r.allowed_roles for r in results)
 
 
 def test_hybrid_retriever_rejects_negative_limits_and_depth(sample_chunks: List[Dict[str, Any]]):
