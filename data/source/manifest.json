@@ -1,0 +1,476 @@
+{
+  "company": "Asterline Services Group",
+  "document_count": 20,
+  "documents": [
+    {
+      "clause_ids": [
+        "TRV-C01",
+        "TRV-C02",
+        "TRV-C03",
+        "TRV-C04",
+        "TRV-C05"
+      ],
+      "department": "Travel",
+      "doc_id": "DOC-TRV-001",
+      "effective_from": "2026-01-01",
+      "effective_to": "2026-06-30",
+      "filename": "travel_policy_v1.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-TRV-001",
+        "R-TRV-002"
+      ],
+      "title": "Travel Policy v1",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "TRV-C01",
+        "TRV-C02",
+        "TRV-C03",
+        "TRV-C04",
+        "TRV-C05"
+      ],
+      "department": "Travel",
+      "doc_id": "DOC-TRV-002",
+      "effective_from": "2026-07-01",
+      "effective_to": "2099-12-31",
+      "filename": "travel_policy_v2.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-TRV-003",
+        "R-TRV-004"
+      ],
+      "title": "Travel Policy v2",
+      "version": "2.0"
+    },
+    {
+      "clause_ids": [
+        "TRV-B01",
+        "TRV-B02",
+        "TRV-B03"
+      ],
+      "department": "Travel",
+      "doc_id": "DOC-TRV-003",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "travel_booking.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-TRV-005",
+        "R-TRV-006"
+      ],
+      "title": "Travel Booking",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "TRV-E01",
+        "TRV-E02",
+        "TRV-E03"
+      ],
+      "department": "Travel",
+      "doc_id": "DOC-TRV-004",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "travel_exceptions.pdf",
+      "permitted_roles": [
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-TRV-007",
+        "R-TRV-008"
+      ],
+      "title": "Travel Exceptions",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "FIN-C01",
+        "FIN-C02",
+        "FIN-C03"
+      ],
+      "department": "Finance",
+      "doc_id": "DOC-FIN-001",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "expense_claims.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-FIN-001",
+        "R-FIN-002"
+      ],
+      "title": "Expense Claims",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "FIN-R01",
+        "FIN-R02",
+        "FIN-R03"
+      ],
+      "department": "Finance",
+      "doc_id": "DOC-FIN-002",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "reimbursements.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-FIN-003",
+        "R-FIN-004"
+      ],
+      "title": "Reimbursements",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "FIN-K01",
+        "FIN-K02",
+        "FIN-K03"
+      ],
+      "department": "Finance",
+      "doc_id": "DOC-FIN-003",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "corporate_cards.pdf",
+      "permitted_roles": [
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-FIN-005",
+        "R-FIN-006"
+      ],
+      "title": "Corporate Cards",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "FIN-A01",
+        "FIN-A02",
+        "FIN-A03"
+      ],
+      "department": "Finance",
+      "doc_id": "DOC-FIN-004",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "expense_audits.pdf",
+      "permitted_roles": [
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [],
+      "title": "Expense Audits",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PPO-L01",
+        "PPO-L02",
+        "PPO-L03"
+      ],
+      "department": "People Operations",
+      "doc_id": "DOC-PPO-001",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "leave_policy.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "hr",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-PPO-001",
+        "R-PPO-002"
+      ],
+      "title": "Leave Policy",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PPO-R01",
+        "PPO-R02",
+        "PPO-R03"
+      ],
+      "department": "People Operations",
+      "doc_id": "DOC-PPO-002",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "remote_work.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "hr",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-PPO-003",
+        "R-PPO-004"
+      ],
+      "title": "Remote Work",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PPO-B01",
+        "PPO-B02",
+        "PPO-B03"
+      ],
+      "department": "People Operations",
+      "doc_id": "DOC-PPO-003",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "learning_benefits.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "hr",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-PPO-005",
+        "R-PPO-006"
+      ],
+      "title": "Learning Benefits",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PPO-T01",
+        "PPO-T02",
+        "PPO-T03"
+      ],
+      "department": "People Operations",
+      "doc_id": "DOC-PPO-004",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "employee_transfers.pdf",
+      "permitted_roles": [
+        "manager",
+        "hr"
+      ],
+      "related_rule_ids": [],
+      "title": "Employee Transfers",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PRC-P01",
+        "PRC-P02",
+        "PRC-P03"
+      ],
+      "department": "Procurement",
+      "doc_id": "DOC-PRC-001",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "purchase_requests.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-PRC-001",
+        "R-PRC-002"
+      ],
+      "title": "Purchase Requests",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PRC-V01",
+        "PRC-V02",
+        "PRC-V03"
+      ],
+      "department": "Procurement",
+      "doc_id": "DOC-PRC-002",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "vendor_onboarding.pdf",
+      "permitted_roles": [
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [],
+      "title": "Vendor Onboarding",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PRC-C01",
+        "PRC-C02",
+        "PRC-C03"
+      ],
+      "department": "Procurement",
+      "doc_id": "DOC-PRC-003",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "contract_approval.pdf",
+      "permitted_roles": [
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-PRC-003",
+        "R-PRC-004"
+      ],
+      "title": "Contract Approval",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "PRC-E01",
+        "PRC-E02",
+        "PRC-E03"
+      ],
+      "department": "Procurement",
+      "doc_id": "DOC-PRC-004",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "purchase_exceptions.pdf",
+      "permitted_roles": [
+        "manager",
+        "finance",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-PRC-005",
+        "R-PRC-006"
+      ],
+      "title": "Purchase Exceptions",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "SEC-D01",
+        "SEC-D02",
+        "SEC-D03"
+      ],
+      "department": "Information Security",
+      "doc_id": "DOC-SEC-001",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "data_classification.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "security",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-SEC-001",
+        "R-SEC-002"
+      ],
+      "title": "Data Classification",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "SEC-A01",
+        "SEC-A02",
+        "SEC-A03"
+      ],
+      "department": "Information Security",
+      "doc_id": "DOC-SEC-002",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "access_requests.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "security",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-SEC-003",
+        "R-SEC-004"
+      ],
+      "title": "Access Requests",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "SEC-I01",
+        "SEC-I02",
+        "SEC-I03"
+      ],
+      "department": "Information Security",
+      "doc_id": "DOC-SEC-003",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "incident_reporting.pdf",
+      "permitted_roles": [
+        "employee",
+        "manager",
+        "security",
+        "auditor"
+      ],
+      "related_rule_ids": [
+        "R-SEC-005",
+        "R-SEC-006"
+      ],
+      "title": "Incident Reporting",
+      "version": "1.0"
+    },
+    {
+      "clause_ids": [
+        "SEC-R01",
+        "SEC-R02",
+        "SEC-R03"
+      ],
+      "department": "Information Security",
+      "doc_id": "DOC-SEC-004",
+      "effective_from": "2026-01-01",
+      "effective_to": "2099-12-31",
+      "filename": "data_retention.pdf",
+      "permitted_roles": [
+        "security",
+        "auditor"
+      ],
+      "related_rule_ids": [],
+      "title": "Data Retention",
+      "version": "1.0"
+    }
+  ],
+  "roles": [
+    "employee",
+    "manager",
+    "hr",
+    "finance",
+    "security",
+    "auditor"
+  ],
+  "rule_count": 32
+}

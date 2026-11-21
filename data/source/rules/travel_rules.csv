@@ -1,0 +1,9 @@
+rule_id,doc_id,clause_id,condition_field,operator,threshold_value,unit,outcome,effective_from,effective_to
+R-TRV-001,DOC-TRV-001,TRV-C04,expense_amount,<=,40000,INR,standard_approval,2026-01-01,2026-06-30
+R-TRV-002,DOC-TRV-001,TRV-C04,expense_amount,>,40000,INR,additional_approval,2026-01-01,2026-06-30
+R-TRV-003,DOC-TRV-002,TRV-C04,expense_amount,<=,50000,INR,standard_approval,2026-07-01,2099-12-31
+R-TRV-004,DOC-TRV-002,TRV-C04,expense_amount,>,50000,INR,additional_approval,2026-07-01,2099-12-31
+R-TRV-005,DOC-TRV-003,TRV-B02,advance_booking_days,>=,14,days,standard_booking,2026-01-01,2099-12-31
+R-TRV-006,DOC-TRV-003,TRV-B02,advance_booking_days,<,14,days,expedited_approval_required,2026-01-01,2099-12-31
+R-TRV-007,DOC-TRV-004,TRV-E01,exception_amount,<=,100000,INR,vp_approval,2026-01-01,2099-12-31
+R-TRV-008,DOC-TRV-004,TRV-E01,exception_amount,>,100000,INR,cfo_approval,2026-01-01,2099-12-31

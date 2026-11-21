@@ -1,0 +1,116 @@
+{
+  "company": "Asterline Services Group",
+  "roles": {
+    "auditor": {
+      "allowed_documents": [
+        "DOC-FIN-001",
+        "DOC-FIN-002",
+        "DOC-FIN-003",
+        "DOC-FIN-004",
+        "DOC-PPO-001",
+        "DOC-PPO-002",
+        "DOC-PPO-003",
+        "DOC-PRC-001",
+        "DOC-PRC-002",
+        "DOC-PRC-003",
+        "DOC-PRC-004",
+        "DOC-SEC-001",
+        "DOC-SEC-002",
+        "DOC-SEC-003",
+        "DOC-SEC-004",
+        "DOC-TRV-001",
+        "DOC-TRV-002",
+        "DOC-TRV-003",
+        "DOC-TRV-004"
+      ],
+      "description": "Compliance auditor with explicit read access to auditable financial, operational, and security policies.",
+      "document_count": 19,
+      "role": "auditor"
+    },
+    "employee": {
+      "allowed_documents": [
+        "DOC-FIN-001",
+        "DOC-FIN-002",
+        "DOC-PPO-001",
+        "DOC-PPO-002",
+        "DOC-PPO-003",
+        "DOC-PRC-001",
+        "DOC-SEC-001",
+        "DOC-SEC-002",
+        "DOC-SEC-003",
+        "DOC-TRV-001",
+        "DOC-TRV-002",
+        "DOC-TRV-003"
+      ],
+      "description": "Standard employee role with access to general workplace, travel, and conduct policies.",
+      "document_count": 12,
+      "role": "employee"
+    },
+    "finance": {
+      "allowed_documents": [
+        "DOC-FIN-001",
+        "DOC-FIN-002",
+        "DOC-FIN-003",
+        "DOC-FIN-004",
+        "DOC-PRC-001",
+        "DOC-PRC-002",
+        "DOC-PRC-003",
+        "DOC-PRC-004",
+        "DOC-TRV-001",
+        "DOC-TRV-002",
+        "DOC-TRV-003",
+        "DOC-TRV-004"
+      ],
+      "description": "Finance specialist with operational access to travel, expense, card, and procurement governance.",
+      "document_count": 12,
+      "role": "finance"
+    },
+    "hr": {
+      "allowed_documents": [
+        "DOC-PPO-001",
+        "DOC-PPO-002",
+        "DOC-PPO-003",
+        "DOC-PPO-004"
+      ],
+      "description": "People Operations specialist with access to employee welfare and personnel governance policies.",
+      "document_count": 4,
+      "role": "hr"
+    },
+    "manager": {
+      "allowed_documents": [
+        "DOC-FIN-001",
+        "DOC-FIN-002",
+        "DOC-FIN-003",
+        "DOC-PPO-001",
+        "DOC-PPO-002",
+        "DOC-PPO-003",
+        "DOC-PPO-004",
+        "DOC-PRC-001",
+        "DOC-PRC-002",
+        "DOC-PRC-003",
+        "DOC-PRC-004",
+        "DOC-SEC-001",
+        "DOC-SEC-002",
+        "DOC-SEC-003",
+        "DOC-TRV-001",
+        "DOC-TRV-002",
+        "DOC-TRV-003",
+        "DOC-TRV-004"
+      ],
+      "description": "Team manager role with operational approval and departmental transfer authority.",
+      "document_count": 18,
+      "role": "manager"
+    },
+    "security": {
+      "allowed_documents": [
+        "DOC-SEC-001",
+        "DOC-SEC-002",
+        "DOC-SEC-003",
+        "DOC-SEC-004"
+      ],
+      "description": "Information Security officer with access to data protection, access controls, and retention rules.",
+      "document_count": 4,
+      "role": "security"
+    }
+  }
+}

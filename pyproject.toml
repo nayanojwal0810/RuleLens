@@ -8,11 +8,14 @@ version = "0.1.0"
 description = "Enterprise Policy Intelligence Engine"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
-dependencies = []
+dependencies = [
+    "reportlab>=4.0.0",
+]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "pymupdf>=2.0.0",
 ]
 
 [tool.setuptools.packages.find]

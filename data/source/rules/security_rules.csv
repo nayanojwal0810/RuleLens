@@ -1,0 +1,7 @@
+rule_id,doc_id,clause_id,condition_field,operator,threshold_value,unit,outcome,effective_from,effective_to
+R-SEC-001,DOC-SEC-001,SEC-D02,data_classification_tier,==,Confidential,tier,aes_256_mandatory,2026-01-01,2099-12-31
+R-SEC-002,DOC-SEC-001,SEC-D02,data_classification_tier,==,Restricted,tier,hsm_tokenized_encryption,2026-01-01,2099-12-31
+R-SEC-003,DOC-SEC-002,SEC-A02,privileged_role_review_interval_days,<=,90,days,access_recertification_compliant,2026-01-01,2099-12-31
+R-SEC-004,DOC-SEC-002,SEC-A02,privileged_role_review_interval_days,>,90,days,automatic_account_suspension,2026-01-01,2099-12-31
+R-SEC-005,DOC-SEC-003,SEC-I02,incident_severity_p1_response_hours,<=,1,hours,sla_met,2026-01-01,2099-12-31
+R-SEC-006,DOC-SEC-003,SEC-I02,incident_severity_p1_response_hours,>,1,hours,sla_breach_escalation,2026-01-01,2099-12-31

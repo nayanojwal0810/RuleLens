@@ -1,0 +1,7 @@
+rule_id,doc_id,clause_id,condition_field,operator,threshold_value,unit,outcome,effective_from,effective_to
+R-FIN-001,DOC-FIN-001,FIN-C02,submission_delay_days,<=,30,days,eligible_reimbursement,2026-01-01,2099-12-31
+R-FIN-002,DOC-FIN-001,FIN-C02,submission_delay_days,>,30,days,requires_late_exception,2026-01-01,2099-12-31
+R-FIN-003,DOC-FIN-002,FIN-R03,receipt_amount,<=,1000,INR,no_receipt_required,2026-01-01,2099-12-31
+R-FIN-004,DOC-FIN-002,FIN-R03,receipt_amount,>,1000,INR,itemized_receipt_required,2026-01-01,2099-12-31
+R-FIN-005,DOC-FIN-003,FIN-K02,monthly_spend,<=,200000,INR,within_standard_card_limit,2026-01-01,2099-12-31
+R-FIN-006,DOC-FIN-003,FIN-K02,monthly_spend,>,200000,INR,card_limit_escalation_required,2026-01-01,2099-12-31

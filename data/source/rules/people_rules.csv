@@ -1,0 +1,7 @@
+rule_id,doc_id,clause_id,condition_field,operator,threshold_value,unit,outcome,effective_from,effective_to
+R-PPO-001,DOC-PPO-001,PPO-L02,consecutive_sick_days,<=,3,days,self_certification,2026-01-01,2099-12-31
+R-PPO-002,DOC-PPO-001,PPO-L02,consecutive_sick_days,>,3,days,medical_certificate_required,2026-01-01,2099-12-31
+R-PPO-003,DOC-PPO-002,PPO-R02,internet_speed_mbps,>=,50,mbps,remote_setup_compliant,2026-01-01,2099-12-31
+R-PPO-004,DOC-PPO-002,PPO-R02,internet_speed_mbps,<,50,mbps,remediation_required,2026-01-01,2099-12-31
+R-PPO-005,DOC-PPO-003,PPO-B02,annual_tuition_claim,<=,75000,INR,standard_tuition_grant,2026-01-01,2099-12-31
+R-PPO-006,DOC-PPO-003,PPO-B02,annual_tuition_claim,>,75000,INR,committee_review_required,2026-01-01,2099-12-31

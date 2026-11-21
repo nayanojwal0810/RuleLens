@@ -1,0 +1,7 @@
+rule_id,doc_id,clause_id,condition_field,operator,threshold_value,unit,outcome,effective_from,effective_to
+R-PRC-001,DOC-PRC-001,PRC-P02,order_amount,<=,150000,INR,single_quote_permitted,2026-01-01,2099-12-31
+R-PRC-002,DOC-PRC-001,PRC-P02,order_amount,>,150000,INR,three_competitive_quotes_required,2026-01-01,2099-12-31
+R-PRC-003,DOC-PRC-003,PRC-C02,contract_duration_months,<=,12,months,department_lead_signoff,2026-01-01,2099-12-31
+R-PRC-004,DOC-PRC-003,PRC-C02,contract_duration_months,>,12,months,legal_and_procurement_signoff,2026-01-01,2099-12-31
+R-PRC-005,DOC-PRC-004,PRC-E01,emergency_purchase_amount,<=,300000,INR,director_emergency_approval,2026-01-01,2099-12-31
+R-PRC-006,DOC-PRC-004,PRC-E01,emergency_purchase_amount,>,300000,INR,board_procurement_committee,2026-01-01,2099-12-31
