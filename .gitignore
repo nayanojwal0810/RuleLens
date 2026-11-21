@@ -72,5 +72,4 @@ temp/
 outputs/
 
 # Private documents, guidebooks, and plans
-*.pdf
 RuleLens_Implementation_Guidebook*.pdf

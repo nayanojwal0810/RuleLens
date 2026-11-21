@@ -14,16 +14,12 @@ def test_package_version():
 def test_model_identifiers():
     """Verify embedding and generation model identifier constants."""
     assert config.EMBEDDING_MODEL == "BAAI/bge-small-en-v1.5"
-    assert config.EMBEDDING_MODEL_ID == "BAAI/bge-small-en-v1.5"
     assert config.GENERATION_MODEL == "openai/gpt-oss-20b"
-    assert config.GENERATION_MODEL_ID == "openai/gpt-oss-20b"
 
 
 def test_evidence_limit():
-    """Verify initial generation evidence limit equals 4."""
-    assert config.INITIAL_GENERATION_EVIDENCE_LIMIT == 4
+    """Verify generation evidence limit equals 4."""
     assert config.GENERATION_EVIDENCE_LIMIT == 4
-    assert config.EVIDENCE_LIMIT == 4
 
 
 def test_env_var_constants():
@@ -70,4 +66,4 @@ def test_no_external_services_called(monkeypatch):
     reloaded = importlib.reload(config)
     _ = reloaded.get_config()
     _ = reloaded.get_env_var("GROQ_API_KEY")
-    assert reloaded.INITIAL_GENERATION_EVIDENCE_LIMIT == 4
+    assert reloaded.GENERATION_EVIDENCE_LIMIT == 4

@@ -10,14 +10,10 @@ QDRANT_API_KEY: str = "QDRANT_API_KEY"
 
 # Model identifiers
 EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
-EMBEDDING_MODEL_ID: str = "BAAI/bge-small-en-v1.5"
 GENERATION_MODEL: str = "openai/gpt-oss-20b"
-GENERATION_MODEL_ID: str = "openai/gpt-oss-20b"
 
 # Evidence limits
-INITIAL_GENERATION_EVIDENCE_LIMIT: int = 4
 GENERATION_EVIDENCE_LIMIT: int = 4
-EVIDENCE_LIMIT: int = 4
 
 
 def get_env_var(name: str, default: Optional[str] = None) -> Optional[str]:
