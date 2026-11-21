@@ -2,6 +2,7 @@
 
 Combines BM25 lexical search and BGE-small dense embeddings using
 Reciprocal Rank Fusion (RRF) with role-based and temporal eligibility filtering.
+Supports local CPU dense retrieval and Qdrant Cloud vector search.
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ EMBEDDING_DIMENSION: int = 384
 
 # Approved enterprise roles for validation
 ALLOWED_ROLES_SET: Set[str] = set(ROLES)
+
+# Official BGE query instruction for retrieval
+BGE_QUERY_INSTRUCTION: str = "Represent this sentence for searching relevant passages: "
 
 # Tokenization regex: lowercase word and number tokens
 WORD_TOKEN_PATTERN: re.Pattern = re.compile(r"\b\w+\b")
@@ -124,12 +128,11 @@ def filter_eligible_chunks(
     query_date: Optional[Union[str, datetime.date]] = None,
 ) -> List[Dict[str, Any]]:
     """Filter a collection of chunks to those eligible for the given role and query date."""
-    # Will raise ValueError on unknown role or malformed date
-    parse_query_date(query_date)
+    validated_date = parse_query_date(query_date)
     if role not in ALLOWED_ROLES_SET:
         raise ValueError(f"Unknown role '{role}'. Allowed roles are: {sorted(ALLOWED_ROLES_SET)}")
 
-    return [c for c in chunks if is_chunk_eligible(c, role, query_date)]
+    return [c for c in chunks if is_chunk_eligible(c, role, validated_date)]
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,7 @@ class BGEEmbedder:
 
     Loads the model lazily on first embedding request.
     Uses CPU by default and generates normalized 384-dimensional embeddings.
+    Applies the BGE query instruction to search questions but not passage texts.
     """
 
     def __init__(
@@ -262,7 +266,7 @@ class BGEEmbedder:
         return self._model
 
     def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
-        """Batch-embed a sequence of text strings.
+        """Batch-embed a sequence of passage text strings without query instruction.
 
         Returns:
             List of 384-dimensional normalized float vectors.
@@ -293,10 +297,79 @@ class BGEEmbedder:
         return validated_vectors
 
     def embed_query(self, query: str) -> List[float]:
-        """Embed a single query string into a 384-dimensional normalized vector."""
+        """Embed a single query string with the BGE query instruction.
+
+        Appends the official BGE query instruction exactly once before embedding.
+        """
         if not query or not query.strip():
             raise ValueError("Query string cannot be empty or whitespace only")
-        return self.embed_texts([query])[0]
+
+        clean = query.strip()
+        if clean.startswith(BGE_QUERY_INSTRUCTION):
+            prefixed = clean
+        else:
+            prefixed = f"{BGE_QUERY_INSTRUCTION}{clean}"
+
+        return self.embed_texts([prefixed])[0]
+
+
+def normalize_dense_candidates(
+    raw_candidates: Sequence[Union[Candidate, Dict[str, Any], Tuple[str, float]]],
+    eligible_ids: Set[str],
+    chunks_by_id: Dict[str, Dict[str, Any]],
+    candidate_depth: int = DEFAULT_CANDIDATE_DEPTH,
+) -> List[Candidate]:
+    """Normalize raw dense candidates across local or Qdrant search results.
+
+    1. Validate chunk ID and finite similarity score.
+    2. Reject unknown chunks not in canonical corpus.
+    3. Apply permission and date eligibility.
+    4. Deduplicate by chunk ID, keeping the best score.
+    5. Sort by descending similarity with chunk-ID tie-breaking.
+    6. Assign consecutive ranks starting at 1.
+    7. Restrict the list to the requested candidate depth.
+    """
+    best_scores: Dict[str, float] = {}
+
+    for item in raw_candidates:
+        if isinstance(item, Candidate):
+            cid = item.chunk_id
+            score = float(item.score)
+        elif isinstance(item, dict):
+            cid = str(item["chunk_id"])
+            score = float(item.get("score", 0.0))
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            cid = str(item[0])
+            score = float(item[1])
+        else:
+            raise TypeError(f"Unsupported dense candidate type: {type(item)}")
+
+        if not math.isfinite(score):
+            raise ValueError(f"Non-finite similarity score for chunk '{cid}': {score}")
+
+        if cid not in chunks_by_id:
+            raise KeyError(f"Unknown chunk '{cid}' not found in canonical corpus")
+
+        if cid not in eligible_ids:
+            continue
+
+        if cid not in best_scores or score > best_scores[cid]:
+            best_scores[cid] = score
+
+    # Sort descending by similarity score, tie-break by chunk_id
+    sorted_items = sorted(best_scores.items(), key=lambda x: (-x[1], x[0]))
+
+    candidates: List[Candidate] = []
+    for rank_idx, (cid, score) in enumerate(sorted_items[:candidate_depth], start=1):
+        candidates.append(
+            Candidate(
+                chunk_id=cid,
+                score=score,
+                rank=rank_idx,
+                chunk=chunks_by_id[cid],
+            )
+        )
+    return candidates
 
 
 def reciprocal_rank_fusion(
@@ -454,17 +527,79 @@ def load_validated_corpus(base_dir: Optional[Union[Path, str]] = None) -> List[D
 
 
 class HybridRetriever:
-    """Offline hybrid retriever coordinating BM25, permission filtering, and RRF fusion."""
+    """Hybrid retriever coordinating BM25, local dense, Qdrant Cloud, and RRF fusion."""
 
     def __init__(
         self,
         chunks: Optional[List[Dict[str, Any]]] = None,
         base_dir: Optional[Union[Path, str]] = None,
         embedder: Optional[BGEEmbedder] = None,
+        corpus_manifest: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self.chunks = chunks if chunks is not None else load_validated_corpus(base_dir)
+        self.base_dir = Path(base_dir) if base_dir else Path.cwd()
+        self.chunks = chunks if chunks is not None else load_validated_corpus(self.base_dir)
         self.chunks_by_id = {c["chunk_id"]: c for c in self.chunks}
         self.embedder = embedder or BGEEmbedder()
+        self.corpus_manifest = corpus_manifest
+        if self.corpus_manifest is None:
+            manifest_path = self.base_dir / "data" / "processed" / "corpus_manifest.json"
+            if manifest_path.exists():
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    self.corpus_manifest = json.load(f)
+
+        # Bounded in-memory cache for BM25Index per distinct eligible chunk set
+        self._bm25_cache: Dict[Tuple[str, ...], BM25Index] = {}
+        self._bm25_cache_max_size: int = 32
+
+        # Cached document embeddings for local dense retrieval
+        self._dense_embeddings_cache: Optional[Dict[str, List[float]]] = None
+
+    def get_bm25_index(self, eligible_chunks: Sequence[Dict[str, Any]]) -> BM25Index:
+        """Retrieve or construct a cached BM25Index for the exact eligible chunk set."""
+        cache_key = tuple(c["chunk_id"] for c in eligible_chunks)
+        if cache_key not in self._bm25_cache:
+            if len(self._bm25_cache) >= self._bm25_cache_max_size:
+                # FIFO eviction
+                self._bm25_cache.pop(next(iter(self._bm25_cache)))
+            self._bm25_cache[cache_key] = BM25Index(eligible_chunks)
+        return self._bm25_cache[cache_key]
+
+    def get_dense_embeddings(self) -> Dict[str, List[float]]:
+        """Compute or retrieve cached 384-d normalized embeddings for all 64 corpus chunks."""
+        if self._dense_embeddings_cache is None:
+            texts = [c["text"] for c in self.chunks]
+            cids = [c["chunk_id"] for c in self.chunks]
+            vectors = self.embedder.embed_texts(texts)
+            self._dense_embeddings_cache = {cid: vec for cid, vec in zip(cids, vectors)}
+        return self._dense_embeddings_cache
+
+    def dense_search(
+        self,
+        query: str,
+        eligible_ids: Set[str],
+        top_k: int = DEFAULT_CANDIDATE_DEPTH,
+    ) -> List[Candidate]:
+        """Execute local dense retrieval using BGE-small embeddings and cosine similarity."""
+        query_vec = self.embedder.embed_query(query)
+        doc_embeddings = self.get_dense_embeddings()
+
+        raw_candidates: List[Tuple[str, float]] = []
+        for cid in eligible_ids:
+            doc_vec = doc_embeddings.get(cid)
+            if doc_vec is None:
+                continue
+            # Cosine similarity for normalized vectors is the dot product
+            sim = sum(q * d for q, d in zip(query_vec, doc_vec))
+            if not math.isfinite(sim):
+                raise ValueError(f"Non-finite similarity score for chunk '{cid}': {sim}")
+            raw_candidates.append((cid, float(sim)))
+
+        return normalize_dense_candidates(
+            raw_candidates=raw_candidates,
+            eligible_ids=eligible_ids,
+            chunks_by_id=self.chunks_by_id,
+            candidate_depth=top_k,
+        )
 
     def search(
         self,
@@ -472,6 +607,9 @@ class HybridRetriever:
         role: str,
         query_date: Optional[Union[str, datetime.date]] = None,
         dense_candidates: Optional[Sequence[Union[Candidate, Dict[str, Any]]]] = None,
+        mode: Optional[str] = None,
+        dense_backend: str = "local",
+        qdrant_client: Optional[Any] = None,
         top_k: int = DEFAULT_TOP_K,
         candidate_depth: int = DEFAULT_CANDIDATE_DEPTH,
     ) -> List[RetrievalResult]:
@@ -482,7 +620,10 @@ class HybridRetriever:
             role: Employee role requesting retrieval (must be one of ROLES).
             query_date: Policy effective date (defaults to today).
             dense_candidates: Optional dense candidates (e.g. from vector search or mock).
-                If None, only BM25 candidates are used (does not fabricate dense results).
+            mode: Retrieval mode: 'bm25', 'dense', or 'hybrid' (defaults to 'hybrid' if dense
+                candidates/model available, else legacy BM25 compatibility).
+            dense_backend: Dense retrieval provider: 'local' (default) or 'qdrant'.
+            qdrant_client: Optional QdrantClient instance for 'qdrant' dense backend.
             top_k: Number of final RRF results to return (default 4).
             candidate_depth: Number of candidate results to take from each retriever (default 20).
 
@@ -506,6 +647,19 @@ class HybridRetriever:
         if not query or not query.strip():
             return []
 
+        # Validate mode if provided
+        if mode is not None and mode not in ("bm25", "dense", "hybrid"):
+            raise ValueError(f"Unknown retrieval mode '{mode}'. Supported modes: 'bm25', 'dense', 'hybrid'.")
+
+        effective_mode = mode
+        if effective_mode is None:
+            if dense_candidates is not None:
+                effective_mode = "hybrid"
+            elif getattr(self.embedder, "_model", None) is not None:
+                effective_mode = "hybrid"
+            else:
+                effective_mode = "bm25"
+
         # 5. Pre-filter eligible chunks using validated role and date
         eligible_chunks = filter_eligible_chunks(self.chunks, role, validated_date)
         if not eligible_chunks:
@@ -513,44 +667,112 @@ class HybridRetriever:
 
         eligible_ids: Set[str] = {c["chunk_id"] for c in eligible_chunks}
 
-        # 2. BM25 search on eligible chunks
-        bm25_index = BM25Index(eligible_chunks)
-        bm25_candidates = bm25_index.search(query, top_k=candidate_depth)
+        # 6. BM25 Search (using cached index for eligible chunk set)
+        bm25_candidates: List[Candidate] = []
+        if effective_mode in ("bm25", "hybrid"):
+            bm25_index = self.get_bm25_index(eligible_chunks)
+            bm25_candidates = bm25_index.search(query, top_k=candidate_depth)
 
-        # 3. Dense candidates handling: filter eligible and assign consecutive ranks 1..N preserving scores
-        eligible_dense_candidates: List[Candidate] = []
-        if dense_candidates is not None:
-            raw_eligible: List[Tuple[str, float]] = []
-            seen_cids: Set[str] = set()
-            for item in dense_candidates:
-                if isinstance(item, Candidate):
-                    cid = item.chunk_id
-                    score = float(item.score)
-                elif isinstance(item, dict):
-                    cid = str(item["chunk_id"])
-                    score = float(item.get("score", 0.0))
+        # 7. Dense Search
+        final_dense_candidates: List[Candidate] = []
+        if effective_mode in ("dense", "hybrid"):
+            if dense_candidates is not None:
+                final_dense_candidates = normalize_dense_candidates(
+                    raw_candidates=dense_candidates,
+                    eligible_ids=eligible_ids,
+                    chunks_by_id=self.chunks_by_id,
+                    candidate_depth=candidate_depth,
+                )
+            else:
+                if dense_backend == "qdrant":
+                    if qdrant_client is None:
+                        from rulelens.qdrant_store import get_qdrant_client
+
+                        qdrant_client = get_qdrant_client()
+                    from rulelens.qdrant_store import search_qdrant
+
+                    query_vec = self.embedder.embed_query(query)
+                    fp = self.corpus_manifest.get("processed_fingerprint", "") if self.corpus_manifest else ""
+                    raw_qdrant = search_qdrant(
+                        client=qdrant_client,
+                        query_vector=query_vec,
+                        role=role,
+                        query_date=validated_date,
+                        corpus_fingerprint=fp,
+                        top_k=candidate_depth,
+                    )
+                    final_dense_candidates = normalize_dense_candidates(
+                        raw_candidates=raw_qdrant,
+                        eligible_ids=eligible_ids,
+                        chunks_by_id=self.chunks_by_id,
+                        candidate_depth=candidate_depth,
+                    )
                 else:
-                    continue
+                    final_dense_candidates = self.dense_search(
+                        query=query,
+                        eligible_ids=eligible_ids,
+                        top_k=candidate_depth,
+                    )
 
-                if cid in eligible_ids and cid not in seen_cids:
-                    seen_cids.add(cid)
-                    raw_eligible.append((cid, score))
-
-            # Assign sensible consecutive ranks (1, 2, 3, ...) while preserving original similarity scores
-            for rank_idx, (cid, score) in enumerate(raw_eligible[:candidate_depth], start=1):
-                eligible_dense_candidates.append(
-                    Candidate(
-                        chunk_id=cid,
-                        score=score,
-                        rank=rank_idx,
-                        chunk=self.chunks_by_id[cid],
+        # 8. Return results based on effective mode
+        if effective_mode == "bm25":
+            results: List[RetrievalResult] = []
+            for cand in bm25_candidates[:top_k]:
+                c = self.chunks_by_id[cand.chunk_id]
+                results.append(
+                    RetrievalResult(
+                        chunk_id=cand.chunk_id,
+                        text=c["text"],
+                        doc_id=c["doc_id"],
+                        clause_id=c["clause_id"],
+                        title=c["title"],
+                        department=c["department"],
+                        version=c["version"],
+                        source_file=c["source_file"],
+                        source_page=int(c["source_page"]),
+                        effective_from=c["effective_from"],
+                        effective_to=c.get("effective_to"),
+                        allowed_roles=list(c["allowed_roles"]),
+                        bm25_rank=cand.rank,
+                        bm25_score=cand.score,
+                        dense_rank=None,
+                        dense_score=None,
+                        rrf_score=1.0 / (RRF_K + cand.rank),
                     )
                 )
+            return results
 
-        # 4. RRF fusion
+        if effective_mode == "dense":
+            results = []
+            for cand in final_dense_candidates[:top_k]:
+                c = self.chunks_by_id[cand.chunk_id]
+                results.append(
+                    RetrievalResult(
+                        chunk_id=cand.chunk_id,
+                        text=c["text"],
+                        doc_id=c["doc_id"],
+                        clause_id=c["clause_id"],
+                        title=c["title"],
+                        department=c["department"],
+                        version=c["version"],
+                        source_file=c["source_file"],
+                        source_page=int(c["source_page"]),
+                        effective_from=c["effective_from"],
+                        effective_to=c.get("effective_to"),
+                        allowed_roles=list(c["allowed_roles"]),
+                        bm25_rank=None,
+                        bm25_score=None,
+                        dense_rank=cand.rank,
+                        dense_score=cand.score,
+                        rrf_score=1.0 / (RRF_K + cand.rank),
+                    )
+                )
+            return results
+
+        # Hybrid mode (BM25 + Dense + RRF)
         return reciprocal_rank_fusion(
             bm25_candidates=bm25_candidates,
-            dense_candidates=eligible_dense_candidates,
+            dense_candidates=final_dense_candidates,
             chunks_lookup=self.chunks_by_id,
             k=RRF_K,
             limit=top_k,

@@ -73,3 +73,7 @@ outputs/
 
 # Private documents, guidebooks, and plans
 RuleLens_Implementation_Guidebook*.pdf
+
+# Local evaluation files and private notes
+/local_eval/
+local_eval/

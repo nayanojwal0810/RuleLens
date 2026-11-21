@@ -8,6 +8,9 @@ GROQ_API_KEY: str = "GROQ_API_KEY"
 QDRANT_URL: str = "QDRANT_URL"
 QDRANT_API_KEY: str = "QDRANT_API_KEY"
 
+# Qdrant configuration
+QDRANT_COLLECTION_NAME: str = "rulelens_policies"
+
 # Model identifiers
 EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
 GENERATION_MODEL: str = "openai/gpt-oss-20b"

@@ -27,6 +27,7 @@ import pytest
 from rulelens.config import GENERATION_EVIDENCE_LIMIT
 from rulelens.dataset import ROLES
 from rulelens.retrieval import (
+    BGE_QUERY_INSTRUCTION,
     DEFAULT_CANDIDATE_DEPTH,
     EMBEDDING_DIMENSION,
     RRF_K,
@@ -38,6 +39,7 @@ from rulelens.retrieval import (
     filter_eligible_chunks,
     is_chunk_eligible,
     load_validated_corpus,
+    normalize_dense_candidates,
     parse_query_date,
     reciprocal_rank_fusion,
     tokenize,
@@ -936,3 +938,208 @@ def test_bge_wrapper_validates_dimension_and_finite_values():
     embedder_non_finite = BGEEmbedder(model_instance=NonFiniteModel())
     with pytest.raises(ValueError, match="non-finite values"):
         embedder_non_finite.embed_texts(["test text"])
+
+
+# ==============================================================================
+# 7. Stage D2 Hybrid Retrieval & Caching Enhancements
+# ==============================================================================
+
+
+def test_query_instruction_applied_to_query_only():
+    """Verify BGE_QUERY_INSTRUCTION is prepended in embed_query but not in embed_texts."""
+    captured_texts = []
+
+    class RecordingModel:
+        def encode(self, sentences, **kwargs):
+            import numpy as np
+
+            captured_texts.extend(sentences)
+            arr = np.ones((len(sentences), 384), dtype=np.float32)
+            for i in range(len(sentences)):
+                arr[i] = arr[i] / np.linalg.norm(arr[i])
+            return arr
+
+    rec_model = RecordingModel()
+    embedder = BGEEmbedder(model_instance=rec_model)
+
+    embedder.embed_query("hotel accommodation expense")
+    assert len(captured_texts) == 1
+    assert captured_texts[0] == f"{BGE_QUERY_INSTRUCTION}hotel accommodation expense"
+
+    captured_texts.clear()
+    embedder.embed_texts(["Hotel policy text", "Flight allowance text"])
+    assert len(captured_texts) == 2
+    assert captured_texts[0] == "Hotel policy text"
+    assert captured_texts[1] == "Flight allowance text"
+    assert not captured_texts[0].startswith(BGE_QUERY_INSTRUCTION)
+    assert not captured_texts[1].startswith(BGE_QUERY_INSTRUCTION)
+
+
+def test_bm25_index_cache_reuse(repo_root: Path):
+    """Verify retriever caches BM25Index per eligible chunk set."""
+    fake_model = FakeSentenceTransformerModel(dimension=384)
+    embedder = BGEEmbedder(model_instance=fake_model)
+    retriever = HybridRetriever(base_dir=repo_root, embedder=embedder)
+
+    eligible_1 = filter_eligible_chunks(retriever.chunks, "employee", "2026-11-22")
+    index_1a = retriever.get_bm25_index(eligible_1)
+    index_1b = retriever.get_bm25_index(eligible_1)
+    assert index_1a is index_1b
+
+    eligible_2 = filter_eligible_chunks(retriever.chunks, "manager", "2026-11-22")
+    index_2 = retriever.get_bm25_index(eligible_2)
+    assert index_1a is not index_2
+
+
+def test_dense_embeddings_cache_reuse(repo_root: Path):
+    """Verify retriever computes 64 chunk embeddings once and reuses them."""
+    call_count = 0
+
+    class CountingModel(FakeSentenceTransformerModel):
+        def encode(self, sentences, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return super().encode(sentences, **kwargs)
+
+    counting_model = CountingModel(dimension=384)
+    embedder = BGEEmbedder(model_instance=counting_model)
+    retriever = HybridRetriever(base_dir=repo_root, embedder=embedder)
+
+    assert retriever._dense_embeddings_cache is None
+    emb1 = retriever.get_dense_embeddings()
+    assert len(emb1) == 64
+    assert call_count == 1
+
+    emb2 = retriever.get_dense_embeddings()
+    assert emb1 is emb2
+    assert call_count == 1  # No re-computation
+
+
+def test_retrieval_modes(repo_root: Path):
+    """Verify explicit mode selection: bm25, dense, hybrid."""
+    dense_called = 0
+
+    class TrackingModel(FakeSentenceTransformerModel):
+        def encode(self, sentences, **kwargs):
+            nonlocal dense_called
+            dense_called += 1
+            return super().encode(sentences, **kwargs)
+
+    tracking_model = TrackingModel(dimension=384)
+    embedder = BGEEmbedder(model_instance=tracking_model)
+    retriever = HybridRetriever(base_dir=repo_root, embedder=embedder)
+
+    # 1. BM25 mode: should not invoke dense embedding
+    dense_called = 0
+    bm25_results = retriever.search(
+        query="meal per diem allowance",
+        role="employee",
+        query_date="2026-11-22",
+        mode="bm25",
+        top_k=4,
+    )
+    assert len(bm25_results) > 0
+    assert dense_called == 0
+    for r in bm25_results:
+        assert r.bm25_rank is not None
+        assert r.dense_rank is None
+
+    # 2. Dense mode: should invoke dense search and have dense_rank
+    dense_results = retriever.search(
+        query="meal per diem allowance",
+        role="employee",
+        query_date="2026-11-22",
+        mode="dense",
+        top_k=4,
+    )
+    assert len(dense_results) > 0
+    assert dense_called > 0
+    for r in dense_results:
+        assert r.dense_rank is not None
+        assert r.bm25_rank is None
+
+    # 3. Hybrid mode: should run both and fuse with RRF
+    hybrid_results = retriever.search(
+        query="meal per diem allowance",
+        role="employee",
+        query_date="2026-11-22",
+        mode="hybrid",
+        top_k=4,
+    )
+    assert len(hybrid_results) > 0
+    for r in hybrid_results:
+        assert r.rrf_score is not None
+
+
+def test_normalize_dense_candidates_sorting_and_deduplication(sample_chunks: List[Dict[str, Any]]):
+    """normalize_dense_candidates must sort by score descending, deduplicate keeping highest score, and assign 1..N ranks."""
+    lookup = {c["chunk_id"]: c for c in sample_chunks}
+    eligible_ids = set(lookup.keys())
+
+    raw_candidates = [
+        {"chunk_id": "DOC-TRV-001_TRV-C01", "score": 0.75},
+        {"chunk_id": "DOC-TRV-001_TRV-C02", "score": 0.90},
+        {"chunk_id": "DOC-TRV-001_TRV-C01", "score": 0.85},  # duplicate with higher score
+    ]
+
+    normalized = normalize_dense_candidates(
+        raw_candidates=raw_candidates,
+        eligible_ids=eligible_ids,
+        chunks_by_id=lookup,
+        candidate_depth=10,
+    )
+
+    assert len(normalized) == 2
+    # Highest score first: TRV-C02 (0.90), then TRV-C01 (0.85)
+    assert normalized[0].chunk_id == "DOC-TRV-001_TRV-C02"
+    assert math.isclose(normalized[0].score, 0.90)
+    assert normalized[0].rank == 1
+
+    assert normalized[1].chunk_id == "DOC-TRV-001_TRV-C01"
+    assert math.isclose(normalized[1].score, 0.85)
+    assert normalized[1].rank == 2
+
+    # Unknown chunk ID must raise KeyError
+    with pytest.raises(KeyError, match="Unknown chunk"):
+        normalize_dense_candidates(
+            raw_candidates=[{"chunk_id": "UNKNOWN_CHUNK_999", "score": 0.99}],
+            eligible_ids=eligible_ids,
+            chunks_by_id=lookup,
+        )
+
+
+def test_normalize_dense_candidates_rejects_non_finite_scores(sample_chunks: List[Dict[str, Any]]):
+    """normalize_dense_candidates must raise ValueError on NaN or infinite scores."""
+    lookup = {c["chunk_id"]: c for c in sample_chunks}
+    eligible_ids = set(lookup.keys())
+
+    with pytest.raises(ValueError, match=r"Non-finite.*score"):
+        normalize_dense_candidates(
+            raw_candidates=[{"chunk_id": "DOC-TRV-001_TRV-C01", "score": float("nan")}],
+            eligible_ids=eligible_ids,
+            chunks_by_id=lookup,
+        )
+
+    with pytest.raises(ValueError, match=r"Non-finite.*score"):
+        normalize_dense_candidates(
+            raw_candidates=[{"chunk_id": "DOC-TRV-001_TRV-C01", "score": float("inf")}],
+            eligible_ids=eligible_ids,
+            chunks_by_id=lookup,
+        )
+
+
+def test_dense_search_local_cosine_ranking(repo_root: Path):
+    """Local dense_search correctly ranks chunks by cosine similarity."""
+    fake_model = FakeSentenceTransformerModel(dimension=384)
+    embedder = BGEEmbedder(model_instance=fake_model)
+    retriever = HybridRetriever(base_dir=repo_root, embedder=embedder)
+
+    eligible = filter_eligible_chunks(retriever.chunks, "employee", "2026-11-22")
+    eligible_ids = {c["chunk_id"] for c in eligible}
+
+    candidates = retriever.dense_search("hotel accommodation expense", eligible_ids=eligible_ids, top_k=5)
+    assert len(candidates) == 5
+    assert candidates[0].rank == 1
+    assert candidates[1].rank == 2
+    for i in range(len(candidates) - 1):
+        assert candidates[i].score >= candidates[i + 1].score
