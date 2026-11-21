@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -307,41 +308,76 @@ def build_corpus(base_dir: Optional[Path | str] = None) -> Dict[str, Any]:
         "source_fingerprint": source_fp,
     }
 
-    # 5. Atomic file writing using temporary files
-    chunks_tmp = processed_dir / "chunks.jsonl.tmp"
-    rules_tmp = processed_dir / "rules.jsonl.tmp"
-    manifest_tmp = processed_dir / "corpus_manifest.json.tmp"
+    # 5. Safe output replacement using temporary staging directory and rollback
+    target_filenames = ("chunks.jsonl", "rules.jsonl", "corpus_manifest.json")
+    backups: Dict[str, bytes] = {}
+    for name in target_filenames:
+        target_path = processed_dir / name
+        if target_path.exists():
+            backups[name] = target_path.read_bytes()
 
-    try:
-        with open(chunks_tmp, "w", encoding="utf-8", newline="\n") as f:
+    with tempfile.TemporaryDirectory(dir=processed_dir) as staging_str:
+        staging_dir = Path(staging_str)
+        staged_chunks = staging_dir / "chunks.jsonl"
+        staged_rules = staging_dir / "rules.jsonl"
+        staged_manifest = staging_dir / "corpus_manifest.json"
+
+        with open(staged_chunks, "w", encoding="utf-8", newline="\n") as f:
             for chunk in chunks:
                 f.write(json.dumps(chunk, sort_keys=True) + "\n")
 
-        with open(rules_tmp, "w", encoding="utf-8", newline="\n") as f:
+        with open(staged_rules, "w", encoding="utf-8", newline="\n") as f:
             for rule in rules:
                 f.write(json.dumps(rule, sort_keys=True) + "\n")
 
-        with open(manifest_tmp, "w", encoding="utf-8", newline="\n") as f:
+        with open(staged_manifest, "w", encoding="utf-8", newline="\n") as f:
             json.dump(corpus_manifest, f, indent=2, sort_keys=True)
             f.write("\n")
 
-        # Atomic replacements
-        os.replace(chunks_tmp, processed_dir / "chunks.jsonl")
-        os.replace(rules_tmp, processed_dir / "rules.jsonl")
-        os.replace(manifest_tmp, processed_dir / "corpus_manifest.json")
-    finally:
-        for tmp_file in (chunks_tmp, rules_tmp, manifest_tmp):
-            if tmp_file.exists():
-                tmp_file.unlink()
+        replaced: List[str] = []
+        try:
+            for name in target_filenames:
+                src_path = staging_dir / name
+                dst_path = processed_dir / name
+                os.replace(src_path, dst_path)
+                replaced.append(name)
+        except Exception as exc:
+            # Restore previous complete output set on handled replacement error
+            for name, content in backups.items():
+                (processed_dir / name).write_bytes(content)
+            for name in replaced:
+                if name not in backups:
+                    p = processed_dir / name
+                    if p.exists():
+                        p.unlink()
+            raise RuntimeError(
+                f"Corpus build replacement failed; previous output state restored: {exc}"
+            ) from exc
 
     return corpus_manifest
 
 
 def validate_corpus(base_dir: Optional[Path | str] = None) -> bool:
-    """Validate existing processed corpus without rebuilding files."""
+    """Validate existing processed corpus without rebuilding files.
+
+    Performs comprehensive verification against the authoritative source dataset:
+    - Verifies source manifest, roles, and source fingerprint.
+    - Re-extracts expected clause records from PDFs with PyMuPDF and verifies exact
+      text, source_page, and metadata match for all chunks.
+    - Parses canonical CSV rules and verifies exact field match for all rules.
+    - Requires exact expected chunk and rule ID sets without duplicates or omissions.
+    - Verifies stored content hashes and processed corpus fingerprint.
+    """
     base = Path(base_dir) if base_dir else Path.cwd()
     source_dir = base / "data" / "source"
+    policies_dir = source_dir / "policies"
+    rules_dir = source_dir / "rules"
+    manifest_path = source_dir / "manifest.json"
+    roles_path = source_dir / "roles.json"
     processed_dir = base / "data" / "processed"
+
+    # 1. Validate source dataset first
+    validate_dataset(base)
 
     chunks_file = processed_dir / "chunks.jsonl"
     rules_file = processed_dir / "rules.jsonl"
@@ -351,11 +387,19 @@ def validate_corpus(base_dir: Optional[Path | str] = None) -> bool:
         if not required_file.exists() or required_file.stat().st_size == 0:
             raise ValueError(f"Processed file missing or empty: {required_file.name}")
 
-    # 1. Validate corpus manifest
+    # 2. Validate corpus manifest
     with open(manifest_file, "r", encoding="utf-8") as f:
         corpus_manifest = json.load(f)
 
-    if corpus_manifest.get("document_count") != 20:
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        source_manifest = json.load(f)
+    manifest_docs = source_manifest["documents"]
+    doc_map = {d["doc_id"]: d for d in manifest_docs}
+
+    with open(roles_path, "r", encoding="utf-8") as f:
+        roles_data = json.load(f)["roles"]
+
+    if corpus_manifest.get("document_count") != len(manifest_docs):
         raise ValueError(f"Document count mismatch in manifest: {corpus_manifest.get('document_count')}")
     if corpus_manifest.get("chunk_count") != 64:
         raise ValueError(f"Chunk count mismatch in manifest: {corpus_manifest.get('chunk_count')}")
@@ -368,14 +412,18 @@ def validate_corpus(base_dir: Optional[Path | str] = None) -> bool:
     if corpus_manifest.get("processing_schema_version") != PROCESSING_SCHEMA_VERSION:
         raise ValueError(f"Schema version mismatch: {corpus_manifest.get('processing_schema_version')}")
 
-    # Check source fingerprint
+    # Check source fingerprint against actual source files
     expected_source_fp = calculate_source_fingerprint(source_dir)
     if corpus_manifest.get("source_fingerprint") != expected_source_fp:
         raise ValueError("Source dataset fingerprint mismatch (source dataset was modified or out of sync).")
 
-    # 2. Validate chunks
+    # 3. Re-extract ground-truth expected chunks from source PDFs
+    expected_chunks = extract_pdf_chunks(policies_dir, manifest_docs)
+    expected_chunks_by_id = {c["chunk_id"]: c for c in expected_chunks}
+
+    # 4. Validate chunks from chunks.jsonl
     chunks: List[Dict[str, Any]] = []
-    chunk_ids: Set[str] = set()
+    chunk_ids: List[str] = []
 
     with open(chunks_file, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -390,45 +438,80 @@ def validate_corpus(base_dir: Optional[Path | str] = None) -> bool:
 
             cid = chunk["chunk_id"]
             if cid in chunk_ids:
-                raise ValueError(f"Duplicate chunk_id found: {cid}")
-            chunk_ids.add(cid)
+                raise ValueError(f"Duplicate chunk_id found in chunks.jsonl: {cid}")
+            chunk_ids.append(cid)
 
-            # Verify content hash matches actual text
+            # Check chunk_id format
+            expected_cid = f"{chunk['doc_id']}_{chunk['clause_id']}"
+            if cid != expected_cid:
+                raise ValueError(f"Chunk ID '{cid}' does not match expected format '{expected_cid}'")
+
+            if cid not in expected_chunks_by_id:
+                raise ValueError(f"Unexpected or nonexistent chunk_id: {cid}")
+
+            expected_c = expected_chunks_by_id[cid]
+            doc_entry = doc_map.get(chunk["doc_id"])
+            if doc_entry is None:
+                raise ValueError(f"Chunk {cid} references nonexistent doc_id: {chunk['doc_id']}")
+
+            if chunk["clause_id"] not in doc_entry["clause_ids"]:
+                raise ValueError(f"Clause {chunk['clause_id']} does not belong to document {chunk['doc_id']}")
+
+            # Verify document metadata
+            if chunk["title"] != doc_entry["title"]:
+                raise ValueError(f"Chunk {cid} title mismatch: '{chunk['title']}' != '{doc_entry['title']}'")
+            if chunk["department"] != doc_entry["department"]:
+                raise ValueError(f"Chunk {cid} department mismatch: '{chunk['department']}' != '{doc_entry['department']}'")
+            if chunk["version"] != doc_entry["version"]:
+                raise ValueError(f"Chunk {cid} version mismatch: '{chunk['version']}' != '{doc_entry['version']}'")
+            if chunk["effective_from"] != doc_entry["effective_from"]:
+                raise ValueError(f"Chunk {cid} effective_from mismatch")
+            if chunk["effective_to"] != doc_entry["effective_to"]:
+                raise ValueError(f"Chunk {cid} effective_to mismatch")
+            if chunk["source_file"] != doc_entry["filename"]:
+                raise ValueError(f"Chunk {cid} source_file mismatch")
+
+            # Verify allowed_roles against manifest and roles.json
+            if sorted(chunk["allowed_roles"]) != sorted(doc_entry["permitted_roles"]):
+                raise ValueError(f"Chunk {cid} allowed_roles mismatch with manifest permitted_roles")
+            for r in chunk["allowed_roles"]:
+                if r not in roles_data or chunk["doc_id"] not in roles_data[r]["allowed_documents"]:
+                    raise ValueError(f"Unauthorized role '{r}' for chunk {cid}")
+
+            # Verify text, content hash, and source page against actual PDF re-extraction
+            if chunk["source_page"] != expected_c["source_page"]:
+                raise ValueError(
+                    f"Chunk {cid} source_page mismatch: {chunk['source_page']} != {expected_c['source_page']}"
+                )
+            if chunk["text"] != expected_c["text"]:
+                raise ValueError(f"Chunk {cid} text mismatch with re-extracted PDF text")
+
             computed_hash = hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest()
             if chunk["content_hash"] != computed_hash:
                 raise ValueError(f"Content hash mismatch in chunk {cid}")
-
-            # Check 1-based source page
-            if not isinstance(chunk["source_page"], int) or chunk["source_page"] < 1:
-                raise ValueError(f"Invalid source_page in chunk {cid}: {chunk['source_page']}")
-
-            # Validate ISO dates
-            datetime.date.fromisoformat(chunk["effective_from"])
-            datetime.date.fromisoformat(chunk["effective_to"])
-            if chunk["effective_from"] > chunk["effective_to"]:
-                raise ValueError(f"Invalid date interval in chunk {cid}")
-
-            # Check roles is a valid non-empty list of known roles
-            if not isinstance(chunk["allowed_roles"], list) or not chunk["allowed_roles"]:
-                raise ValueError(f"Invalid allowed_roles in chunk {cid}")
-            for role in chunk["allowed_roles"]:
-                if role not in ROLES:
-                    raise ValueError(f"Unknown role '{role}' in chunk {cid}")
+            if chunk["content_hash"] != expected_c["content_hash"]:
+                raise ValueError(f"Content hash does not match expected hash for chunk {cid}")
 
             chunks.append(chunk)
 
+    # Require exact expected chunk ID set
+    expected_chunk_ids_set = set(expected_chunks_by_id.keys())
+    found_chunk_ids_set = set(chunk_ids)
+    if found_chunk_ids_set != expected_chunk_ids_set:
+        raise ValueError(
+            f"Chunk ID set mismatch: missing {expected_chunk_ids_set - found_chunk_ids_set}, "
+            f"extra {found_chunk_ids_set - expected_chunk_ids_set}"
+        )
     if len(chunks) != 64:
         raise ValueError(f"Expected 64 chunks in {chunks_file.name}, found {len(chunks)}")
 
-    # Distinct document count
-    docs_represented = {c["doc_id"] for c in chunks}
-    if len(docs_represented) != 20:
-        raise ValueError(f"Expected 20 documents represented in chunks, found {len(docs_represented)}")
-
-    # 3. Validate rules
-    rules: List[Dict[str, Any]] = []
-    rule_ids: Set[str] = set()
+    # 5. Parse canonical rules and validate rules.jsonl
     chunks_by_id = {c["chunk_id"]: c for c in chunks}
+    canonical_rules = parse_csv_rules(rules_dir, chunks_by_id)
+    canonical_rules_by_id = {r["rule_id"]: r for r in canonical_rules}
+
+    rules: List[Dict[str, Any]] = []
+    rule_ids: List[str] = []
 
     with open(rules_file, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -443,32 +526,41 @@ def validate_corpus(base_dir: Optional[Path | str] = None) -> bool:
 
             rid = rule["rule_id"]
             if rid in rule_ids:
-                raise ValueError(f"Duplicate rule_id found: {rid}")
-            rule_ids.add(rid)
+                raise ValueError(f"Duplicate rule_id found in rules.jsonl: {rid}")
+            rule_ids.append(rid)
 
-            if rule["operator"] not in APPROVED_OPERATORS:
-                raise ValueError(f"Unapproved operator in rule {rid}: {rule['operator']}")
+            if rid not in canonical_rules_by_id:
+                raise ValueError(f"Unexpected or nonexistent rule_id: {rid}")
 
-            # Verify threshold typing
-            val = rule["threshold_value"]
-            if not isinstance(val, (int, float, str)):
-                raise ValueError(f"Invalid threshold type in rule {rid}: {type(val)}")
+            canon = canonical_rules_by_id[rid]
 
-            # Link to chunk
-            chunk_key = f"{rule['doc_id']}_{rule['clause_id']}"
-            if chunk_key not in chunks_by_id:
-                raise ValueError(f"Rule {rid} links to nonexistent chunk: {chunk_key}")
-
-            chunk = chunks_by_id[chunk_key]
-            if rule["effective_from"] < chunk["effective_from"] or rule["effective_to"] > chunk["effective_to"]:
-                raise ValueError(f"Rule {rid} effective dates exceed chunk {chunk_key} bounds")
+            # Verify every field against canonical rule
+            for field in RULE_REQUIRED_FIELDS:
+                actual_val = rule[field]
+                expected_val = canon[field]
+                if actual_val != expected_val:
+                    raise ValueError(
+                        f"Rule {rid} field '{field}' mismatch: expected '{expected_val}', got '{actual_val}'"
+                    )
+                if type(actual_val) is not type(expected_val):
+                    raise ValueError(
+                        f"Rule {rid} field '{field}' type mismatch: expected {type(expected_val)}, got {type(actual_val)}"
+                    )
 
             rules.append(rule)
 
+    # Require exact expected rule ID set
+    expected_rule_ids_set = set(canonical_rules_by_id.keys())
+    found_rule_ids_set = set(rule_ids)
+    if found_rule_ids_set != expected_rule_ids_set:
+        raise ValueError(
+            f"Rule ID set mismatch: missing {expected_rule_ids_set - found_rule_ids_set}, "
+            f"extra {found_rule_ids_set - expected_rule_ids_set}"
+        )
     if len(rules) != 32:
         raise ValueError(f"Expected 32 rules in {rules_file.name}, found {len(rules)}")
 
-    # 4. Verify processed fingerprint
+    # 6. Verify processed fingerprint
     expected_proc_fp = calculate_processed_fingerprint(chunks, rules)
     if corpus_manifest.get("processed_fingerprint") != expected_proc_fp:
         raise ValueError("Processed corpus fingerprint mismatch (records modified or corrupted).")

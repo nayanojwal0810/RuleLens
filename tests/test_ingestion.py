@@ -1,7 +1,12 @@
-"""Offline unit and integration tests for RuleLens ingestion pipeline."""
+"""Offline unit and integration tests for RuleLens ingestion pipeline.
+
+Validates the committed processed corpus, determinism, failure recovery,
+and negative test cases against corruptions.
+"""
 
 import hashlib
 import json
+import os
 import shutil
 import socket
 import tempfile
@@ -41,7 +46,7 @@ def copy_source_and_processed(repo_root: Path, target_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def test_committed_processed_corpus_validation(repo_root):
-    """Verify that existing committed processed corpus passes validation."""
+    """Verify that existing committed processed corpus passes strengthened validation."""
     assert validate_corpus(repo_root) is True
 
 
@@ -181,7 +186,7 @@ def test_accurate_original_pdf_page_references_sample_10(repo_root):
         page_text = " ".join(pdf_doc[page_idx].get_text().split())
         pdf_doc.close()
 
-        # Confirm clause ID and key phrase from text is on that page
+        # Confirm clause ID and company name appear on that page
         assert chunk["clause_id"] in page_text
         assert "Asterline Services Group" in page_text
 
@@ -263,69 +268,210 @@ def test_ingestion_offline(repo_root, monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Negative Tests: Corruptions Must Fail Validation
+# Negative Tests: Corruptions & Failure Handling
 # ---------------------------------------------------------------------------
 
-def test_negative_corrupt_chunk_text(repo_root, tmp_path):
-    """Validation must fail when chunk text is modified without updating content_hash."""
+def test_negative_unauthorized_role_added_with_recomputed_hash(repo_root, tmp_path):
+    """Validation must reject unauthorized role even when processed fingerprint is recomputed."""
     copy_source_and_processed(repo_root, tmp_path)
     chunks_file = tmp_path / "data" / "processed" / "chunks.jsonl"
-
-    lines = chunks_file.read_text(encoding="utf-8").splitlines()
-    chunk0 = json.loads(lines[0])
-    chunk0["text"] = chunk0["text"] + " TAMPERED"
-    lines[0] = json.dumps(chunk0, sort_keys=True)
-    chunks_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="Content hash mismatch"):
-        validate_corpus(tmp_path)
-
-
-def test_negative_corrupt_rule_link(repo_root, tmp_path):
-    """Validation must fail when a rule links to a nonexistent chunk."""
-    copy_source_and_processed(repo_root, tmp_path)
+    manifest_file = tmp_path / "data" / "processed" / "corpus_manifest.json"
     rules_file = tmp_path / "data" / "processed" / "rules.jsonl"
 
-    lines = rules_file.read_text(encoding="utf-8").splitlines()
-    rule0 = json.loads(lines[0])
-    rule0["clause_id"] = "NONEXISTENT-CLAUSE"
-    lines[0] = json.dumps(rule0, sort_keys=True)
-    rules_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    chunks = [json.loads(l) for l in chunks_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rules = [json.loads(l) for l in rules_file.read_text(encoding="utf-8").splitlines() if l.strip()]
 
-    with pytest.raises(ValueError, match="nonexistent chunk"):
+    # Find Travel Exceptions chunk and inject unauthorized role 'employee'
+    for c in chunks:
+        if c["doc_id"] == "DOC-TRV-004":
+            c["allowed_roles"].append("employee")
+            c["allowed_roles"].sort()
+            break
+
+    # Recompute processed fingerprint
+    proc_fp = calculate_processed_fingerprint(chunks, rules)
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest_data["processed_fingerprint"] = proc_fp
+
+    chunks_file.write_text("\n".join(json.dumps(c, sort_keys=True) for c in chunks) + "\n", encoding="utf-8")
+    manifest_file.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="allowed_roles mismatch|Unauthorized role"):
         validate_corpus(tmp_path)
 
 
-def test_negative_corrupt_manifest_fingerprint(repo_root, tmp_path):
-    """Validation must fail when corpus manifest processed fingerprint is altered."""
+def test_negative_wrong_document_version_metadata(repo_root, tmp_path):
+    """Validation must reject altered document metadata even with recomputed fingerprint."""
     copy_source_and_processed(repo_root, tmp_path)
+    chunks_file = tmp_path / "data" / "processed" / "chunks.jsonl"
     manifest_file = tmp_path / "data" / "processed" / "corpus_manifest.json"
+    rules_file = tmp_path / "data" / "processed" / "rules.jsonl"
 
-    data = json.loads(manifest_file.read_text(encoding="utf-8"))
-    data["processed_fingerprint"] = "0" * 64
-    manifest_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    chunks = [json.loads(l) for l in chunks_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rules = [json.loads(l) for l in rules_file.read_text(encoding="utf-8").splitlines() if l.strip()]
 
-    with pytest.raises(ValueError, match="Processed corpus fingerprint mismatch"):
+    chunks[0]["version"] = "9.9"  # Corrupt version
+
+    proc_fp = calculate_processed_fingerprint(chunks, rules)
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest_data["processed_fingerprint"] = proc_fp
+
+    chunks_file.write_text("\n".join(json.dumps(c, sort_keys=True) for c in chunks) + "\n", encoding="utf-8")
+    manifest_file.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="version mismatch"):
         validate_corpus(tmp_path)
 
 
-def test_negative_corrupt_source_fingerprint(repo_root, tmp_path):
-    """Validation must fail when source dataset files are out of sync with stored fingerprint."""
+def test_negative_incorrect_source_page(repo_root, tmp_path):
+    """Validation must reject incorrect source_page even with recomputed fingerprint."""
     copy_source_and_processed(repo_root, tmp_path)
-    # Tamper with a source CSV file
-    csv_file = tmp_path / "data" / "source" / "rules" / "travel_rules.csv"
-    csv_file.write_text(csv_file.read_text(encoding="utf-8") + "# comment\n", encoding="utf-8")
+    chunks_file = tmp_path / "data" / "processed" / "chunks.jsonl"
+    manifest_file = tmp_path / "data" / "processed" / "corpus_manifest.json"
+    rules_file = tmp_path / "data" / "processed" / "rules.jsonl"
 
-    with pytest.raises(ValueError, match="Source dataset fingerprint mismatch"):
+    chunks = [json.loads(l) for l in chunks_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rules = [json.loads(l) for l in rules_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    chunks[0]["source_page"] = 42  # Wrong source page
+
+    proc_fp = calculate_processed_fingerprint(chunks, rules)
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest_data["processed_fingerprint"] = proc_fp
+
+    chunks_file.write_text("\n".join(json.dumps(c, sort_keys=True) for c in chunks) + "\n", encoding="utf-8")
+    manifest_file.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_page mismatch"):
         validate_corpus(tmp_path)
 
 
-def test_negative_corrupted_pdf_build_fails(repo_root, tmp_path):
-    """Build must fail safely without creating outputs if a source PDF is corrupted."""
-    shutil.copytree(repo_root / "data" / "source", tmp_path / "data" / "source")
-    # Corrupt a PDF
+def test_negative_text_changed_with_recomputed_hashes(repo_root, tmp_path):
+    """Validation must reject altered chunk text even when content hash and fingerprint are recomputed."""
+    copy_source_and_processed(repo_root, tmp_path)
+    chunks_file = tmp_path / "data" / "processed" / "chunks.jsonl"
+    manifest_file = tmp_path / "data" / "processed" / "corpus_manifest.json"
+    rules_file = tmp_path / "data" / "processed" / "rules.jsonl"
+
+    chunks = [json.loads(l) for l in chunks_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rules = [json.loads(l) for l in rules_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    # Alter text and legitimately recompute content hash
+    chunks[0]["text"] += "\nUnauthorized policy modification."
+    chunks[0]["content_hash"] = hashlib.sha256(chunks[0]["text"].encode("utf-8")).hexdigest()
+
+    proc_fp = calculate_processed_fingerprint(chunks, rules)
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest_data["processed_fingerprint"] = proc_fp
+
+    chunks_file.write_text("\n".join(json.dumps(c, sort_keys=True) for c in chunks) + "\n", encoding="utf-8")
+    manifest_file.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="text mismatch with re-extracted PDF text"):
+        validate_corpus(tmp_path)
+
+
+def test_negative_rule_threshold_or_outcome_changed_with_recomputed_fingerprint(repo_root, tmp_path):
+    """Validation must reject altered rule threshold or outcome even when fingerprint is recomputed."""
+    copy_source_and_processed(repo_root, tmp_path)
+    chunks_file = tmp_path / "data" / "processed" / "chunks.jsonl"
+    manifest_file = tmp_path / "data" / "processed" / "corpus_manifest.json"
+    rules_file = tmp_path / "data" / "processed" / "rules.jsonl"
+
+    chunks = [json.loads(l) for l in chunks_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rules = [json.loads(l) for l in rules_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    # Alter rule threshold
+    rules[0]["threshold_value"] = 999999
+
+    proc_fp = calculate_processed_fingerprint(chunks, rules)
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest_data["processed_fingerprint"] = proc_fp
+
+    rules_file.write_text("\n".join(json.dumps(r, sort_keys=True) for r in rules) + "\n", encoding="utf-8")
+    manifest_file.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mismatch"):
+        validate_corpus(tmp_path)
+
+
+def test_negative_missing_or_substituted_chunk_ids(repo_root, tmp_path):
+    """Validation must reject missing or substituted chunk IDs."""
+    copy_source_and_processed(repo_root, tmp_path)
+    chunks_file = tmp_path / "data" / "processed" / "chunks.jsonl"
+    manifest_file = tmp_path / "data" / "processed" / "corpus_manifest.json"
+    rules_file = tmp_path / "data" / "processed" / "rules.jsonl"
+
+    chunks = [json.loads(l) for l in chunks_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rules = [json.loads(l) for l in rules_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    # Substitute chunk_id
+    chunks[0]["chunk_id"] = "DOC-TRV-001_TRV-C99"
+
+    proc_fp = calculate_processed_fingerprint(chunks, rules)
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest_data["processed_fingerprint"] = proc_fp
+
+    chunks_file.write_text("\n".join(json.dumps(c, sort_keys=True) for c in chunks) + "\n", encoding="utf-8")
+    manifest_file.write_text(json.dumps(manifest_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="format|Unexpected or nonexistent chunk_id|Chunk ID set mismatch"):
+        validate_corpus(tmp_path)
+
+
+def test_replacement_failure_during_second_output_restores_previous_state(repo_root, tmp_path, monkeypatch):
+    """A replacement error during the second file update must restore exact previous files byte-for-byte."""
+    copy_source_and_processed(repo_root, tmp_path)
+    processed_dir = tmp_path / "data" / "processed"
+
+    # Record previous SHA-256 hashes of all three files
+    initial_hashes = {
+        name: hashlib.sha256((processed_dir / name).read_bytes()).hexdigest()
+        for name in ("chunks.jsonl", "rules.jsonl", "corpus_manifest.json")
+    }
+
+    original_replace = os.replace
+
+    def mock_replace(src, dst):
+        # Fail when replacing the second file: rules.jsonl
+        if Path(dst).name == "rules.jsonl":
+            raise OSError("Injected disk/filesystem error on rules.jsonl replacement")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", mock_replace)
+
+    with pytest.raises(RuntimeError, match="Corpus build replacement failed; previous output state restored"):
+        build_corpus(tmp_path)
+
+    # Verify all three files exist and remain byte-for-byte identical to initial state
+    for name, expected_hash in initial_hashes.items():
+        assert (processed_dir / name).exists()
+        actual_hash = hashlib.sha256((processed_dir / name).read_bytes()).hexdigest()
+        assert actual_hash == expected_hash, f"File {name} was not properly restored!"
+
+    # Verify no temporary staging files remain in processed_dir
+    stray_files = [p.name for p in processed_dir.glob("*.tmp")]
+    assert len(stray_files) == 0, f"Found leftover temporary files: {stray_files}"
+
+
+def test_extraction_failure_preserves_existing_outputs(repo_root, tmp_path):
+    """An extraction error before replacement must leave existing outputs untouched."""
+    copy_source_and_processed(repo_root, tmp_path)
+    processed_dir = tmp_path / "data" / "processed"
+
+    initial_hashes = {
+        name: hashlib.sha256((processed_dir / name).read_bytes()).hexdigest()
+        for name in ("chunks.jsonl", "rules.jsonl", "corpus_manifest.json")
+    }
+
+    # Corrupt a source PDF
     pdf_file = tmp_path / "data" / "source" / "policies" / "travel_policy_v1.pdf"
-    pdf_file.write_bytes(b"CORRUPTED_NOT_A_PDF")
+    pdf_file.write_bytes(b"CORRUPTED_PDF_BYTES")
 
     with pytest.raises(Exception):
         build_corpus(tmp_path)
+
+    # Verify previous outputs are completely intact
+    for name, expected_hash in initial_hashes.items():
+        actual_hash = hashlib.sha256((processed_dir / name).read_bytes()).hexdigest()
+        assert actual_hash == expected_hash, f"File {name} was modified despite extraction failure!"
