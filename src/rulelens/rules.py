@@ -65,6 +65,15 @@ class RuleEvaluationResult:
     error_type: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ConditionExtractionResult:
+    """Structured outcome of natural language condition extraction."""
+
+    status: str  # "valid", "missing", "ambiguous", "invalid"
+    conditions: List[Dict[str, Any]]
+    reason: Optional[str] = None
+
+
 # Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
 _RULES_CACHE: Dict[Path, List[RuleRecord]] = {}
 
@@ -226,12 +235,18 @@ def resolve_rules_for_evidence(
     authorized_cids = {c["chunk_id"] for c in authorized_chunks}
 
     # Map conditions by field for evaluation
-    cond_map: Dict[str, Tuple[Any, Optional[str]]] = {}
+    cond_map: Dict[str, Tuple[Any, Optional[str], bool, Optional[str]]] = {}
+    has_ambiguity = False
+    ambiguity_reason = None
     if extracted_conditions:
         for cond in extracted_conditions:
             field = cond.get("field")
-            if field and "value" in cond:
-                cond_map[field] = (cond["value"], cond.get("unit"))
+            is_ambig = bool(cond.get("is_ambiguous", False))
+            if is_ambig:
+                has_ambiguity = True
+                ambiguity_reason = cond.get("error", "Ambiguous or conflicting condition inputs detected")
+            if field:
+                cond_map[field] = (cond.get("value"), cond.get("unit"), is_ambig, cond.get("error"))
 
     results: List[RuleEvaluationResult] = []
 
@@ -244,9 +259,30 @@ def resolve_rules_for_evidence(
         if not is_rule_active(rule, q_date):
             continue
 
-        # 3. If condition value provided for this field, evaluate it
-        if rule.condition_field in cond_map:
-            val, unit = cond_map[rule.condition_field]
+        # 3. Check for condition evaluation or ambiguity
+        if rule.condition_field in cond_map or (has_ambiguity and rule.condition_field in ("expense_amount", "order_amount", "monthly_spend", "receipt_amount", "exception_amount")):
+            cond_entry = cond_map.get(rule.condition_field)
+            if (cond_entry and cond_entry[2]) or has_ambiguity:
+                # Ambiguous input condition
+                explanation = (
+                    f"Rule {rule.rule_id} condition ambiguous: "
+                    f"{ambiguity_reason or 'Multiple conflicting condition inputs detected in query.'}"
+                )
+                results.append(
+                    RuleEvaluationResult(
+                        rule=rule,
+                        passed=False,
+                        input_value=None,
+                        input_unit=rule.unit,
+                        outcome="ambiguous_condition",
+                        explanation=explanation,
+                        is_error=True,
+                        error_type="ambiguous_condition",
+                    )
+                )
+                continue
+
+            val, unit, _, _ = cond_entry
             try:
                 passed = evaluate_rule_condition(rule, val, unit)
                 if passed:
@@ -315,7 +351,7 @@ def resolve_rules_for_evidence(
                     )
                 )
         else:
-            # Rule applies structurally to the clause, but no transaction amount was provided
+            # Rule applies structurally to the clause, but no transaction amount was provided (threshold definition query)
             explanation = (
                 f"Rule {rule.rule_id} defines: {rule.condition_field} {rule.operator} {rule.threshold_value} {rule.unit} "
                 f"for {rule.outcome}."
@@ -407,13 +443,14 @@ def extract_conditions_from_query(
     elif "restricted" in q_lower and any(k in q_lower for k in ("restricted data", "restricted tier", "data classification")):
         conditions.append({"field": "data_classification_tier", "value": "Restricted", "unit": "tier"})
 
-    # Check for INR currency amounts
-    found_currency_amounts: List[Tuple[float, str]] = []
+    # Check for INR currency amounts using Decimal precision directly from string
+    found_currency_amounts: List[Tuple[Decimal, str]] = []
+    has_or_connector = bool(re.search(r"\b(?:or|and/or)\b|/", q_lower))
     for match in _CURRENCY_PATTERN.finditer(query):
         raw_num = match.group(1).replace(",", "")
         try:
-            val = float(raw_num)
-        except ValueError:
+            val = Decimal(raw_num)
+        except (InvalidOperation, ValueError):
             continue
         # Exclude years (e.g. 2026) unless explicitly preceded/followed by currency mark
         span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
@@ -425,19 +462,30 @@ def extract_conditions_from_query(
             if field:
                 found_currency_amounts.append((val, field))
 
-    # Reject if multiple distinct amounts claim the same field or if fields are ambiguous
-    seen_fields = set()
-    ambiguous = False
+    # Reject if multiple distinct amounts claim the same field or if query presents ambiguous alternatives
+    seen_amounts_by_field: Dict[str, List[Decimal]] = {}
     for val, field in found_currency_amounts:
-        if field in seen_fields:
-            # Ambiguous: multiple amounts for same field
-            ambiguous = True
-            break
-        seen_fields.add(field)
+        seen_amounts_by_field.setdefault(field, []).append(val)
 
-    if not ambiguous:
+    ambiguous_fields = {f for f, vals in seen_amounts_by_field.items() if len(set(vals)) > 1}
+    distinct_vals = {v for v, _ in found_currency_amounts}
+    if len(distinct_vals) > 1 and has_or_connector:
+        for f in seen_amounts_by_field:
+            ambiguous_fields.add(f)
+
+    if ambiguous_fields:
+        for f in ambiguous_fields:
+            vals_str = ", ".join(str(v) for v in sorted(set(seen_amounts_by_field[f])))
+            conditions.append({
+                "field": f,
+                "value": None,
+                "unit": "INR",
+                "is_ambiguous": True,
+                "error": f"Multiple conflicting amounts [{vals_str}] detected for condition '{f}'.",
+            })
+    else:
         for val, field in found_currency_amounts:
-            conditions.append({"field": field, "value": val, "unit": "INR"})
+            conditions.append({"field": field, "value": val, "unit": "INR", "is_ambiguous": False})
 
     # Check for days
     for match in _DAYS_PATTERN.finditer(query):
@@ -485,3 +533,24 @@ def extract_conditions_from_query(
         conditions = [c for c in conditions if c["field"] in relevant_fields]
 
     return conditions
+
+
+def extract_condition_result(
+    query: str,
+    relevant_fields: Optional[Set[str]] = None,
+) -> ConditionExtractionResult:
+    """Return structured ConditionExtractionResult distinguishing valid, missing, and ambiguous conditions."""
+    if not query or not query.strip():
+        return ConditionExtractionResult(status="missing", conditions=[])
+
+    conds = extract_conditions_from_query(query, relevant_fields=relevant_fields)
+    if any(c.get("is_ambiguous") for c in conds):
+        ambig_reasons = [c.get("error") for c in conds if c.get("is_ambiguous")]
+        return ConditionExtractionResult(
+            status="ambiguous",
+            conditions=conds,
+            reason="; ".join(filter(None, ambig_reasons)) or "Ambiguous condition values in query",
+        )
+    if conds:
+        return ConditionExtractionResult(status="valid", conditions=conds)
+    return ConditionExtractionResult(status="missing", conditions=[])

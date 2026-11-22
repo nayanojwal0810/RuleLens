@@ -24,6 +24,8 @@ from rulelens.llm import (
     AnswerResponse,
     AnswerStatus,
     GroqClientWrapper,
+    ProviderTelemetrySnapshot,
+    SanitizedProviderError,
     build_evidence_context,
     build_evidence_fingerprint,
     validate_citations_and_rules,
@@ -403,7 +405,7 @@ def test_groq_wrapper_fails_cleanly_after_two_invalid_attempts():
         wrapper.generate_answer(
             question="Question?",
             role="employee",
-            evidence_chunks=[],
+            evidence_chunks=[{"chunk_id": "c1", "text": "t", "doc_id": "d", "clause_id": "c"}],
         )
     assert getattr(excinfo.value, "category", None) == "invalid_generation"
 
@@ -489,3 +491,155 @@ def test_groq_wrapper_uses_strict_json_schema():
     schema = rf["json_schema"]["schema"]
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == {"answer", "status", "citations", "referenced_rule_ids", "reason"}
+
+
+# ==============================================================================
+# 5. Evidence Limits and Provider Telemetry Tests
+# ==============================================================================
+
+
+def test_evidence_chunks_strict_limit_enforced():
+    """generate_answer and build_evidence_context strictly reject 0 or >4 evidence chunks."""
+    mock_client = MagicMock()
+    wrapper = GroqClientWrapper(client=mock_client)
+    dummy_chunk = {"chunk_id": "c1", "text": "t", "doc_id": "d", "clause_id": "c"}
+
+    # 0 chunks in generate_answer
+    with pytest.raises(ValueError, match="At least 1 evidence chunk is required"):
+        wrapper.generate_answer(
+            question="What is the policy?",
+            role="employee",
+            evidence_chunks=[],
+        )
+
+    # 5 chunks in generate_answer
+    with pytest.raises(ValueError, match="Maximum of 4 evidence chunks permitted"):
+        wrapper.generate_answer(
+            question="What is the policy?",
+            role="employee",
+            evidence_chunks=[dummy_chunk] * 5,
+        )
+
+    # 0 chunks in build_evidence_context
+    with pytest.raises(ValueError, match="At least 1 evidence chunk is required"):
+        build_evidence_context([])
+
+    # 5 chunks in build_evidence_context
+    with pytest.raises(ValueError, match="Maximum of 4 evidence chunks permitted"):
+        build_evidence_context([dummy_chunk] * 5)
+
+
+def test_telemetry_snapshot_success_and_delta():
+    """Telemetry accurately records attempted, succeeded, latency, and tokens across successful calls."""
+    mock_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = json.dumps({
+        "answer": "Answer.",
+        "status": "answered",
+        "citations": ["DOC-TRV-001_TRV-C01"],
+        "referenced_rule_ids": [],
+        "reason": "Direct text citation.",
+    })
+    mock_comp = MagicMock()
+    mock_comp.choices = [mock_choice]
+    mock_comp.usage.total_tokens = 150
+    mock_client.chat.completions.create.return_value = mock_comp
+
+    wrapper = GroqClientWrapper(client=mock_client)
+    baseline = wrapper.get_telemetry_snapshot()
+    assert baseline.provider_requests_attempted == 0
+    assert baseline.provider_requests_succeeded == 0
+    assert baseline.known_total_tokens is None
+
+    _, meta = wrapper.generate_answer(
+        question="What is the meal allowance?",
+        role="employee",
+        evidence_chunks=[{"chunk_id": "DOC-TRV-001_TRV-C01", "text": "Allowance.", "doc_id": "DOC-TRV-001", "clause_id": "TRV-C01"}],
+    )
+
+    current = wrapper.get_telemetry_snapshot()
+    assert current.provider_requests_attempted == 1
+    assert current.provider_requests_succeeded == 1
+    assert current.provider_request_latency_ms > 0
+    assert current.known_total_tokens == 150
+
+    delta = current.delta(baseline)
+    assert delta.provider_requests_attempted == 1
+    assert delta.provider_requests_succeeded == 1
+    assert delta.known_total_tokens == 150
+    assert delta.has_incomplete_tokens is False
+
+
+def test_telemetry_snapshot_rate_limit_and_timeout():
+    """Telemetry records attempted requests even when provider fails with 429 or timeout."""
+    import groq
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = groq.RateLimitError(
+        "Rate limit exceeded: 429", response=MagicMock(status_code=429), body={}
+    )
+    wrapper = GroqClientWrapper(client=mock_client)
+
+    with pytest.raises(SanitizedProviderError):
+        wrapper.generate_answer(
+            question="Question?",
+            role="employee",
+            evidence_chunks=[{"chunk_id": "c1", "text": "t", "doc_id": "d", "clause_id": "c"}],
+        )
+
+    snap = wrapper.get_telemetry_snapshot()
+    assert snap.provider_requests_attempted == 1
+    assert snap.provider_requests_succeeded == 0
+
+    # Reset telemetry
+    wrapper.reset_telemetry()
+    assert wrapper.get_telemetry_snapshot().provider_requests_attempted == 0
+
+    # Timeout
+    mock_client.chat.completions.create.side_effect = groq.APITimeoutError(request=MagicMock())
+    with pytest.raises(SanitizedProviderError):
+        wrapper.generate_answer(
+            question="Question?",
+            role="employee",
+            evidence_chunks=[{"chunk_id": "c1", "text": "t", "doc_id": "d", "clause_id": "c"}],
+        )
+
+    snap_to = wrapper.get_telemetry_snapshot()
+    assert snap_to.provider_requests_attempted == 1
+    assert snap_to.provider_requests_succeeded == 0
+
+
+def test_telemetry_snapshot_repair_attempts():
+    """Telemetry records 2 attempted and 2 succeeded requests when repair succeeds."""
+    mock_client = MagicMock()
+    bad_c = MagicMock()
+    bad_c.message.content = "INVALID_JSON"
+    bad_comp = MagicMock()
+    bad_comp.choices = [bad_c]
+    bad_comp.usage.total_tokens = 40
+
+    good_c = MagicMock()
+    good_c.message.content = json.dumps({
+        "answer": "Repaired answer.",
+        "status": "answered",
+        "citations": ["DOC-TRV-001_TRV-C01"],
+        "referenced_rule_ids": [],
+        "reason": "Repaired reasoning.",
+    })
+    good_comp = MagicMock()
+    good_comp.choices = [good_c]
+    good_comp.usage.total_tokens = 60
+
+    mock_client.chat.completions.create.side_effect = [bad_comp, good_comp]
+    wrapper = GroqClientWrapper(client=mock_client)
+
+    _, meta = wrapper.generate_answer(
+        question="Question?",
+        role="employee",
+        evidence_chunks=[{"chunk_id": "DOC-TRV-001_TRV-C01", "text": "t", "doc_id": "DOC-TRV-001", "clause_id": "TRV-C01"}],
+    )
+
+    snap = wrapper.get_telemetry_snapshot()
+    assert snap.provider_requests_attempted == 2
+    assert snap.provider_requests_succeeded == 2
+    assert snap.known_total_tokens == 100
+    assert meta["repair_attempted"] is True

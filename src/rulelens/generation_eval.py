@@ -14,6 +14,7 @@ import json
 import statistics
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
@@ -36,6 +37,7 @@ from rulelens.retrieval import (
     load_validated_corpus,
     parse_query_date,
 )
+from rulelens.retrieval_eval import validate_evaluation_dataset
 from rulelens.rules import (
     extract_conditions_from_query,
     resolve_rules_for_evidence,
@@ -56,6 +58,64 @@ DEV_SUBSET_QUESTION_IDS: List[str] = [
 ]
 
 
+def _safe_int(val: Any, default: int = 0) -> int:
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(val: Any) -> Optional[float]:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+@dataclass
+class EvaluationContext:
+    """Validated evaluation environment and canonical corpus context."""
+
+    base_dir: Path
+    corpus_chunks: List[Dict[str, Any]]
+    chunks_by_id: Dict[str, Dict[str, Any]]
+    manifest: Dict[str, Any]
+    corpus_fingerprint: str
+
+
+def create_evaluation_context(base_dir: Optional[Union[Path, str]] = None) -> EvaluationContext:
+    """Load and validate evaluation context and canonical corpus records."""
+    base = Path(base_dir) if base_dir else Path.cwd()
+    manifest_p = base / "data" / "processed" / "corpus_manifest.json"
+    if not manifest_p.exists():
+        manifest_p = base.parent / "data" / "processed" / "corpus_manifest.json"
+    if not manifest_p.exists():
+        raise FileNotFoundError(f"Corpus manifest not found at {manifest_p}")
+
+    manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
+    corpus_fp = manifest.get("processed_fingerprint")
+    if not corpus_fp:
+        raise ValueError("Corpus manifest is missing 'processed_fingerprint'.")
+
+    corpus = load_validated_corpus(base_dir=base)
+    chunks_by_id = {c["chunk_id"]: c for c in corpus}
+    return EvaluationContext(
+        base_dir=base,
+        corpus_chunks=corpus,
+        chunks_by_id=chunks_by_id,
+        manifest=manifest,
+        corpus_fingerprint=corpus_fp,
+    )
+
+
 def load_evaluation_dataset(dataset_path: Union[Path, str]) -> Dict[str, Any]:
     """Load evaluation questions JSON file."""
     path = Path(dataset_path)
@@ -66,14 +126,15 @@ def load_evaluation_dataset(dataset_path: Union[Path, str]) -> Dict[str, Any]:
 
 def evaluate_single_question(
     question_data: Dict[str, Any],
-    retriever: HybridRetriever,
-    llm_client: GroqClientWrapper,
+    retriever: Optional[HybridRetriever] = None,
+    llm_client: Optional[GroqClientWrapper] = None,
     base_dir: Optional[Union[Path, str]] = None,
     use_gold_evidence_for_answerable: bool = True,
     dense_backend: str = "local",
     qdrant_client: Optional[Any] = None,
+    eval_context: Optional[EvaluationContext] = None,
 ) -> Dict[str, Any]:
-    """Evaluate generation on a single question using the real answering pipeline.
+    """Evaluate generation on a single question using verified canonical evidence.
 
     For diagnostic questions, runs through the actual application authorization and
     evidence sufficiency checks without reading expected diagnostic labels to construct the answer.
@@ -88,6 +149,11 @@ def evaluate_single_question(
     expected_evidence = question_data.get("gold_evidence", [])
     restr_targets = question_data.get("restricted_target_chunk_ids", [])
 
+    base = Path(base_dir) if base_dir else Path.cwd()
+    ctx = eval_context or create_evaluation_context(base_dir=base)
+    active_retriever = retriever or HybridRetriever(base_dir=base)
+    active_llm = llm_client or GroqClientWrapper()
+
     start_time = time.perf_counter()
 
     # Diagnostic questions: execute through real application answering pipeline
@@ -96,16 +162,16 @@ def evaluate_single_question(
             question=q_text,
             role=role,
             query_date=query_date_str,
-            retriever=retriever,
-            llm_client=llm_client,
-            base_dir=base_dir,
+            retriever=active_retriever,
+            llm_client=active_llm,
+            base_dir=base,
             dense_backend=dense_backend,
             qdrant_client=qdrant_client,
         )
         total_lat = (time.perf_counter() - start_time) * 1000.0
 
         is_restricted_expected = bool(restr_targets)
-        # Score the refusal based on whether it correctly refused and matched expected refusal type
+        # Score refusal based on whether it correctly refused and matched expected refusal type
         refusal_correct = False
         if is_restricted_expected:
             refusal_correct = (app_result.status == AnswerStatus.RESTRICTED.value)
@@ -121,6 +187,7 @@ def evaluate_single_question(
             "query_date": query_date_str,
             "answerability": is_answerable,
             "gold_chunk_ids": gold_cids,
+            "evaluation_mode": "application_diagnostic",
             "retrieval_mode": f"application_{dense_backend}",
             "status": app_result.status,
             "answer": app_result.answer,
@@ -131,6 +198,8 @@ def evaluate_single_question(
             "citation_valid": len(app_result.citations) == 0,
             "refusal_correct": refusal_correct,
             "provider_error": app_result.status == "operational_error",
+            "evidence_validation_failure": False,
+            "citation_validation_failure": False,
             "provider_calls_attempted": 0,
             "role_violations": 0,
             "version_violations": 0,
@@ -145,41 +214,75 @@ def evaluate_single_question(
 
     # Answerable questions: run using authorized gold chunks or standard retrieval
     if use_gold_evidence_for_answerable and gold_cids:
-        # Load and verify gold evidence through canonical corpus
-        corpus_chunks = getattr(retriever, "chunks_by_id", {})
-        if not corpus_chunks and hasattr(retriever, "chunks"):
-            corpus_chunks = {c["chunk_id"]: c for c in retriever.chunks}
-
-        authorized_chunks = []
         role_violations = 0
         version_violations = 0
-        integrity_error = False
+        fail_reason: Optional[str] = None
+        evidence_validation_failed = False
 
-        # Verify corpus fingerprint
-        manifest = getattr(retriever, "corpus_manifest", None)
-        corpus_fp = manifest.get("processed_fingerprint") if manifest else None
-        if not corpus_fp:
-            integrity_error = True
+        # Fail-closed check 1: Corpus fingerprint
+        if not ctx.corpus_fingerprint:
+            fail_reason = "Corpus fingerprint is missing or invalid."
+            evidence_validation_failed = True
+
+        # Fail-closed check 2: Evidence limit (1 to 4 chunks)
+        if not (1 <= len(gold_cids) <= 4):
+            fail_reason = f"Gold chunks count ({len(gold_cids)}) outside allowed bounds [1, 4]."
+            evidence_validation_failed = True
+
+        # Fail-closed check 3: Duplicate chunk IDs
+        if len(gold_cids) != len(set(gold_cids)):
+            fail_reason = "Duplicate chunk IDs present in gold_chunk_ids."
+            evidence_validation_failed = True
+
+        # Fail-closed check 4: Presence and metadata integrity against canonical records
+        authorized_chunks: List[Dict[str, Any]] = []
+        exact_fields = [
+            "chunk_id", "doc_id", "clause_id", "department", "text", "title", "version",
+            "effective_from", "source_file"
+        ]
 
         for cid in gold_cids:
-            if cid not in corpus_chunks:
-                integrity_error = True
-                continue
-            c = corpus_chunks[cid]
-            # Verify role permission
-            if role not in c.get("allowed_roles", []):
+            if cid not in ctx.chunks_by_id:
+                fail_reason = f"Gold chunk ID '{cid}' not found in canonical corpus."
+                evidence_validation_failed = True
+                break
+
+            canonical = ctx.chunks_by_id[cid]
+
+            # Role authorization verification
+            if role not in canonical.get("allowed_roles", []):
                 role_violations += 1
-            # Verify effective date
-            eff_from = c.get("effective_from", "0000-01-01")
-            eff_to = c.get("effective_to") or "9999-12-31"
+                fail_reason = f"Role '{role}' is not authorized for chunk '{cid}'."
+                evidence_validation_failed = True
+
+            # Temporal eligibility verification
+            eff_from = canonical.get("effective_from", "0000-01-01")
+            eff_to = canonical.get("effective_to") or "9999-12-31"
             if not (eff_from <= validated_date.isoformat() <= eff_to):
                 version_violations += 1
+                fail_reason = f"Chunk '{cid}' is inactive on query date {validated_date.isoformat()}."
+                evidence_validation_failed = True
 
-            if is_chunk_eligible(c, role, validated_date):
-                authorized_chunks.append(c)
+            if is_chunk_eligible(canonical, role, validated_date):
+                authorized_chunks.append(canonical)
 
-        # FAIL CLOSED: Never send invalid or unauthorized chunks to Groq!
-        if role_violations > 0 or version_violations > 0 or integrity_error or not authorized_chunks:
+        # Fail-closed check 5: Verbatim quote presence in canonical chunk text
+        if not evidence_validation_failed:
+            for ev_item in expected_evidence:
+                ev_cid = ev_item.get("chunk_id")
+                ev_quote = ev_item.get("quote", "").strip()
+                if not ev_cid or ev_cid not in ctx.chunks_by_id:
+                    fail_reason = f"Evidence quote references unknown chunk ID '{ev_cid}'."
+                    evidence_validation_failed = True
+                    break
+                can_text = ctx.chunks_by_id[ev_cid]["text"]
+                if ev_quote and ev_quote not in can_text:
+                    fail_reason = f"Evidence quote is not an exact substring of chunk '{ev_cid}' text."
+                    evidence_validation_failed = True
+                    break
+
+        # FAIL CLOSED: Never send invalid, corrupted, or unauthorized chunks to Groq!
+        if evidence_validation_failed or role_violations > 0 or version_violations > 0 or not authorized_chunks:
             total_lat = (time.perf_counter() - start_time) * 1000.0
             return {
                 "question_id": qid,
@@ -190,19 +293,22 @@ def evaluate_single_question(
                 "query_date": query_date_str,
                 "answerability": is_answerable,
                 "gold_chunk_ids": gold_cids,
-                "retrieval_mode": "gold_evidence_direct (independent of retrieval backend)",
+                "evaluation_mode": "gold_evidence_generation",
+                "retrieval_mode": "none (gold evidence direct)",
                 "status": "operational_error",
-                "answer": "Gold evidence failed authorization/version integrity verification.",
+                "answer": "Gold evidence failed authorization, version, or text verification.",
                 "citations": [],
                 "referenced_rule_ids": [],
                 "reason": (
-                    f"Unauthorized or invalid gold evidence: role_violations={role_violations}, "
-                    f"version_violations={version_violations}, integrity_error={integrity_error}."
+                    f"Gold evidence verification failed: {fail_reason} "
+                    f"(role_violations={role_violations}, version_violations={version_violations})."
                 ),
-                "schema_valid": False,
+                "schema_valid": None,
                 "citation_valid": False,
                 "refusal_correct": False,
-                "provider_error": True,
+                "provider_error": False,
+                "evidence_validation_failure": True,
+                "citation_validation_failure": False,
                 "provider_calls_attempted": 0,
                 "role_violations": role_violations,
                 "version_violations": version_violations,
@@ -210,12 +316,9 @@ def evaluate_single_question(
                 "provider_latency_ms": None,
                 "token_usage": None,
                 "factual_correctness": "not_reviewed",
-                "error_category": "service_unavailable",
+                "error_category": "evidence_validation_failure",
                 "gold_quotes": [e.get("quote", "") for e in expected_evidence],
-                "error": (
-                    f"Gold evidence authorization failed: role_violations={role_violations}, "
-                    f"version_violations={version_violations}"
-                ),
+                "error": f"Gold evidence verification failed: {fail_reason}",
             }
 
         extracted_conds = extract_conditions_from_query(q_text)
@@ -223,7 +326,7 @@ def evaluate_single_question(
             authorized_chunks=authorized_chunks,
             role=role,
             query_date=validated_date,
-            base_dir=base_dir,
+            base_dir=base,
             extracted_conditions=extracted_conds,
         )
 
@@ -240,7 +343,8 @@ def evaluate_single_question(
                 "query_date": query_date_str,
                 "answerability": is_answerable,
                 "gold_chunk_ids": gold_cids,
-                "retrieval_mode": "gold_evidence_direct (independent of retrieval backend)",
+                "evaluation_mode": "gold_evidence_generation",
+                "retrieval_mode": "none (gold evidence direct)",
                 "status": "insufficient",
                 "answer": "The policy question contains rule condition inputs that could not be evaluated safely.",
                 "citations": [],
@@ -250,6 +354,8 @@ def evaluate_single_question(
                 "citation_valid": False,
                 "refusal_correct": False,
                 "provider_error": False,
+                "evidence_validation_failure": False,
+                "citation_validation_failure": False,
                 "provider_calls_attempted": 0,
                 "role_violations": 0,
                 "version_violations": 0,
@@ -276,22 +382,35 @@ def evaluate_single_question(
         error_cat = None
         provider_lat = None
         provider_calls = 1
+        provider_err = False
+        cit_val_failure = False
+
+        baseline_telemetry = None
+        if hasattr(active_llm, "get_telemetry_snapshot"):
+            baseline_telemetry = active_llm.get_telemetry_snapshot()
 
         try:
-            model_resp, llm_meta = llm_client.generate_answer(
+            model_resp, llm_meta = active_llm.generate_answer(
                 question=q_text,
                 role=role,
                 evidence_chunks=authorized_chunks,
                 query_date=query_date_str,
                 applicable_rule_facts=rule_results,
             )
-            provider_calls = llm_meta.get("calls_made", 1)
+            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+                delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+                token_usage = _safe_int(getattr(delta, "known_total_tokens", None), default=0) if getattr(delta, "known_total_tokens", None) is not None else None
+            else:
+                provider_calls = _safe_int(llm_meta.get("calls_made", 1), default=1) if isinstance(llm_meta, dict) else 1
+                provider_lat = _safe_float(llm_meta.get("latency_ms")) if isinstance(llm_meta, dict) else None
+                token_usage = _safe_int(llm_meta.get("total_tokens")) if (isinstance(llm_meta, dict) and llm_meta.get("total_tokens") is not None) else None
+
             schema_valid = True
             gen_answer = model_resp.answer
             gen_status = model_resp.status.value
             gen_reason = model_resp.reason
-            token_usage = llm_meta.get("total_tokens")
-            provider_lat = llm_meta.get("latency_ms")
 
             val_cids, _, val_rules = validate_citations_and_rules(
                 response=model_resp,
@@ -305,18 +424,33 @@ def evaluate_single_question(
             citation_valid = True
 
         except CitationValidationError as cit_err:
+            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+                delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
             error_msg = cit_err.safe_message
             error_cat = cit_err.category
             gen_status = "operational_error"
             citation_valid = False
+            cit_val_failure = True
         except SanitizedProviderError as prov_err:
+            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+                delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
             error_msg = prov_err.safe_message
             error_cat = prov_err.category
             gen_status = "operational_error"
+            provider_err = True
         except Exception:
+            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+                delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
             error_msg = "Unhandled operational error during evaluation generation."
             error_cat = "service_unavailable"
             gen_status = "operational_error"
+            provider_err = True
 
         total_lat = (time.perf_counter() - start_time) * 1000.0
 
@@ -329,7 +463,8 @@ def evaluate_single_question(
             "query_date": query_date_str,
             "answerability": is_answerable,
             "gold_chunk_ids": gold_cids,
-            "retrieval_mode": "gold_evidence_direct (independent of retrieval backend)",
+            "evaluation_mode": "gold_evidence_generation",
+            "retrieval_mode": "none (gold evidence direct)",
             "status": gen_status,
             "answer": gen_answer,
             "citations": gen_citations,
@@ -338,7 +473,9 @@ def evaluate_single_question(
             "schema_valid": schema_valid,
             "citation_valid": citation_valid,
             "refusal_correct": False,
-            "provider_error": gen_status == "operational_error",
+            "provider_error": provider_err,
+            "evidence_validation_failure": False,
+            "citation_validation_failure": cit_val_failure,
             "provider_calls_attempted": provider_calls,
             "role_violations": 0,
             "version_violations": 0,
@@ -356,9 +493,9 @@ def evaluate_single_question(
             question=q_text,
             role=role,
             query_date=query_date_str,
-            retriever=retriever,
-            llm_client=llm_client,
-            base_dir=base_dir,
+            retriever=active_retriever,
+            llm_client=active_llm,
+            base_dir=base,
             dense_backend=dense_backend,
             qdrant_client=qdrant_client,
         )
@@ -372,6 +509,7 @@ def evaluate_single_question(
             "query_date": query_date_str,
             "answerability": is_answerable,
             "gold_chunk_ids": gold_cids,
+            "evaluation_mode": "application_pipeline",
             "retrieval_mode": f"application_{dense_backend}",
             "status": app_result.status,
             "answer": app_result.answer,
@@ -382,11 +520,13 @@ def evaluate_single_question(
             "citation_valid": len(app_result.citations) > 0 and app_result.status == "answered",
             "refusal_correct": False,
             "provider_error": app_result.status == "operational_error",
-            "provider_calls_attempted": 1 if app_result.token_usage is not None else 0,
+            "evidence_validation_failure": False,
+            "citation_validation_failure": False,
+            "provider_calls_attempted": app_result.provider_calls_attempted,
             "role_violations": 0,
             "version_violations": 0,
             "latency_ms": round(total_lat, 2),
-            "provider_latency_ms": None,
+            "provider_latency_ms": app_result.provider_latency_ms,
             "token_usage": app_result.token_usage,
             "factual_correctness": "not_reviewed",
             "error_category": app_result.error_category,
@@ -411,7 +551,7 @@ def run_generation_evaluation(
         dataset_path: Path to dev_questions.json.
         base_dir: Repository root.
         subset_ids: Specific question IDs to evaluate.
-        max_questions: Cap on number of questions to evaluate.
+        max_questions: Cap on number of questions to evaluate (1 to 50).
         llm_client: Optional injected client wrapper.
         retriever: Optional injected HybridRetriever.
         dense_backend: Dense retrieval backend ('local' or 'qdrant').
@@ -421,6 +561,18 @@ def run_generation_evaluation(
         Dict with aggregate summary and per-question results.
     """
     base = Path(base_dir) if base_dir else Path.cwd()
+
+    if max_questions is not None and (max_questions < 1 or max_questions > 50):
+        raise ValueError(f"max_questions must be an integer between 1 and 50 inclusive, got {max_questions}.")
+
+    # Pre-generation evaluation dataset validation
+    try:
+        val_report = validate_evaluation_dataset(dataset_path, base_dir=base)
+        if val_report.get("status") != "valid":
+            raise ValueError("Evaluation dataset validation failed.")
+    except Exception as exc:
+        raise ValueError(f"Evaluation dataset validation failed: {exc}") from exc
+
     data = load_evaluation_dataset(dataset_path)
     all_questions = data["questions"]
     q_map = {q["question_id"]: q for q in all_questions}
@@ -430,7 +582,10 @@ def run_generation_evaluation(
         target_ids = target_ids[:max_questions]
 
     selected_questions = [q_map[qid] for qid in target_ids if qid in q_map]
+    if not selected_questions:
+        raise ValueError("No matching questions found in dataset to evaluate.")
 
+    eval_ctx = create_evaluation_context(base_dir=base)
     active_retriever = retriever or HybridRetriever(base_dir=base)
     active_llm = llm_client or GroqClientWrapper()
 
@@ -458,6 +613,7 @@ def run_generation_evaluation(
             base_dir=base,
             dense_backend=dense_backend,
             qdrant_client=active_qdrant_client,
+            eval_context=eval_ctx,
         )
         per_q_results.append(res)
         if res.get("error_category") == "rate_limited":
@@ -465,7 +621,7 @@ def run_generation_evaluation(
             stop_reason = "Rate limit HTTP 429 encountered from provider."
             print(f"Encountered Groq 429 rate limit on {qid}. Stopping evaluation early to respect provider quota.")
             break
-        # Pacing between live calls
+        # Pacing between live calls (skip during mock/offline runs)
         if q.get("answerability", True) and llm_client is None:
             time.sleep(2.5)
 
@@ -478,22 +634,34 @@ def run_generation_evaluation(
     restr_results = [r for r in diag_results if r["question_id"].endswith("-009")]
     unsupp_results = [r for r in diag_results if r["question_id"].endswith("-010")]
 
-    successful_generations = sum(1 for r in ans_results if r["status"] == "answered" and not r["provider_error"])
+    successful_answers = sum(
+        1 for r in ans_results
+        if r["status"] == "answered" and not r["provider_error"] and r["schema_valid"] and r["citation_valid"]
+    )
     refusals = sum(1 for r in per_q_results if r["status"] in ("insufficient", "restricted"))
-    provider_errors = sum(1 for r in per_q_results if r["provider_error"])
+    provider_errors = sum(1 for r in per_q_results if r.get("provider_error", False))
+    evidence_val_failures = sum(1 for r in per_q_results if r.get("evidence_validation_failure", False))
+    citation_val_failures = sum(1 for r in per_q_results if r.get("citation_validation_failure", False))
 
-    generations_attempted = sum(1 for r in per_q_results if r.get("provider_calls_attempted", 0) > 0)
+    generations_attempted = sum(1 for r in per_q_results if _safe_int(r.get("provider_calls_attempted", 0), default=0) > 0)
     schema_valid_generations = sum(
         1 for r in per_q_results
-        if r.get("provider_calls_attempted", 0) > 0 and r.get("schema_valid") is True and not r["provider_error"]
+        if _safe_int(r.get("provider_calls_attempted", 0), default=0) > 0 and r.get("schema_valid") is True and not r.get("provider_error", False)
     )
-    citation_valid_generations = sum(1 for r in ans_results if r["citation_valid"] and not r["provider_error"])
+    citation_valid_generations = sum(
+        1 for r in ans_results
+        if r.get("citation_valid", False) and not r.get("provider_error", False)
+    )
 
     restr_success = sum(1 for r in restr_results if r["refusal_correct"])
     unsupp_success = sum(1 for r in unsupp_results if r["refusal_correct"])
+    incorrect_refusals = (
+        sum(1 for r in ans_results if r["status"] in ("insufficient", "restricted")) +
+        sum(1 for r in diag_results if not r["refusal_correct"] and r["status"] in ("insufficient", "restricted"))
+    )
 
-    generation_calls = sum(r.get("provider_calls_attempted", 0) for r in per_q_results)
-    total_tokens = sum(r.get("token_usage") or 0 for r in per_q_results)
+    actual_provider_requests = sum(_safe_int(r.get("provider_calls_attempted", 0), default=0) for r in per_q_results)
+    known_tokens = sum(_safe_int(r.get("token_usage", 0), default=0) for r in per_q_results if r.get("token_usage") is not None)
 
     e2e_latencies = [r["latency_ms"] for r in per_q_results]
     provider_latencies = [
@@ -514,16 +682,23 @@ def run_generation_evaluation(
         "retrieval_backend": dense_backend,
         "planned_questions": planned_questions,
         "completed_questions": completed_questions,
-        "successful_generations": successful_generations,
+        "successful_answers": successful_answers,
+        "successful_generations": successful_answers,  # Backward compatibility
         "refusals": refusals,
+        "restricted_refusal_successes": restr_success,
+        "unsupported_refusal_successes": unsupp_success,
+        "incorrect_refusals": incorrect_refusals,
         "provider_errors": provider_errors,
+        "provider_failures": provider_errors,
+        "evidence_validation_failures": evidence_val_failures,
+        "citation_validation_failures": citation_val_failures,
         "generations_attempted": generations_attempted,
         "schema_valid_generations": schema_valid_generations,
         "citation_valid_generations": citation_valid_generations,
-        "restricted_refusal_successes": restr_success,
-        "unsupported_refusal_successes": unsupp_success,
-        "generation_calls": generation_calls,
-        "tokens_used": total_tokens,
+        "generation_calls": actual_provider_requests,
+        "actual_provider_requests": actual_provider_requests,
+        "tokens_used": known_tokens,
+        "known_tokens_used": known_tokens,
         "median_e2e_latency_ms": round(median_e2e, 2),
         "median_provider_latency_ms": round(median_prov, 2),
         "median_diagnostic_latency_ms": round(median_diag, 2),
@@ -576,6 +751,8 @@ def generate_summary_markdown(summary: Dict[str, Any]) -> str:
         f"| **Restricted Refusal Success** | {format_rate(summary['restricted_refusal_successes'], restr_count)} | 100% |",
         f"| **Unsupported Refusal Success** | {format_rate(summary['unsupported_refusal_successes'], unsupp_count)} | 100% |",
         f"| **Provider Errors** | {summary['provider_errors']} | 0 |",
+        f"| **Evidence Validation Failures** | {summary.get('evidence_validation_failures', 0)} | 0 |",
+        f"| **Citation Validation Failures** | {summary.get('citation_validation_failures', 0)} | 0 |",
         f"| **Provider Requests Attempted** | {summary.get('generation_calls', 0)} | Monitored |",
         f"| **Median E2E Latency** | {summary['median_e2e_latency_ms']} ms | < 2500 ms |",
         f"| **Median Provider Latency** | {summary['median_provider_latency_ms']} ms | < 2000 ms |",
@@ -621,27 +798,6 @@ def main():
         max_questions=limit,
         dense_backend=args.backend,
     )
-
-    local_eval_dir = repo_root / "local_eval"
-    local_eval_dir.mkdir(exist_ok=True)
-
-    results_path = local_eval_dir / "generation_development_results.json"
-    summary_path = local_eval_dir / "generation_development_summary.md"
-
-    results_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    md_content = generate_summary_markdown(summary)
-    summary_path.write_text(md_content, encoding="utf-8")
-
-    print(f"\nSaved generation results to {results_path}")
-    print(f"Saved generation summary to {summary_path}")
-    print("\nSummary metrics:")
-    print(f"  Evaluation state:           {summary['evaluation_state']}")
-    print(f"  Completed / Planned:        {summary['completed_questions']} / {summary['planned_questions']}")
-    print(f"  Schema valid:               {summary['schema_valid_generations']}")
-    print(f"  Citation valid:             {summary['citation_valid_generations']}")
-    print(f"  Restricted refusals:        {summary['restricted_refusal_successes']}")
-    print(f"  Unsupported refusals:       {summary['unsupported_refusal_successes']}")
-    print(f"  Median E2E latency:         {summary['median_e2e_latency_ms']} ms")
 
     local_eval_dir = repo_root / "local_eval"
     local_eval_dir.mkdir(exist_ok=True)

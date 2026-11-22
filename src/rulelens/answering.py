@@ -48,6 +48,28 @@ from rulelens.rules import (
 )
 
 
+def _safe_int(val: Any, default: int = 1) -> int:
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(val: Any) -> Optional[float]:
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass
 class GenerationResult:
     """Complete, structured outcome of answering a policy question."""
@@ -65,12 +87,17 @@ class GenerationResult:
     corpus_fingerprint: str
     evidence_fingerprint: Dict[str, Any]
     latency_ms: float
+    provider_calls_attempted: int = 0
+    provider_latency_ms: Optional[float] = None
     token_usage: Optional[int] = None
     error_category: Optional[str] = None
     error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["provider_calls_attempted"] = _safe_int(self.provider_calls_attempted, default=0)
+        d["provider_latency_ms"] = _safe_float(self.provider_latency_ms)
+        return d
 
 
 def check_restricted_policy_access(
@@ -193,9 +220,9 @@ def validate_candidate_evidence(
 
     canonical = canonical_chunks_by_id[cid]
 
-    # Verify all 11 canonical fields
+    # Verify all 12 canonical fields
     exact_fields = [
-        "chunk_id", "doc_id", "clause_id", "text", "title", "version",
+        "chunk_id", "doc_id", "clause_id", "department", "text", "title", "version",
         "effective_from", "source_file"
     ]
     for field in exact_fields:
@@ -330,7 +357,7 @@ def answer_question(
         llm_client: Injected GroqClientWrapper instance (optional).
         qdrant_client: Optional Qdrant client when dense_backend="qdrant".
         base_dir: Repository root directory.
-        top_k: Number of evidence chunks to retrieve for generation (default: 4).
+        top_k: Number of evidence chunks to retrieve for generation (default: 4, max: 4).
         candidate_depth: Retrieval candidate pool depth (default: 20).
         mode: Retrieval mode ('hybrid', 'dense', 'bm25').
         dense_backend: Dense retrieval backend ('local' or 'qdrant').
@@ -349,11 +376,36 @@ def answer_question(
     if role not in ALLOWED_ROLES_SET:
         raise ValueError(f"Unknown role '{role}'. Allowed roles are: {sorted(ALLOWED_ROLES_SET)}")
 
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1 or top_k > 4:
+        raise ValueError(f"Invalid top_k: top_k must be an integer between 1 and 4 inclusive, got {top_k}.")
+
     validated_date = parse_query_date(query_date)
     date_str = validated_date.isoformat()
 
     # Step B: Initialize retriever & verify corpus integrity
-    active_retriever = retriever or HybridRetriever(base_dir=base_dir)
+    try:
+        active_retriever = retriever or HybridRetriever(base_dir=base_dir)
+    except Exception as exc:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The policy verification system encountered an operational error.",
+            status="operational_error",
+            reason="Retriever initialization failed.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint="",
+            evidence_fingerprint={},
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+            error_category="service_unavailable",
+            error="Retriever initialization failed.",
+        )
 
     manifest = getattr(active_retriever, "corpus_manifest", None)
     if not manifest:
@@ -362,7 +414,10 @@ def answer_question(
         if not manifest_p.exists():
             manifest_p = base_path.parent / "data" / "processed" / "corpus_manifest.json"
         if manifest_p.exists():
-            manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
+            try:
+                manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = None
 
     if not manifest or not manifest.get("processed_fingerprint"):
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
@@ -380,6 +435,8 @@ def answer_question(
             corpus_fingerprint="",
             evidence_fingerprint={},
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
             error_category="service_unavailable",
             error="Corpus fingerprint manifest is missing or inconsistent.",
         )
@@ -403,19 +460,43 @@ def answer_question(
             corpus_fingerprint=corpus_fp,
             evidence_fingerprint={"corpus_fingerprint": corpus_fp},
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
         )
 
     # Step D: Retrieval
-    retrieved_results = active_retriever.search(
-        query=cleaned_question,
-        role=role,
-        query_date=validated_date,
-        mode=mode,
-        dense_backend=dense_backend,
-        qdrant_client=qdrant_client,
-        top_k=top_k,
-        candidate_depth=candidate_depth,
-    )
+    try:
+        retrieved_results = active_retriever.search(
+            query=cleaned_question,
+            role=role,
+            query_date=validated_date,
+            mode=mode,
+            dense_backend=dense_backend,
+            qdrant_client=qdrant_client,
+            top_k=top_k,
+            candidate_depth=candidate_depth,
+        )
+    except Exception as exc:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The policy verification system encountered an operational error during retrieval.",
+            status="operational_error",
+            reason="Retrieval execution failed.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint={},
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+            error_category="service_unavailable",
+            error="Retrieval execution failed.",
+        )
 
     # Step E: Strengthened evidence validation against canonical corpus records
     canonical_chunks = getattr(active_retriever, "chunks_by_id", {})
@@ -443,6 +524,8 @@ def answer_question(
                 corpus_fingerprint=corpus_fp,
                 evidence_fingerprint={},
                 latency_ms=round(total_latency, 2),
+                provider_calls_attempted=0,
+                provider_latency_ms=None,
                 error_category=integ_err.category,
                 error=integ_err.safe_message,
             )
@@ -466,6 +549,8 @@ def answer_question(
             corpus_fingerprint=corpus_fp,
             evidence_fingerprint=ev_fingerprint,
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
         )
 
     # Step G: Deterministic rule resolution
@@ -482,7 +567,7 @@ def answer_question(
         extracted_conditions=extracted_conds,
     )
 
-    # If any rule condition input has an invalid unit or type error, fail safely with insufficient
+    # If any rule condition input has an invalid unit, type error, or ambiguous condition, fail safely with insufficient
     rule_errors = [r for r in rule_results if r.is_error]
     if rule_errors:
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
@@ -501,6 +586,8 @@ def answer_question(
             corpus_fingerprint=corpus_fp,
             evidence_fingerprint=ev_fingerprint,
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
             error_category=err.error_type,
             error=err.explanation,
         )
@@ -510,6 +597,13 @@ def answer_question(
 
     # Step H: Call Groq LLM
     active_llm = llm_client or GroqClientWrapper()
+    baseline_telemetry = None
+    if hasattr(active_llm, "get_telemetry_snapshot"):
+        baseline_telemetry = active_llm.get_telemetry_snapshot()
+
+    provider_calls = 1
+    provider_lat: Optional[float] = None
+
     try:
         model_resp, llm_meta = active_llm.generate_answer(
             question=cleaned_question,
@@ -518,7 +612,27 @@ def answer_question(
             query_date=date_str,
             applicable_rule_facts=rule_results,
         )
+        if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+        else:
+            telemetry = llm_meta.get("telemetry") if isinstance(llm_meta, dict) else None
+            provider_calls = _safe_int(
+                getattr(telemetry, "provider_requests_attempted", None) or (llm_meta.get("calls_made", 1) if isinstance(llm_meta, dict) else 1),
+                default=1,
+            )
+            provider_lat = _safe_float(
+                getattr(telemetry, "provider_request_latency_ms", None) or (llm_meta.get("latency_ms") if isinstance(llm_meta, dict) else None)
+            )
     except SanitizedProviderError as prov_err:
+        if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+        else:
+            provider_calls = 1
+            provider_lat = None
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -534,10 +648,19 @@ def answer_question(
             corpus_fingerprint=corpus_fp,
             evidence_fingerprint=ev_fingerprint,
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=provider_calls,
+            provider_latency_ms=provider_lat,
             error_category=prov_err.category,
             error=prov_err.safe_message,
         )
     except Exception:
+        if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+        else:
+            provider_calls = 1
+            provider_lat = None
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -553,6 +676,8 @@ def answer_question(
             corpus_fingerprint=corpus_fp,
             evidence_fingerprint=ev_fingerprint,
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=provider_calls,
+            provider_latency_ms=provider_lat,
             error_category="service_unavailable",
             error="Generation service encountered an unhandled provider error.",
         )
@@ -582,6 +707,8 @@ def answer_question(
             corpus_fingerprint=corpus_fp,
             evidence_fingerprint=ev_fingerprint,
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=provider_calls,
+            provider_latency_ms=provider_lat,
             error_category=cit_err.category,
             error=cit_err.safe_message,
         )
@@ -601,6 +728,8 @@ def answer_question(
             corpus_fingerprint=corpus_fp,
             evidence_fingerprint=ev_fingerprint,
             latency_ms=round(total_latency, 2),
+            provider_calls_attempted=provider_calls,
+            provider_latency_ms=provider_lat,
             error_category="invalid_citation",
             error="Citation validation failed.",
         )
@@ -621,6 +750,8 @@ def answer_question(
         corpus_fingerprint=corpus_fp,
         evidence_fingerprint=ev_fingerprint,
         latency_ms=round(total_latency, 2),
+        provider_calls_attempted=provider_calls,
+        provider_latency_ms=provider_lat,
         token_usage=llm_meta.get("total_tokens"),
     )
 

@@ -155,7 +155,13 @@ python -m rulelens.answering --question "How many days in advance must domestic 
 Evaluate grounded answer generation against the development evaluation dataset:
 ```bash
 # Evaluate development questions (e.g., balanced 30-question subset)
-python -m rulelens.generation_eval run --questions data/evaluation/dev_questions.json --limit 30 --backend local
+python -m rulelens.generation_eval --questions data/evaluation/dev_questions.json --limit 30 --backend local
+
+# Run 5-question smoke test
+python -m rulelens.generation_eval --smoke --backend local
 ```
 
-> **Development Evaluation Status:** On the 30-question development subset (20 answerable, 5 role-restricted, 5 unsupported), 22 questions were evaluated live (16 answerable, 6 diagnostics) before reaching Groq free-tier per-minute rate limits (HTTP 429). The evaluation runner cleanly stopped without crashing, preserving all completed responses in `local_eval/generation_development_results.json` and `local_eval/generation_development_summary.md`. Across all evaluated questions: 100% schema validity, 100% citation validity, and 100% appropriate refusal on diagnostic probes.
+> **Development Evaluation Notes:**
+> - **Evaluation Modes:** Evaluates answerable questions in `gold_evidence_generation` mode with strict authorization, temporal validity, verbatim quote, and 4-chunk limit checks before calling Groq. Evaluates diagnostic probes (`application_diagnostic` mode) through the end-to-end `answer_question` pipeline using the selected retrieval backend (`local` or `qdrant`).
+> - **Provider Quotas and Pacing:** When evaluating live against the Groq API (`openai/gpt-oss-20b`), sequential requests are paced (2.5s) to stay within per-minute TPM/RPM quotas. If an HTTP 429 rate limit is encountered, the evaluation harness stops gracefully without data loss, marking the run as partial and persisting all completed results to `local_eval/generation_development_results.json` and `local_eval/generation_development_summary.md`.
+> - **Offline Verification:** Full generation evaluation workflows and fail-closed safety behaviors are verified offline with mocked LLM wrappers via `python -m pytest -q`.

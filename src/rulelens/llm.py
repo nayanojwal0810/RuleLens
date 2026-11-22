@@ -9,6 +9,7 @@ Provides:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 import time
@@ -96,15 +97,61 @@ Do not include any extra fields, markdown fences, or text outside the JSON objec
 """
 
 
+@dataclass(frozen=True)
+class ProviderTelemetrySnapshot:
+    """Minimal, testable telemetry snapshot of provider requests."""
+
+    provider_requests_attempted: int = 0
+    provider_requests_succeeded: int = 0
+    provider_request_latency_ms: float = 0.0
+    known_total_tokens: Optional[int] = None
+    has_incomplete_tokens: bool = False
+
+    def delta(self, baseline: ProviderTelemetrySnapshot) -> ProviderTelemetrySnapshot:
+        """Compute the difference between this snapshot and a previous baseline."""
+        diff_tokens = None
+        if self.known_total_tokens is not None and baseline.known_total_tokens is not None:
+            diff_tokens = self.known_total_tokens - baseline.known_total_tokens
+        elif self.known_total_tokens is not None:
+            diff_tokens = self.known_total_tokens
+
+        incomplete = self.has_incomplete_tokens or baseline.has_incomplete_tokens
+        return ProviderTelemetrySnapshot(
+            provider_requests_attempted=self.provider_requests_attempted - baseline.provider_requests_attempted,
+            provider_requests_succeeded=self.provider_requests_succeeded - baseline.provider_requests_succeeded,
+            provider_request_latency_ms=round(
+                max(0.0, self.provider_request_latency_ms - baseline.provider_request_latency_ms), 2
+            ),
+            known_total_tokens=diff_tokens,
+            has_incomplete_tokens=incomplete,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "provider_requests_attempted": self.provider_requests_attempted,
+            "provider_requests_succeeded": self.provider_requests_succeeded,
+            "provider_request_latency_ms": self.provider_request_latency_ms,
+            "known_total_tokens": self.known_total_tokens,
+            "has_incomplete_tokens": self.has_incomplete_tokens,
+        }
+
+
 def build_evidence_context(
     evidence_chunks: Sequence[Union[RetrievalResult, Dict[str, Any]]],
     applicable_rule_facts: Optional[Sequence[Any]] = None,
 ) -> str:
     """Format authorized evidence chunks and validated rule facts for model prompt.
 
-    At most 4 chunks are included. Only non-sensitive approved metadata is included.
+    Enforces exactly at most 4 chunks. Never silently slices or permits extraneous evidence.
     """
-    chunks_to_include = evidence_chunks[:4]
+    if len(evidence_chunks) > 4:
+        raise ValueError(
+            f"Maximum of 4 evidence chunks permitted for generation. Received: {len(evidence_chunks)}"
+        )
+    if len(evidence_chunks) < 1:
+        raise ValueError("At least 1 evidence chunk is required for evidence context.")
+
+    chunks_to_include = list(evidence_chunks)
     parts = []
 
     parts.append("=== AUTHORIZED POLICY EVIDENCE ===")
@@ -121,16 +168,16 @@ def build_evidence_context(
             source_page = c.source_page
             text = c.text
         else:
-            cid = c["chunk_id"]
-            doc_id = c["doc_id"]
-            clause_id = c["clause_id"]
-            title = c["title"]
-            department = c["department"]
-            version = c["version"]
-            eff_from = c["effective_from"]
+            cid = c.get("chunk_id", "")
+            doc_id = c.get("doc_id", "")
+            clause_id = c.get("clause_id", "")
+            title = c.get("title", "")
+            department = c.get("department", "")
+            version = c.get("version", "")
+            eff_from = c.get("effective_from", "")
             eff_to = c.get("effective_to") or "Present"
-            source_page = c["source_page"]
-            text = c["text"]
+            source_page = c.get("source_page", "")
+            text = c.get("text", "")
 
         parts.append(
             f"--- Evidence Chunk {i} [{cid}] ---\n"
@@ -294,6 +341,11 @@ class GroqClientWrapper:
     ):
         self.model = model
         self.timeout = timeout
+        self._requests_attempted: int = 0
+        self._requests_succeeded: int = 0
+        self._request_latency_ms: float = 0.0
+        self._known_total_tokens: Optional[int] = None
+        self._has_incomplete_tokens: bool = False
 
         if client is not None:
             self._client = client
@@ -310,6 +362,24 @@ class GroqClientWrapper:
                 max_retries=0,
                 timeout=timeout,
             )
+
+    def get_telemetry_snapshot(self) -> ProviderTelemetrySnapshot:
+        """Return a read-only snapshot of current provider request telemetry."""
+        return ProviderTelemetrySnapshot(
+            provider_requests_attempted=self._requests_attempted,
+            provider_requests_succeeded=self._requests_succeeded,
+            provider_request_latency_ms=round(self._request_latency_ms, 2),
+            known_total_tokens=self._known_total_tokens,
+            has_incomplete_tokens=self._has_incomplete_tokens,
+        )
+
+    def reset_telemetry(self) -> None:
+        """Reset internal provider request telemetry counters."""
+        self._requests_attempted = 0
+        self._requests_succeeded = 0
+        self._request_latency_ms = 0.0
+        self._known_total_tokens = None
+        self._has_incomplete_tokens = False
 
     def generate_answer(
         self,
@@ -328,6 +398,14 @@ class GroqClientWrapper:
         Raises:
             RuntimeError / ValueError: on unrecoverable generation, auth, or validation failure.
         """
+        if len(evidence_chunks) > 4:
+            raise ValueError(
+                f"Maximum of 4 evidence chunks permitted for generation. Received: {len(evidence_chunks)}"
+            )
+        if len(evidence_chunks) < 1:
+            raise ValueError("At least 1 evidence chunk is required for generation.")
+
+        baseline_telemetry = self.get_telemetry_snapshot()
         evidence_context = build_evidence_context(evidence_chunks, applicable_rule_facts)
         user_prompt = (
             f"User Role: {role}\n"
@@ -341,13 +419,10 @@ class GroqClientWrapper:
             {"role": "user", "content": user_prompt},
         ]
 
-        start_time = time.perf_counter()
         raw_content = ""
         total_tokens = None
-        call_count = 0
 
-        # Attempt 1: primary generation
-        call_count += 1
+        # Attempt 1: primary generation (telemetry incremented inside _call_provider)
         resp = self._call_provider(messages)
         raw_content = resp["content"]
         total_tokens = resp.get("total_tokens")
@@ -356,7 +431,6 @@ class GroqClientWrapper:
 
         # Attempt 2: bounded repair if needed (only for schema/JSON parsing errors)
         if parse_err is not None and max_repair_attempts > 0:
-            call_count += 1
             repair_messages = list(messages)
             repair_messages.append({"role": "assistant", "content": raw_content})
             repair_messages.append(
@@ -376,7 +450,8 @@ class GroqClientWrapper:
 
             parsed_response, parse_err = self._parse_json_response(raw_content)
 
-        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        final_telemetry = self.get_telemetry_snapshot()
+        telemetry_delta = final_telemetry.delta(baseline_telemetry)
 
         if parse_err is not None or parsed_response is None:
             raise SanitizedProviderError(
@@ -386,16 +461,18 @@ class GroqClientWrapper:
 
         metadata = {
             "model": self.model,
-            "latency_ms": round(latency_ms, 2),
-            "calls_made": call_count,
-            "total_tokens": total_tokens,
+            "latency_ms": round(telemetry_delta.provider_request_latency_ms, 2),
+            "calls_made": telemetry_delta.provider_requests_attempted,
+            "total_tokens": telemetry_delta.known_total_tokens,
             "raw_response": raw_content,
+            "telemetry": telemetry_delta,
+            "repair_attempted": (telemetry_delta.provider_requests_attempted > 1),
         }
 
         return parsed_response, metadata
 
     def _call_provider(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Call Groq chat completion endpoint with safe error mapping."""
+        """Call Groq chat completion endpoint with safe error mapping and telemetry tracking."""
         import groq
 
         response_format = {
@@ -407,6 +484,10 @@ class GroqClientWrapper:
             },
         }
 
+        # Telemetry: increment attempted immediately before provider request
+        self._requests_attempted += 1
+        req_start = time.perf_counter()
+
         try:
             completion = self._client.chat.completions.create(
                 model=self.model,
@@ -414,38 +495,51 @@ class GroqClientWrapper:
                 response_format=response_format,
                 temperature=0.0,
             )
+            req_duration_ms = (time.perf_counter() - req_start) * 1000.0
+            self._request_latency_ms += req_duration_ms
+            self._requests_succeeded += 1
+
             content = completion.choices[0].message.content or ""
             usage = getattr(completion, "usage", None)
             total_tokens = getattr(usage, "total_tokens", None) if usage else None
-            return {"content": content, "total_tokens": total_tokens}
+            if total_tokens is not None:
+                self._known_total_tokens = (self._known_total_tokens or 0) + total_tokens
+            else:
+                self._has_incomplete_tokens = True
 
-        except groq.AuthenticationError:
-            raise SanitizedProviderError(
-                category="authentication_error",
-                safe_message="Provider authentication failed. Please verify credentials.",
-            )
-        except groq.RateLimitError:
-            raise SanitizedProviderError(
-                category="rate_limited",
-                safe_message="Generation service is currently rate limited. Please retry later.",
-            )
-        except (groq.APITimeoutError, groq.APIConnectionError):
-            raise SanitizedProviderError(
-                category="timeout",
-                safe_message="Generation request timed out. Please retry later.",
-            )
-        except groq.InternalServerError:
-            raise SanitizedProviderError(
-                category="service_unavailable",
-                safe_message="Generation service is temporarily unavailable. Please retry later.",
-            )
-        except SanitizedProviderError:
-            raise
-        except Exception:
-            raise SanitizedProviderError(
-                category="service_unavailable",
-                safe_message="Generation service encountered an unhandled provider error.",
-            )
+            return {"content": content, "total_tokens": total_tokens, "latency_ms": req_duration_ms}
+
+        except Exception as exc:
+            req_duration_ms = (time.perf_counter() - req_start) * 1000.0
+            self._request_latency_ms += req_duration_ms
+
+            if isinstance(exc, groq.AuthenticationError):
+                raise SanitizedProviderError(
+                    category="authentication_error",
+                    safe_message="Provider authentication failed. Please verify credentials.",
+                ) from None
+            elif isinstance(exc, groq.RateLimitError):
+                raise SanitizedProviderError(
+                    category="rate_limited",
+                    safe_message="Generation service is currently rate limited. Please retry later.",
+                ) from None
+            elif isinstance(exc, (groq.APITimeoutError, groq.APIConnectionError)):
+                raise SanitizedProviderError(
+                    category="timeout",
+                    safe_message="Generation request timed out. Please retry later.",
+                ) from None
+            elif isinstance(exc, groq.InternalServerError):
+                raise SanitizedProviderError(
+                    category="service_unavailable",
+                    safe_message="Generation service is temporarily unavailable. Please retry later.",
+                ) from None
+            elif isinstance(exc, SanitizedProviderError):
+                raise
+            else:
+                raise SanitizedProviderError(
+                    category="service_unavailable",
+                    safe_message="Generation service encountered an unhandled provider error.",
+                ) from None
 
     def _parse_json_response(self, text: str) -> Tuple[Optional[AnswerResponse], Optional[str]]:
         """Attempt to parse and validate text as AnswerResponse."""

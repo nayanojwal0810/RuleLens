@@ -494,3 +494,107 @@ def test_cli_exits_nonzero_on_operational_error(monkeypatch, sample_retrieval_re
         with pytest.raises(SystemExit) as excinfo:
             answering_main()
         assert excinfo.value.code == 1
+
+
+# ==============================================================================
+# 4. Strict Evidence Limits, Forged Department, and Ambiguous Input Tests
+# ==============================================================================
+
+
+def test_answer_question_rejects_invalid_top_k(mock_retriever):
+    """top_k must be strictly validated as an int between 1 and 4 inclusive."""
+    for invalid_val in (0, 5, True, False, "4", None):
+        with pytest.raises(ValueError, match="Invalid top_k"):
+            answer_question(
+                question="What is the meal allowance?",
+                role="employee",
+                top_k=invalid_val,  # type: ignore
+                retriever=mock_retriever,
+            )
+
+
+def test_answer_question_rejects_forged_department(mock_retriever, sample_retrieval_result):
+    """validate_candidate_evidence must reject candidate whose department does not match canonical."""
+    forged_dept_chunk = RetrievalResult(
+        chunk_id=sample_retrieval_result.chunk_id,
+        text=sample_retrieval_result.text,
+        doc_id=sample_retrieval_result.doc_id,
+        clause_id=sample_retrieval_result.clause_id,
+        title=sample_retrieval_result.title,
+        department="Finance",  # Canonical is "Travel"
+        version=sample_retrieval_result.version,
+        source_file=sample_retrieval_result.source_file,
+        source_page=sample_retrieval_result.source_page,
+        effective_from=sample_retrieval_result.effective_from,
+        effective_to=sample_retrieval_result.effective_to,
+        allowed_roles=sample_retrieval_result.allowed_roles,
+    )
+    mock_retriever.search.return_value = [forged_dept_chunk]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    result = answer_question(
+        question="What is the meal allowance?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert result.status == "operational_error"
+    assert result.error_category == "service_unavailable"
+    assert "department" in result.error.lower()
+    assert result.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_answer_question_ambiguous_amount_safely_refuses(mock_retriever, canonical_chunks_by_id):
+    """When query specifies conflicting/ambiguous amounts, safe refusal status insufficient is returned."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"],
+        text=c["text"],
+        doc_id=c["doc_id"],
+        clause_id=c["clause_id"],
+        title=c["title"],
+        department=c["department"],
+        version=c["version"],
+        source_file=c["source_file"],
+        source_page=int(c["source_page"]),
+        effective_from=c["effective_from"],
+        effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    result = answer_question(
+        question="What approval is required for travel expenses of INR 40,000 or INR 60,000 under Travel Policy v2?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert result.status == "insufficient"
+    assert result.error_category == "ambiguous_condition"
+    assert result.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_answer_question_retrieval_failure_returns_operational_error(mock_retriever):
+    """When retriever.search raises an unexpected exception, answer_question returns operational_error."""
+    mock_retriever.search.side_effect = RuntimeError("Vector index disk I/O error")
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    result = answer_question(
+        question="What is the meal allowance?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert result.status == "operational_error"
+    assert result.error_category == "service_unavailable"
+    assert result.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()

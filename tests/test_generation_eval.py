@@ -310,7 +310,8 @@ def test_adversarial_gold_chunk_unauthorized_role_fails_closed(mock_retriever):
     )
 
     assert res["status"] == "operational_error"
-    assert res["provider_error"] is True
+    assert res["provider_error"] is False
+    assert res["evidence_validation_failure"] is True
     assert res["role_violations"] == 1
     assert res["version_violations"] == 0
     assert res["provider_calls_attempted"] == 0
@@ -340,7 +341,8 @@ def test_adversarial_gold_chunk_expired_date_fails_closed(mock_retriever):
     )
 
     assert res["status"] == "operational_error"
-    assert res["provider_error"] is True
+    assert res["provider_error"] is False
+    assert res["evidence_validation_failure"] is True
     assert res["version_violations"] == 1
     assert res["role_violations"] == 0
     assert res["provider_calls_attempted"] == 0
@@ -445,3 +447,109 @@ def test_evaluation_stops_on_typed_rate_limit(repo_root: Path, mock_retriever):
         assert summary["evaluation_state"] == "partial"
         assert "Rate limit" in summary["stop_reason"]
         assert summary["completed_questions"] == 1
+
+
+# ==============================================================================
+# 6. Additional Fail-Closed Gold Evidence & Bounds Tests
+# ==============================================================================
+
+
+def test_adversarial_gold_chunks_exceeds_limit_fails_closed(mock_retriever):
+    """Gold chunks count > 4 fails closed immediately without Groq call."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    adv_q = {
+        "question_id": "ADV-5CHUNKS-001",
+        "question": "What are all the travel rules?",
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "answerability": True,
+        "gold_chunk_ids": [
+            "DOC-TRV-002_TRV-C01", "DOC-TRV-002_TRV-C02", "DOC-TRV-002_TRV-C03",
+            "DOC-TRV-002_TRV-C04", "DOC-TRV-003_TRV-C01",
+        ],
+        "gold_evidence": [],
+    }
+
+    res = evaluate_single_question(
+        question_data=adv_q,
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert res["status"] == "operational_error"
+    assert res["provider_error"] is False
+    assert res["evidence_validation_failure"] is True
+    assert res["provider_calls_attempted"] == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_adversarial_gold_chunks_duplicate_cids_fails_closed(mock_retriever):
+    """Duplicate chunk IDs in gold_chunk_ids fails closed immediately without Groq call."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    adv_q = {
+        "question_id": "ADV-DUP-001",
+        "question": "What is the meal allowance?",
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "answerability": True,
+        "gold_chunk_ids": ["DOC-TRV-002_TRV-C03", "DOC-TRV-002_TRV-C03"],
+        "gold_evidence": [],
+    }
+
+    res = evaluate_single_question(
+        question_data=adv_q,
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert res["status"] == "operational_error"
+    assert res["provider_error"] is False
+    assert res["evidence_validation_failure"] is True
+    assert res["provider_calls_attempted"] == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_adversarial_gold_quote_mismatch_fails_closed(mock_retriever):
+    """Evidence quote that is not a verbatim substring of chunk text fails closed immediately."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    adv_q = {
+        "question_id": "ADV-QUOTE-001",
+        "question": "What is the meal allowance?",
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "answerability": True,
+        "gold_chunk_ids": ["DOC-TRV-002_TRV-C03"],
+        "gold_evidence": [
+            {
+                "chunk_id": "DOC-TRV-002_TRV-C03",
+                "quote": "FABRICATED QUOTE NOT IN POLICY TEXT: Free caviar for all employees.",
+            }
+        ],
+    }
+
+    res = evaluate_single_question(
+        question_data=adv_q,
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert res["status"] == "operational_error"
+    assert res["provider_error"] is False
+    assert res["evidence_validation_failure"] is True
+    assert res["provider_calls_attempted"] == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_run_generation_evaluation_rejects_invalid_max_questions(repo_root: Path):
+    """run_generation_evaluation rejects max_questions < 1 or > 50 with ValueError."""
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    for invalid_val in (0, 51, -1, 100):
+        with pytest.raises(ValueError, match="max_questions must be an integer between 1 and 50"):
+            run_generation_evaluation(
+                dataset_path=dataset_path,
+                base_dir=repo_root,
+                max_questions=invalid_val,
+                llm_client=mock_llm,
+            )

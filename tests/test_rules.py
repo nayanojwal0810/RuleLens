@@ -13,15 +13,18 @@ from __future__ import annotations
 
 import datetime
 import socket
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
 
 from rulelens.rules import (
+    ConditionExtractionResult,
     RuleEvaluationResult,
     RuleRecord,
     evaluate_rule_condition,
+    extract_condition_result,
     extract_conditions_from_query,
     is_rule_active,
     load_rules,
@@ -323,3 +326,52 @@ def test_rules_cache_isolation_by_base_dir(repo_root: Path, tmp_path: Path):
     # A different directory without data/processed/rules.jsonl must fail and not reuse cache
     with pytest.raises(FileNotFoundError):
         load_rules(base_dir=tmp_path, reload=False)
+
+
+# ==============================================================================
+# 5. Decimal Precision and Ambiguous Condition Tests
+# ==============================================================================
+
+
+def test_decimal_currency_precision_preserved(all_rules: List[RuleRecord]):
+    """Currency conditions preserve exact Decimal precision without float conversion loss."""
+    r3 = next(r for r in all_rules if r.rule_id == "R-TRV-003")  # <= 50000 INR
+
+    # Exact decimal threshold check
+    val_below = Decimal("50000.00")
+    val_above = Decimal("50000.01")
+
+    assert evaluate_rule_condition(r3, val_below, "INR") is True
+    assert evaluate_rule_condition(r3, val_above, "INR") is False
+
+
+def test_extract_condition_result_detects_ambiguous_amounts():
+    """Queries mentioning multiple conflicting amounts or 'or' conjunctions emit ambiguous status."""
+    ambig_query = "What happens if travel expenses are INR 40,000 or INR 50,000 under the policy?"
+    cond_res = extract_condition_result(ambig_query)
+
+    assert cond_res.status == "ambiguous"
+    assert any(c.get("field") == "expense_amount" for c in cond_res.conditions)
+
+
+def test_ambiguous_condition_marks_rule_evaluation_error(repo_root: Path):
+    """When condition extraction detects ambiguity, resolve_rules_for_evidence marks is_error=True."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04"},
+    ]
+    query = "What approval is required if expenses are INR 40,000 or INR 60,000?"
+    conds = extract_conditions_from_query(query)
+
+    res = resolve_rules_for_evidence(
+        authorized_chunks=mock_chunks,
+        role="employee",
+        query_date="2026-11-22",
+        base_dir=repo_root,
+        extracted_conditions=conds,
+    )
+
+    r_err = next(r for r in res if r.rule.rule_id in ("R-TRV-003", "R-TRV-004"))
+    assert r_err.passed is False
+    assert r_err.is_error is True
+    assert r_err.error_type == "ambiguous_condition"
+    assert "ambiguous" in r_err.explanation.lower()
