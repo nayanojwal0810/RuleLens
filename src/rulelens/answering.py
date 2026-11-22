@@ -79,35 +79,97 @@ def check_restricted_policy_access(
     role: str,
     query_date: datetime.date,
 ) -> bool:
-    """Check if query targets a policy active on date that is restricted for the role.
+    """Check if query unambiguously targets a policy active on date that is restricted for the role.
 
-    Uses only permissible policy metadata (allowed_roles, effective dates).
-    Never inspects or forwards forbidden clause text to an LLM.
+    Uses only non-sensitive document metadata (doc_id, title, department, allowed_roles, effective dates).
+    Never creates a text search index over chunk bodies or inspects forbidden clause text.
+    If restriction cannot be established reliably, returns False so the caller falls back
+    to authorized retrieval which safely returns insufficient.
     """
     date_str = query_date.isoformat()
-    active_chunks = [
-        c for c in retriever.chunks
-        if c["effective_from"] <= date_str <= (c.get("effective_to") or "9999-12-31")
+    # Cache document-level metadata catalog on retriever to avoid redundant grouping
+    doc_catalog = getattr(retriever, "_doc_metadata_catalog", None)
+    if not isinstance(doc_catalog, dict):
+        doc_catalog = {}
+        for c in getattr(retriever, "chunks", []):
+            did = c.get("doc_id")
+            if not did:
+                continue
+            if did not in doc_catalog:
+                doc_catalog[did] = {
+                    "doc_id": did,
+                    "title": c.get("title", ""),
+                    "department": c.get("department", ""),
+                    "allowed_roles": set(c.get("allowed_roles", [])),
+                    "effective_from": c.get("effective_from", "0000-01-01"),
+                    "effective_to": c.get("effective_to") or "9999-12-31",
+                }
+            else:
+                doc_catalog[did]["allowed_roles"].update(c.get("allowed_roles", []))
+        try:
+            retriever._doc_metadata_catalog = doc_catalog
+        except Exception:
+            pass
+
+    if not doc_catalog:
+        return False
+
+    active_docs = [
+        d for d in doc_catalog.values()
+        if d["effective_from"] <= date_str <= d["effective_to"]
     ]
-    if not active_chunks:
+    if not active_docs:
         return False
 
-    bm25 = retriever.get_bm25_index(active_chunks)
-    candidates = bm25.search(query, top_k=3)
-    if not candidates:
+    q_norm = query.lower()
+    restr_matches: List[Tuple[str, int]] = []
+    auth_matches: List[Tuple[str, int]] = []
+
+    for doc in active_docs:
+        did = doc["doc_id"].lower()
+        short_did = did.replace("doc-", "")
+        is_allowed = role in doc["allowed_roles"]
+
+        # Check explicit doc_id match
+        if re.search(r"\b" + re.escape(did) + r"\b", q_norm) or re.search(r"\b" + re.escape(short_did) + r"\b", q_norm):
+            score = 100
+        else:
+            # Check title match against distinctive title terms (excluding generic corporate words)
+            t_clean = re.sub(r"\bpolicy\b|\bv[0-9]+\b", "", doc["title"].lower()).strip()
+            words = [w for w in re.findall(r"\b[a-zA-Z]{3,}\b", t_clean)]
+            if not words:
+                score = 0
+            else:
+                phrase = " ".join(words)
+                if phrase in q_norm:
+                    score = len(words) * 10
+                else:
+                    # Stem matching for all title words
+                    matched_words = 0
+                    for w in words:
+                        root = w.rstrip("s").rstrip("ing").rstrip("ed")
+                        if re.search(r"\b" + re.escape(root), q_norm):
+                            matched_words += 1
+                    if matched_words == len(words):
+                        score = len(words) * 5
+                    else:
+                        score = 0
+
+        if score >= 10:
+            if is_allowed:
+                auth_matches.append((doc["doc_id"], score))
+            else:
+                restr_matches.append((doc["doc_id"], score))
+
+    if not restr_matches:
         return False
 
-    top_candidate = candidates[0]
-    try:
-        cand_score = float(top_candidate.score)
-    except (ValueError, TypeError, AttributeError):
-        cand_score = 0.0
+    max_restr_score = max(s[1] for s in restr_matches)
+    max_auth_score = max([s[1] for s in auth_matches], default=0)
 
-    # If the top matching active chunk has strong relevance and the role is not allowed
-    if cand_score >= 12.0 and role not in top_candidate.chunk.get("allowed_roles", []):
-        return True
-
-    return False
+    # Return True only if the restricted policy match is unambiguous and strictly more specific
+    # than any matching authorized document title
+    return max_restr_score > max_auth_score
 
 
 def validate_candidate_evidence(
@@ -183,6 +245,7 @@ def validate_candidate_evidence(
 
 
 _QUERY_STOPWORDS = {
+    # Standard English function words and interrogatives
     "what", "is", "the", "how", "much", "many", "can", "an", "a", "in", "on", "at",
     "by", "for", "with", "about", "against", "between", "into", "through", "during",
     "before", "after", "above", "below", "to", "from", "up", "down", "out", "off",
@@ -190,20 +253,37 @@ _QUERY_STOPWORDS = {
     "where", "why", "all", "any", "both", "each", "few", "more", "most", "other",
     "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too",
     "very", "will", "just", "should", "now", "does", "do", "did", "have", "has",
-    "had", "be", "are", "was", "were", "been", "being", "policy", "corporate",
-    "company", "asterline", "services", "group", "required", "under", "must",
-    "per", "use", "used", "employee", "rules", "rule", "guidelines",
+    "had", "be", "are", "was", "were", "been", "being", "which", "who", "whom",
+    "this", "that", "these", "those", "am", "via", "per", "under", "without",
+    "and", "but", "or", "as", "if", "take", "taking",
+    # Enterprise policy boilerplate terms appearing across virtually all policies
+    "policy", "corporate", "company", "asterline", "services", "group", "required",
+    "use", "used", "employee", "employees", "rules", "rule", "guidelines", "guideline",
+    "procedure", "procedures", "standard", "standards", "eligible", "eligibility",
+    "approved", "approval", "approvals", "allowable", "allowed", "reimbursement",
+    "reimbursements", "expense", "expenses", "claim", "claims", "travel", "request",
+    "requests", "department", "applicable", "process", "submitted", "submission",
+    "criteria", "amount", "limit", "limits", "within", "month", "months", "day", "days",
+    "personal", "business", "domestic", "international", "official", "general",
 }
 
 
-def check_evidence_support(query: str, authorized_chunks: Sequence[Union[RetrievalResult, Dict[str, Any]]]) -> bool:
-    """Conservative check whether retrieved authorized evidence mentions salient query terms.
+def check_evidence_support(
+    query: str,
+    authorized_chunks: Sequence[Union[RetrievalResult, Dict[str, Any]]],
+) -> bool:
+    """Conservative check whether retrieved authorized evidence mentions distinctive query terms.
 
-    If none of the core content words appear in any retrieved chunk, the evidence cannot support an answer.
+    Filters ubiquitous corporate policy boilerplate terms and stopwords.
+    Requires distinctive term coverage before proceeding to generation.
     """
+    if not authorized_chunks:
+        return False
+
     words = re.findall(r"\b[a-zA-Z]{3,}\b", query.lower())
-    salient_words = [w for w in words if w not in _QUERY_STOPWORDS]
+    salient_words = list(dict.fromkeys([w for w in words if w not in _QUERY_STOPWORDS]))
     if not salient_words:
+        # If query consists entirely of generic corporate words, allow generation to assess support
         return True
 
     all_evidence_text = " ".join(
@@ -211,9 +291,20 @@ def check_evidence_support(query: str, authorized_chunks: Sequence[Union[Retriev
         for c in authorized_chunks
     )
 
-    # If not a single salient term from the query is present in the evidence
-    matches = sum(1 for w in salient_words if w in all_evidence_text)
-    return matches > 0
+    matched_salient = []
+    for w in salient_words:
+        root = w.rstrip("s").rstrip("ing").rstrip("ed")
+        if re.search(r"\b" + re.escape(root), all_evidence_text):
+            matched_salient.append(w)
+
+    match_count = len(matched_salient)
+    total_salient = len(salient_words)
+
+    if total_salient <= 2:
+        return match_count >= 1
+    else:
+        # Require at least 2 distinctive words or at least 40% distinctive coverage
+        return match_count >= 2 or (match_count / total_salient) >= 0.4
 
 
 def answer_question(
@@ -390,8 +481,32 @@ def answer_question(
         base_dir=base_dir,
         extracted_conditions=extracted_conds,
     )
-    # Only rules that passed or define thresholds are applicable
-    applicable_rule_ids = {r.rule.rule_id for r in rule_results if r.passed}
+
+    # If any rule condition input has an invalid unit or type error, fail safely with insufficient
+    rule_errors = [r for r in rule_results if r.is_error]
+    if rule_errors:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        err = rule_errors[0]
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The policy question contains rule condition inputs that could not be evaluated safely.",
+            status=AnswerStatus.INSUFFICIENT.value,
+            reason=f"Rule evaluation error ({err.error_type}): {err.explanation}",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            error_category=err.error_type,
+            error=err.explanation,
+        )
+
+    # Only rules that successfully passed without error or define approved thresholds are applicable
+    applicable_rule_ids = {r.rule.rule_id for r in rule_results if r.passed and not r.is_error}
 
     # Step H: Call Groq LLM
     active_llm = llm_client or GroqClientWrapper()

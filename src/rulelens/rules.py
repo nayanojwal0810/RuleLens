@@ -61,6 +61,8 @@ class RuleEvaluationResult:
     input_unit: Optional[str]
     outcome: str
     explanation: str
+    is_error: bool = False
+    error_type: Optional[str] = None
 
 
 # Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
@@ -247,39 +249,69 @@ def resolve_rules_for_evidence(
             val, unit = cond_map[rule.condition_field]
             try:
                 passed = evaluate_rule_condition(rule, val, unit)
-            except (ValueError, TypeError):
-                # Incompatible unit or type: fails closed
-                passed = False
-
-            if passed:
-                explanation = (
-                    f"Rule {rule.rule_id} condition satisfied: {rule.condition_field} {rule.operator} "
-                    f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit} -> outcome: {rule.outcome}"
-                )
-                results.append(
-                    RuleEvaluationResult(
-                        rule=rule,
-                        passed=True,
-                        input_value=val,
-                        input_unit=unit or rule.unit,
-                        outcome=rule.outcome,
-                        explanation=explanation,
+                if passed:
+                    explanation = (
+                        f"Rule {rule.rule_id} condition satisfied: {rule.condition_field} {rule.operator} "
+                        f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit} -> outcome: {rule.outcome}"
                     )
-                )
-            else:
-                # Failed condition: outcome must NOT be described as applicable
-                explanation = (
-                    f"Rule {rule.rule_id} condition NOT satisfied: {rule.condition_field} {rule.operator} "
-                    f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit}."
-                )
+                    results.append(
+                        RuleEvaluationResult(
+                            rule=rule,
+                            passed=True,
+                            input_value=val,
+                            input_unit=unit or rule.unit,
+                            outcome=rule.outcome,
+                            explanation=explanation,
+                            is_error=False,
+                            error_type=None,
+                        )
+                    )
+                else:
+                    # Valid comparison evaluating to False (normal unsatisfied rule)
+                    explanation = (
+                        f"Rule {rule.rule_id} condition NOT satisfied: {rule.condition_field} {rule.operator} "
+                        f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit}."
+                    )
+                    results.append(
+                        RuleEvaluationResult(
+                            rule=rule,
+                            passed=False,
+                            input_value=val,
+                            input_unit=unit or rule.unit,
+                            outcome="condition_not_met",
+                            explanation=explanation,
+                            is_error=False,
+                            error_type=None,
+                        )
+                    )
+            except ValueError as val_err:
+                # Incompatible unit: invalid rule evaluation error
+                explanation = f"Rule {rule.rule_id} unit error: {val_err}"
                 results.append(
                     RuleEvaluationResult(
                         rule=rule,
                         passed=False,
                         input_value=val,
                         input_unit=unit or rule.unit,
-                        outcome="condition_not_met",
+                        outcome="invalid_unit",
                         explanation=explanation,
+                        is_error=True,
+                        error_type="invalid_unit",
+                    )
+                )
+            except TypeError as type_err:
+                # Incompatible type: invalid rule evaluation error
+                explanation = f"Rule {rule.rule_id} type error: {type_err}"
+                results.append(
+                    RuleEvaluationResult(
+                        rule=rule,
+                        passed=False,
+                        input_value=val,
+                        input_unit=unit or rule.unit,
+                        outcome="invalid_type",
+                        explanation=explanation,
+                        is_error=True,
+                        error_type="invalid_type",
                     )
                 )
         else:
@@ -296,6 +328,8 @@ def resolve_rules_for_evidence(
                     input_unit=rule.unit,
                     outcome=rule.outcome,
                     explanation=explanation,
+                    is_error=False,
+                    error_type=None,
                 )
             )
 

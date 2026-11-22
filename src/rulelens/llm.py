@@ -142,9 +142,10 @@ def build_evidence_context(
     if applicable_rule_facts:
         parts.append("=== APPLICABLE STRUCTURED RULE FACTS ===")
         for r in applicable_rule_facts:
-            # Only include rules where the condition was satisfied or is a threshold definition
+            # Only include rules where the condition was satisfied or is a threshold definition without error
             passed = getattr(r, "passed", True)
-            if not passed:
+            is_error = getattr(r, "is_error", False)
+            if not passed or is_error:
                 continue
             if hasattr(r, "explanation"):
                 parts.append(f"- {r.explanation}")

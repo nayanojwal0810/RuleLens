@@ -203,6 +203,116 @@ def test_answer_question_restricted_policy_detection_without_keywords(mock_retri
     mock_llm.generate_answer.assert_not_called()
 
 
+def test_check_restricted_policy_access_never_creates_bm25_or_reads_chunk_text(mock_retriever):
+    """Security verification: check_restricted_policy_access must NEVER instantiate BM25 or index chunk text."""
+    from rulelens.answering import check_restricted_policy_access
+    mock_retriever.get_bm25_index.reset_mock()
+
+    is_restr = check_restricted_policy_access(
+        retriever=mock_retriever,
+        query="What is the travel exceptions policy?",
+        role="employee",
+        query_date=datetime.date(2026, 11, 22),
+    )
+    assert is_restr is True
+    # BM25 index over chunk bodies must NEVER be called
+    mock_retriever.get_bm25_index.assert_not_called()
+
+
+def test_check_restricted_policy_access_across_roles_and_dates(mock_retriever):
+    """Security verification: Verify restriction detection across all 6 roles and dates."""
+    from rulelens.answering import check_restricted_policy_access
+
+    # DOC-TRV-004: Travel Exceptions (allowed: auditor, finance, manager; NOT employee, hr, security)
+    q_trv004 = "What are the rules under the travel exceptions policy?"
+    curr_date = datetime.date(2026, 11, 22)
+    assert check_restricted_policy_access(mock_retriever, q_trv004, "employee", curr_date) is True
+    assert check_restricted_policy_access(mock_retriever, q_trv004, "hr", curr_date) is True
+    assert check_restricted_policy_access(mock_retriever, q_trv004, "security", curr_date) is True
+    assert check_restricted_policy_access(mock_retriever, q_trv004, "manager", curr_date) is False
+    assert check_restricted_policy_access(mock_retriever, q_trv004, "finance", curr_date) is False
+    assert check_restricted_policy_access(mock_retriever, q_trv004, "auditor", curr_date) is False
+
+    # DOC-PPO-004: Employee Transfers (allowed: hr, manager; NOT employee, finance, auditor, security)
+    q_ppo004 = "What is the policy for employee transfers?"
+    assert check_restricted_policy_access(mock_retriever, q_ppo004, "employee", curr_date) is True
+    assert check_restricted_policy_access(mock_retriever, q_ppo004, "auditor", curr_date) is True
+    assert check_restricted_policy_access(mock_retriever, q_ppo004, "hr", curr_date) is False
+    assert check_restricted_policy_access(mock_retriever, q_ppo004, "manager", curr_date) is False
+
+
+def test_authorized_document_not_wrongly_blocked_by_restricted_detection(mock_retriever, sample_retrieval_result):
+    """Security verification: An authorized query must not be blocked because a restricted policy shares words."""
+    from rulelens.answering import check_restricted_policy_access
+    mock_retriever.search.return_value = [sample_retrieval_result]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    mock_llm.generate_answer.return_value = (
+        AnswerResponse(
+            answer="Meal allowance is INR 2,000.",
+            status=AnswerStatus.ANSWERED,
+            citations=["DOC-TRV-002_TRV-C03"],
+            referenced_rule_ids=[],
+            reason="Grounded in evidence.",
+        ),
+        {"total_tokens": 100},
+    )
+
+    # Travel Policy v2 is authorized for employee
+    is_restr = check_restricted_policy_access(
+        retriever=mock_retriever,
+        query="What is the daily meal allowance under Travel Policy v2?",
+        role="employee",
+        query_date=datetime.date(2026, 11, 22),
+    )
+    assert is_restr is False
+
+    result = answer_question(
+        question="What is the daily meal allowance under Travel Policy v2?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+    assert result.status == "answered"
+
+
+def test_answer_question_rule_unit_error_fails_safely(mock_retriever, canonical_chunks_by_id):
+    """Security verification: Incompatible rule unit input must fail safely with insufficient without calling Groq."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_result = RetrievalResult(
+        chunk_id=c["chunk_id"],
+        text=c["text"],
+        doc_id=c["doc_id"],
+        clause_id=c["clause_id"],
+        title=c["title"],
+        department=c["department"],
+        version=c["version"],
+        source_file=c["source_file"],
+        source_page=int(c["source_page"]),
+        effective_from=c["effective_from"],
+        effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_result]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    # Mock extract_conditions_from_query to simulate an incompatible unit (e.g. days instead of INR for expense amount)
+    with patch("rulelens.answering.extract_conditions_from_query") as mock_extract:
+        mock_extract.return_value = [{"field": "expense_amount", "value": 50000, "unit": "days"}]
+        result = answer_question(
+            question="What approval is required for travel expenses exceeding 50000 days under Travel Policy v2?",
+            role="employee",
+            query_date="2026-11-22",
+            retriever=mock_retriever,
+            llm_client=mock_llm,
+        )
+
+    assert result.status == "insufficient"
+    assert result.error_category == "invalid_unit"
+    assert "rule evaluation error" in result.reason.lower()
+    mock_llm.generate_answer.assert_not_called()
+
+
 def test_answer_question_rejects_forged_evidence_metadata(mock_retriever, sample_retrieval_result):
     """Bug regression: Adversarial candidate with correct ID but altered permissions or text must be rejected."""
     forged_chunk = RetrievalResult(

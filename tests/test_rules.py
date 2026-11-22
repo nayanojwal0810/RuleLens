@@ -262,11 +262,57 @@ def test_failed_rule_not_treated_as_applicable(repo_root: Path):
 
     assert r_pass.passed is True
     assert r_pass.outcome == "additional_approval"
+    assert r_pass.is_error is False
+    assert r_pass.error_type is None
 
     # Failed rule must NOT report standard_approval as satisfied!
     assert r_fail.passed is False
     assert r_fail.outcome != "standard_approval"
+    assert r_fail.is_error is False
+    assert r_fail.error_type is None
     assert "NOT satisfied" in r_fail.explanation
+
+
+def test_rule_unit_mismatch_marks_is_error(repo_root: Path):
+    """When condition input has incompatible unit, resolve_rules_for_evidence marks is_error=True."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04"},
+    ]
+    # R-TRV-003 requires unit INR, input supplies days
+    res = resolve_rules_for_evidence(
+        authorized_chunks=mock_chunks,
+        role="employee",
+        query_date="2026-11-22",
+        base_dir=repo_root,
+        extracted_conditions=[{"field": "expense_amount", "value": 50000, "unit": "days"}],
+    )
+    r_err = next(r for r in res if r.rule.rule_id == "R-TRV-003")
+    assert r_err.passed is False
+    assert r_err.is_error is True
+    assert r_err.error_type == "invalid_unit"
+    assert r_err.outcome == "invalid_unit"
+    assert "unit error" in r_err.explanation.lower()
+
+
+def test_rule_type_mismatch_marks_is_error(repo_root: Path):
+    """When condition input has unconvertible type, resolve_rules_for_evidence marks is_error=True."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04"},
+    ]
+    # R-TRV-003 requires numeric value, input supplies unconvertible string
+    res = resolve_rules_for_evidence(
+        authorized_chunks=mock_chunks,
+        role="employee",
+        query_date="2026-11-22",
+        base_dir=repo_root,
+        extracted_conditions=[{"field": "expense_amount", "value": "unconvertible_str", "unit": "INR"}],
+    )
+    r_err = next(r for r in res if r.rule.rule_id == "R-TRV-003")
+    assert r_err.passed is False
+    assert r_err.is_error is True
+    assert r_err.error_type == "invalid_type"
+    assert r_err.outcome == "invalid_type"
+    assert "type error" in r_err.explanation.lower()
 
 
 def test_rules_cache_isolation_by_base_dir(repo_root: Path, tmp_path: Path):

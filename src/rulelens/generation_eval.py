@@ -70,6 +70,8 @@ def evaluate_single_question(
     llm_client: GroqClientWrapper,
     base_dir: Optional[Union[Path, str]] = None,
     use_gold_evidence_for_answerable: bool = True,
+    dense_backend: str = "local",
+    qdrant_client: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Evaluate generation on a single question using the real answering pipeline.
 
@@ -97,6 +99,8 @@ def evaluate_single_question(
             retriever=retriever,
             llm_client=llm_client,
             base_dir=base_dir,
+            dense_backend=dense_backend,
+            qdrant_client=qdrant_client,
         )
         total_lat = (time.perf_counter() - start_time) * 1000.0
 
@@ -117,21 +121,24 @@ def evaluate_single_question(
             "query_date": query_date_str,
             "answerability": is_answerable,
             "gold_chunk_ids": gold_cids,
+            "retrieval_mode": f"application_{dense_backend}",
             "status": app_result.status,
             "answer": app_result.answer,
             "citations": app_result.citations,
             "referenced_rule_ids": app_result.referenced_rule_ids,
             "reason": app_result.reason,
-            "schema_valid": app_result.status in ("answered", "insufficient", "restricted"),
+            "schema_valid": None,  # Deterministic refusal: not a Groq schema response
             "citation_valid": len(app_result.citations) == 0,
             "refusal_correct": refusal_correct,
             "provider_error": app_result.status == "operational_error",
+            "provider_calls_attempted": 0,
             "role_violations": 0,
             "version_violations": 0,
             "latency_ms": round(total_lat, 2),
-            "provider_latency_ms": 0.0,
-            "token_usage": 0,
+            "provider_latency_ms": None,
+            "token_usage": None,
             "factual_correctness": "not_reviewed",
+            "error_category": app_result.error_category,
             "gold_quotes": [e.get("quote", "") for e in expected_evidence],
             "error": app_result.error,
         }
@@ -146,12 +153,70 @@ def evaluate_single_question(
         authorized_chunks = []
         role_violations = 0
         version_violations = 0
+        integrity_error = False
+
+        # Verify corpus fingerprint
+        manifest = getattr(retriever, "corpus_manifest", None)
+        corpus_fp = manifest.get("processed_fingerprint") if manifest else None
+        if not corpus_fp:
+            integrity_error = True
+
         for cid in gold_cids:
-            if cid in corpus_chunks:
-                c = corpus_chunks[cid]
-                if not is_chunk_eligible(c, role, validated_date):
-                    role_violations += 1
+            if cid not in corpus_chunks:
+                integrity_error = True
+                continue
+            c = corpus_chunks[cid]
+            # Verify role permission
+            if role not in c.get("allowed_roles", []):
+                role_violations += 1
+            # Verify effective date
+            eff_from = c.get("effective_from", "0000-01-01")
+            eff_to = c.get("effective_to") or "9999-12-31"
+            if not (eff_from <= validated_date.isoformat() <= eff_to):
+                version_violations += 1
+
+            if is_chunk_eligible(c, role, validated_date):
                 authorized_chunks.append(c)
+
+        # FAIL CLOSED: Never send invalid or unauthorized chunks to Groq!
+        if role_violations > 0 or version_violations > 0 or integrity_error or not authorized_chunks:
+            total_lat = (time.perf_counter() - start_time) * 1000.0
+            return {
+                "question_id": qid,
+                "department": question_data.get("department"),
+                "question_type": question_data.get("question_type"),
+                "difficulty": question_data.get("difficulty"),
+                "role": role,
+                "query_date": query_date_str,
+                "answerability": is_answerable,
+                "gold_chunk_ids": gold_cids,
+                "retrieval_mode": "gold_evidence_direct (independent of retrieval backend)",
+                "status": "operational_error",
+                "answer": "Gold evidence failed authorization/version integrity verification.",
+                "citations": [],
+                "referenced_rule_ids": [],
+                "reason": (
+                    f"Unauthorized or invalid gold evidence: role_violations={role_violations}, "
+                    f"version_violations={version_violations}, integrity_error={integrity_error}."
+                ),
+                "schema_valid": False,
+                "citation_valid": False,
+                "refusal_correct": False,
+                "provider_error": True,
+                "provider_calls_attempted": 0,
+                "role_violations": role_violations,
+                "version_violations": version_violations,
+                "latency_ms": round(total_lat, 2),
+                "provider_latency_ms": None,
+                "token_usage": None,
+                "factual_correctness": "not_reviewed",
+                "error_category": "service_unavailable",
+                "gold_quotes": [e.get("quote", "") for e in expected_evidence],
+                "error": (
+                    f"Gold evidence authorization failed: role_violations={role_violations}, "
+                    f"version_violations={version_violations}"
+                ),
+            }
 
         extracted_conds = extract_conditions_from_query(q_text)
         rule_results = resolve_rules_for_evidence(
@@ -161,7 +226,43 @@ def evaluate_single_question(
             base_dir=base_dir,
             extracted_conditions=extracted_conds,
         )
-        applicable_rule_ids = {r.rule.rule_id for r in rule_results if r.passed}
+
+        # Check rule condition evaluation errors
+        rule_errors = [r for r in rule_results if r.is_error]
+        if rule_errors:
+            total_lat = (time.perf_counter() - start_time) * 1000.0
+            return {
+                "question_id": qid,
+                "department": question_data.get("department"),
+                "question_type": question_data.get("question_type"),
+                "difficulty": question_data.get("difficulty"),
+                "role": role,
+                "query_date": query_date_str,
+                "answerability": is_answerable,
+                "gold_chunk_ids": gold_cids,
+                "retrieval_mode": "gold_evidence_direct (independent of retrieval backend)",
+                "status": "insufficient",
+                "answer": "The policy question contains rule condition inputs that could not be evaluated safely.",
+                "citations": [],
+                "referenced_rule_ids": [],
+                "reason": f"Rule evaluation error: {rule_errors[0].explanation}",
+                "schema_valid": None,
+                "citation_valid": False,
+                "refusal_correct": False,
+                "provider_error": False,
+                "provider_calls_attempted": 0,
+                "role_violations": 0,
+                "version_violations": 0,
+                "latency_ms": round(total_lat, 2),
+                "provider_latency_ms": None,
+                "token_usage": None,
+                "factual_correctness": "not_reviewed",
+                "error_category": rule_errors[0].error_type,
+                "gold_quotes": [e.get("quote", "") for e in expected_evidence],
+                "error": rule_errors[0].explanation,
+            }
+
+        applicable_rule_ids = {r.rule.rule_id for r in rule_results if r.passed and not r.is_error}
 
         schema_valid = False
         citation_valid = False
@@ -172,7 +273,9 @@ def evaluate_single_question(
         gen_rules: List[str] = []
         token_usage = None
         error_msg = None
-        provider_lat = 0.0
+        error_cat = None
+        provider_lat = None
+        provider_calls = 1
 
         try:
             model_resp, llm_meta = llm_client.generate_answer(
@@ -182,12 +285,13 @@ def evaluate_single_question(
                 query_date=query_date_str,
                 applicable_rule_facts=rule_results,
             )
+            provider_calls = llm_meta.get("calls_made", 1)
             schema_valid = True
             gen_answer = model_resp.answer
             gen_status = model_resp.status.value
             gen_reason = model_resp.reason
             token_usage = llm_meta.get("total_tokens")
-            provider_lat = llm_meta.get("latency_ms", 0.0)
+            provider_lat = llm_meta.get("latency_ms")
 
             val_cids, _, val_rules = validate_citations_and_rules(
                 response=model_resp,
@@ -200,11 +304,18 @@ def evaluate_single_question(
             gen_rules = val_rules
             citation_valid = True
 
-        except (SanitizedProviderError, CitationValidationError) as prov_err:
+        except CitationValidationError as cit_err:
+            error_msg = cit_err.safe_message
+            error_cat = cit_err.category
+            gen_status = "operational_error"
+            citation_valid = False
+        except SanitizedProviderError as prov_err:
             error_msg = prov_err.safe_message
+            error_cat = prov_err.category
             gen_status = "operational_error"
         except Exception:
             error_msg = "Unhandled operational error during evaluation generation."
+            error_cat = "service_unavailable"
             gen_status = "operational_error"
 
         total_lat = (time.perf_counter() - start_time) * 1000.0
@@ -218,6 +329,7 @@ def evaluate_single_question(
             "query_date": query_date_str,
             "answerability": is_answerable,
             "gold_chunk_ids": gold_cids,
+            "retrieval_mode": "gold_evidence_direct (independent of retrieval backend)",
             "status": gen_status,
             "answer": gen_answer,
             "citations": gen_citations,
@@ -227,12 +339,14 @@ def evaluate_single_question(
             "citation_valid": citation_valid,
             "refusal_correct": False,
             "provider_error": gen_status == "operational_error",
-            "role_violations": role_violations,
-            "version_violations": version_violations,
+            "provider_calls_attempted": provider_calls,
+            "role_violations": 0,
+            "version_violations": 0,
             "latency_ms": round(total_lat, 2),
-            "provider_latency_ms": round(provider_lat, 2),
+            "provider_latency_ms": round(provider_lat, 2) if provider_lat is not None else None,
             "token_usage": token_usage,
             "factual_correctness": "not_reviewed",
+            "error_category": error_cat,
             "gold_quotes": [e.get("quote", "") for e in expected_evidence],
             "error": error_msg,
         }
@@ -245,6 +359,8 @@ def evaluate_single_question(
             retriever=retriever,
             llm_client=llm_client,
             base_dir=base_dir,
+            dense_backend=dense_backend,
+            qdrant_client=qdrant_client,
         )
         total_lat = (time.perf_counter() - start_time) * 1000.0
         return {
@@ -256,21 +372,24 @@ def evaluate_single_question(
             "query_date": query_date_str,
             "answerability": is_answerable,
             "gold_chunk_ids": gold_cids,
+            "retrieval_mode": f"application_{dense_backend}",
             "status": app_result.status,
             "answer": app_result.answer,
             "citations": app_result.citations,
             "referenced_rule_ids": app_result.referenced_rule_ids,
             "reason": app_result.reason,
-            "schema_valid": app_result.status in ("answered", "insufficient", "restricted"),
-            "citation_valid": len(app_result.citations) > 0,
+            "schema_valid": app_result.status in ("answered", "insufficient", "restricted") and app_result.token_usage is not None,
+            "citation_valid": len(app_result.citations) > 0 and app_result.status == "answered",
             "refusal_correct": False,
             "provider_error": app_result.status == "operational_error",
+            "provider_calls_attempted": 1 if app_result.token_usage is not None else 0,
             "role_violations": 0,
             "version_violations": 0,
             "latency_ms": round(total_lat, 2),
-            "provider_latency_ms": round(app_result.latency_ms, 2),
+            "provider_latency_ms": None,
             "token_usage": app_result.token_usage,
             "factual_correctness": "not_reviewed",
+            "error_category": app_result.error_category,
             "gold_quotes": [e.get("quote", "") for e in expected_evidence],
             "error": app_result.error,
         }
@@ -283,6 +402,8 @@ def run_generation_evaluation(
     max_questions: Optional[int] = None,
     llm_client: Optional[GroqClientWrapper] = None,
     retriever: Optional[HybridRetriever] = None,
+    dense_backend: str = "local",
+    qdrant_client: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Run controlled development generation evaluation.
 
@@ -293,6 +414,8 @@ def run_generation_evaluation(
         max_questions: Cap on number of questions to evaluate.
         llm_client: Optional injected client wrapper.
         retriever: Optional injected HybridRetriever.
+        dense_backend: Dense retrieval backend ('local' or 'qdrant').
+        qdrant_client: Optional active Qdrant client.
 
     Returns:
         Dict with aggregate summary and per-question results.
@@ -311,8 +434,16 @@ def run_generation_evaluation(
     active_retriever = retriever or HybridRetriever(base_dir=base)
     active_llm = llm_client or GroqClientWrapper()
 
+    active_qdrant_client = qdrant_client
+    if dense_backend == "qdrant" and active_qdrant_client is None:
+        from rulelens.qdrant_store import get_qdrant_client
+        try:
+            active_qdrant_client = get_qdrant_client()
+        except Exception as exc:
+            raise RuntimeError(f"Qdrant client initialization failed for backend 'qdrant': {exc}")
+
     per_q_results: List[Dict[str, Any]] = []
-    print(f"Starting Generation Evaluation on {len(selected_questions)} questions...")
+    print(f"Starting Generation Evaluation on {len(selected_questions)} questions (backend: {dense_backend})...")
 
     stopped_early = False
     stop_reason = None
@@ -325,9 +456,11 @@ def run_generation_evaluation(
             retriever=active_retriever,
             llm_client=active_llm,
             base_dir=base,
+            dense_backend=dense_backend,
+            qdrant_client=active_qdrant_client,
         )
         per_q_results.append(res)
-        if res.get("provider_error") and res.get("error") and "rate limit" in res["error"].lower():
+        if res.get("error_category") == "rate_limited":
             stopped_early = True
             stop_reason = "Rate limit HTTP 429 encountered from provider."
             print(f"Encountered Groq 429 rate limit on {qid}. Stopping evaluation early to respect provider quota.")
@@ -349,17 +482,24 @@ def run_generation_evaluation(
     refusals = sum(1 for r in per_q_results if r["status"] in ("insufficient", "restricted"))
     provider_errors = sum(1 for r in per_q_results if r["provider_error"])
 
-    schema_valid_generations = sum(1 for r in per_q_results if r["schema_valid"] and not r["provider_error"])
+    generations_attempted = sum(1 for r in per_q_results if r.get("provider_calls_attempted", 0) > 0)
+    schema_valid_generations = sum(
+        1 for r in per_q_results
+        if r.get("provider_calls_attempted", 0) > 0 and r.get("schema_valid") is True and not r["provider_error"]
+    )
     citation_valid_generations = sum(1 for r in ans_results if r["citation_valid"] and not r["provider_error"])
 
     restr_success = sum(1 for r in restr_results if r["refusal_correct"])
     unsupp_success = sum(1 for r in unsupp_results if r["refusal_correct"])
 
-    generation_calls = sum(1 for r in per_q_results if r["answerability"] and not r["provider_error"])
+    generation_calls = sum(r.get("provider_calls_attempted", 0) for r in per_q_results)
     total_tokens = sum(r.get("token_usage") or 0 for r in per_q_results)
 
     e2e_latencies = [r["latency_ms"] for r in per_q_results]
-    provider_latencies = [r["provider_latency_ms"] for r in ans_results if r["provider_latency_ms"] > 0]
+    provider_latencies = [
+        r["provider_latency_ms"] for r in per_q_results
+        if r.get("provider_latency_ms") is not None and r["provider_latency_ms"] > 0
+    ]
     diag_latencies = [r["latency_ms"] for r in diag_results]
 
     median_e2e = statistics.median(e2e_latencies) if e2e_latencies else 0.0
@@ -371,11 +511,13 @@ def run_generation_evaluation(
         "model": GENERATION_MODEL,
         "evaluation_state": "partial" if stopped_early else "completed",
         "stop_reason": stop_reason,
+        "retrieval_backend": dense_backend,
         "planned_questions": planned_questions,
         "completed_questions": completed_questions,
         "successful_generations": successful_generations,
         "refusals": refusals,
         "provider_errors": provider_errors,
+        "generations_attempted": generations_attempted,
         "schema_valid_generations": schema_valid_generations,
         "citation_valid_generations": citation_valid_generations,
         "restricted_refusal_successes": restr_success,
@@ -410,6 +552,7 @@ def generate_summary_markdown(summary: Dict[str, Any]) -> str:
     diag_count = completed - ans_count
     restr_count = sum(1 for r in summary["per_question_results"] if r["question_id"].endswith("-009"))
     unsupp_count = sum(1 for r in summary["per_question_results"] if r["question_id"].endswith("-010"))
+    generations_att = summary.get("generations_attempted", completed)
 
     lines = [
         "# RuleLens — Stage E Development Answer Generation Summary",
@@ -417,6 +560,7 @@ def generate_summary_markdown(summary: Dict[str, Any]) -> str:
         "## 1. Evaluation Setup",
         f"- **Timestamp**: `{summary['timestamp']}`",
         f"- **Model**: `{summary['model']}`",
+        f"- **Dense Retrieval Backend**: `{summary.get('retrieval_backend', 'local')}`",
         f"- **Evaluation Status**: {state_str}",
         f"- **Planned Questions**: {summary['planned_questions']}",
         f"- **Completed Questions**: {completed}",
@@ -427,11 +571,12 @@ def generate_summary_markdown(summary: Dict[str, Any]) -> str:
         "",
         "| Metric | Result | Target |",
         "|---|:---:|:---:|",
-        f"| **Schema Validity** | {format_rate(summary['schema_valid_generations'], completed)} | 100% |",
+        f"| **Schema Validity (Groq)** | {format_rate(summary['schema_valid_generations'], generations_att)} | 100% |",
         f"| **Citation Validity (Answerable)** | {format_rate(summary['citation_valid_generations'], ans_count)} | 100% |",
         f"| **Restricted Refusal Success** | {format_rate(summary['restricted_refusal_successes'], restr_count)} | 100% |",
         f"| **Unsupported Refusal Success** | {format_rate(summary['unsupported_refusal_successes'], unsupp_count)} | 100% |",
         f"| **Provider Errors** | {summary['provider_errors']} | 0 |",
+        f"| **Provider Requests Attempted** | {summary.get('generation_calls', 0)} | Monitored |",
         f"| **Median E2E Latency** | {summary['median_e2e_latency_ms']} ms | < 2500 ms |",
         f"| **Median Provider Latency** | {summary['median_provider_latency_ms']} ms | < 2000 ms |",
         f"| **Median Diagnostic Latency** | {summary['median_diagnostic_latency_ms']} ms | < 50 ms |",
@@ -474,7 +619,29 @@ def main():
         dataset_path=dataset_path,
         base_dir=repo_root,
         max_questions=limit,
+        dense_backend=args.backend,
     )
+
+    local_eval_dir = repo_root / "local_eval"
+    local_eval_dir.mkdir(exist_ok=True)
+
+    results_path = local_eval_dir / "generation_development_results.json"
+    summary_path = local_eval_dir / "generation_development_summary.md"
+
+    results_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    md_content = generate_summary_markdown(summary)
+    summary_path.write_text(md_content, encoding="utf-8")
+
+    print(f"\nSaved generation results to {results_path}")
+    print(f"Saved generation summary to {summary_path}")
+    print("\nSummary metrics:")
+    print(f"  Evaluation state:           {summary['evaluation_state']}")
+    print(f"  Completed / Planned:        {summary['completed_questions']} / {summary['planned_questions']}")
+    print(f"  Schema valid:               {summary['schema_valid_generations']}")
+    print(f"  Citation valid:             {summary['citation_valid_generations']}")
+    print(f"  Restricted refusals:        {summary['restricted_refusal_successes']}")
+    print(f"  Unsupported refusals:       {summary['unsupported_refusal_successes']}")
+    print(f"  Median E2E latency:         {summary['median_e2e_latency_ms']} ms")
 
     local_eval_dir = repo_root / "local_eval"
     local_eval_dir.mkdir(exist_ok=True)

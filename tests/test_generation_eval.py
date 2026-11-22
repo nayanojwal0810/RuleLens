@@ -14,7 +14,7 @@ import json
 import socket
 from pathlib import Path
 from typing import Any, Dict, List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -209,6 +209,7 @@ def test_metrics_calculated_dynamically_without_hardcoded_100_percent():
         "stop_reason": "Rate limit HTTP 429 encountered",
         "planned_questions": 30,
         "completed_questions": 10,
+        "generations_attempted": 10,
         "schema_valid_generations": 8,
         "citation_valid_generations": 6,
         "restricted_refusal_successes": 2,
@@ -272,9 +273,175 @@ def test_run_generation_evaluation_offline(repo_root: Path, mock_retriever):
     )
 
     assert summary["completed_questions"] == 5
-    assert summary["schema_valid_generations"] == 5
+    # In first 5 questions (TRV-001, 002, 003, 007, 009), 4 are answerable and 1 is restricted diagnostic
+    assert summary["generations_attempted"] == 4
+    assert summary["schema_valid_generations"] == 4
+    assert summary["restricted_refusal_successes"] == 1
 
     # Markdown generation
     md = generate_summary_markdown(summary)
     assert "# RuleLens — Stage E Development Answer Generation Summary" in md
-    assert "Schema Validity" in md
+    assert "Schema Validity (Groq)" in md
+
+
+# ==============================================================================
+# 4. Adversarial Gold Evidence Fail-Closed Tests
+# ==============================================================================
+
+
+def test_adversarial_gold_chunk_unauthorized_role_fails_closed(mock_retriever):
+    """Security verification: Unauthorized role in gold evidence fails closed immediately without Groq call."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    # Adversarial question: employee requesting DOC-TRV-004 chunk (restricted for employee)
+    adv_q = {
+        "question_id": "ADV-ROLE-001",
+        "question": "What is the exception route?",
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "answerability": True,
+        "gold_chunk_ids": ["DOC-TRV-004_TRV-E01"],
+        "gold_evidence": [{"chunk_id": "DOC-TRV-004_TRV-E01", "quote": "Adversarial test quote"}],
+    }
+
+    res = evaluate_single_question(
+        question_data=adv_q,
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert res["status"] == "operational_error"
+    assert res["provider_error"] is True
+    assert res["role_violations"] == 1
+    assert res["version_violations"] == 0
+    assert res["provider_calls_attempted"] == 0
+    assert res["provider_latency_ms"] is None
+    # Model must NEVER be called with unauthorized gold chunks!
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_adversarial_gold_chunk_expired_date_fails_closed(mock_retriever):
+    """Security verification: Expired date in gold evidence fails closed immediately without Groq call."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    # Adversarial question: query date 2026-11-22 requesting DOC-TRV-001 (expired 2026-06-30)
+    adv_q = {
+        "question_id": "ADV-DATE-001",
+        "question": "What was the v1 travel allowance?",
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "answerability": True,
+        "gold_chunk_ids": ["DOC-TRV-001_TRV-C01"],
+        "gold_evidence": [{"chunk_id": "DOC-TRV-001_TRV-C01", "quote": "Expired test quote"}],
+    }
+
+    res = evaluate_single_question(
+        question_data=adv_q,
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert res["status"] == "operational_error"
+    assert res["provider_error"] is True
+    assert res["version_violations"] == 1
+    assert res["role_violations"] == 0
+    assert res["provider_calls_attempted"] == 0
+    assert res["provider_latency_ms"] is None
+    # Model must NEVER be called with expired gold chunks!
+    mock_llm.generate_answer.assert_not_called()
+
+
+# ==============================================================================
+# 5. Backend Selection and Typed Rate Limit Tests
+# ==============================================================================
+
+
+def test_backend_selection_honored(repo_root: Path, mock_retriever):
+    """Verification: Backend selection is honored and passed through to answer_question."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    mock_qdrant = MagicMock()
+
+    with patch("rulelens.generation_eval.evaluate_single_question") as mock_eval:
+        mock_eval.return_value = {
+            "question_id": "TRV-001",
+            "answerability": True,
+            "status": "answered",
+            "provider_error": False,
+            "latency_ms": 100.0,
+            "provider_latency_ms": 80.0,
+            "token_usage": 50,
+            "schema_valid": True,
+            "citation_valid": True,
+            "refusal_correct": False,
+            "provider_calls_attempted": 1,
+        }
+
+        summary = run_generation_evaluation(
+            dataset_path=dataset_path,
+            base_dir=repo_root,
+            max_questions=1,
+            llm_client=mock_llm,
+            retriever=mock_retriever,
+            dense_backend="qdrant",
+            qdrant_client=mock_qdrant,
+        )
+
+        mock_eval.assert_called_once()
+        _, kwargs = mock_eval.call_args
+        assert kwargs.get("dense_backend") == "qdrant"
+        assert kwargs.get("qdrant_client") is mock_qdrant
+        assert summary["retrieval_backend"] == "qdrant"
+
+
+def test_backend_qdrant_fails_when_unavailable(repo_root: Path, mock_retriever):
+    """Verification: When dense_backend='qdrant' and Qdrant fails, raise RuntimeError (no silent fallback)."""
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    with patch("rulelens.qdrant_store.get_qdrant_client", side_effect=ConnectionError("Cannot connect to Qdrant Cloud")):
+        with pytest.raises(RuntimeError, match="Qdrant client initialization failed"):
+            run_generation_evaluation(
+                dataset_path=dataset_path,
+                base_dir=repo_root,
+                max_questions=1,
+                llm_client=mock_llm,
+                retriever=mock_retriever,
+                dense_backend="qdrant",
+                qdrant_client=None,
+            )
+
+
+def test_evaluation_stops_on_typed_rate_limit(repo_root: Path, mock_retriever):
+    """Verification: Evaluation stops immediately on typed 'rate_limited' error category."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+
+    with patch("rulelens.generation_eval.evaluate_single_question") as mock_eval:
+        mock_eval.return_value = {
+            "question_id": "TRV-001",
+            "answerability": True,
+            "status": "operational_error",
+            "provider_error": True,
+            "error_category": "rate_limited",
+            "error": "Rate limit exceeded (HTTP 429)",
+            "latency_ms": 50.0,
+            "provider_latency_ms": None,
+            "token_usage": None,
+            "schema_valid": False,
+            "citation_valid": False,
+            "refusal_correct": False,
+            "provider_calls_attempted": 1,
+        }
+
+        summary = run_generation_evaluation(
+            dataset_path=dataset_path,
+            base_dir=repo_root,
+            max_questions=5,
+            llm_client=mock_llm,
+            retriever=mock_retriever,
+        )
+
+        # Evaluator should have stopped after question 1
+        assert mock_eval.call_count == 1
+        assert summary["evaluation_state"] == "partial"
+        assert "Rate limit" in summary["stop_reason"]
+        assert summary["completed_questions"] == 1
