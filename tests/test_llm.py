@@ -389,7 +389,7 @@ def test_groq_wrapper_bounded_repair_on_malformed_json():
 
 
 def test_groq_wrapper_fails_cleanly_after_two_invalid_attempts():
-    """If repair call also fails, raises ValueError and never returns raw model text."""
+    """If repair call also fails, raises SanitizedProviderError with category invalid_generation."""
     mock_client = MagicMock()
     bad_c = MagicMock()
     bad_c.message.content = "STILL NOT JSON"
@@ -399,43 +399,93 @@ def test_groq_wrapper_fails_cleanly_after_two_invalid_attempts():
     mock_client.chat.completions.create.side_effect = [bad_comp, bad_comp]
 
     wrapper = GroqClientWrapper(client=mock_client)
-    with pytest.raises(ValueError, match="Failed to produce a valid structured AnswerResponse after repair"):
+    with pytest.raises(RuntimeError, match="Failed to produce a valid structured AnswerResponse") as excinfo:
         wrapper.generate_answer(
             question="Question?",
             role="employee",
             evidence_chunks=[],
         )
+    assert getattr(excinfo.value, "category", None) == "invalid_generation"
 
 
-def test_groq_wrapper_maps_provider_exceptions():
-    """Groq client maps authentication, rate limit, timeout, and 5xx errors to controlled RuntimeError."""
+def test_groq_wrapper_maps_provider_exceptions_without_leakage():
+    """Groq client maps authentication, rate limit, timeout, and 5xx errors to SanitizedProviderError."""
     import groq
+    from rulelens.llm import SanitizedProviderError
 
     mock_client = MagicMock()
     wrapper = GroqClientWrapper(client=mock_client)
 
-    # 401 Auth
+    # 401 Auth with leaked key in raw exception
     mock_client.chat.completions.create.side_effect = groq.AuthenticationError(
-        "Invalid API Key", response=MagicMock(status_code=401), body={}
+        "Invalid API Key: gsk_SECRET_KEY_12345", response=MagicMock(status_code=401), body={}
     )
-    with pytest.raises(RuntimeError, match="Groq authentication error"):
+    with pytest.raises(SanitizedProviderError) as exc_auth:
         wrapper._call_provider([])
+    assert exc_auth.value.category == "authentication_error"
+    assert "SECRET" not in str(exc_auth.value)
+    assert "gsk_" not in str(exc_auth.value)
 
     # 429 Rate limit
     mock_client.chat.completions.create.side_effect = groq.RateLimitError(
-        "Rate limit exceeded", response=MagicMock(status_code=429), body={}
+        "Rate limit exceeded: 429 quota exhausted for token gsk_SECRET", response=MagicMock(status_code=429), body={}
     )
-    with pytest.raises(RuntimeError, match="Groq service temporarily unavailable"):
+    with pytest.raises(SanitizedProviderError) as exc_rate:
         wrapper._call_provider([])
+    assert exc_rate.value.category == "rate_limited"
+    assert "SECRET" not in str(exc_rate.value)
 
     # Timeout
     mock_client.chat.completions.create.side_effect = groq.APITimeoutError(request=MagicMock())
-    with pytest.raises(RuntimeError, match="Groq service network/timeout error"):
+    with pytest.raises(SanitizedProviderError) as exc_to:
         wrapper._call_provider([])
+    assert exc_to.value.category == "timeout"
 
     # 500 Internal error
     mock_client.chat.completions.create.side_effect = groq.InternalServerError(
-        "Internal server error", response=MagicMock(status_code=500), body={}
+        "Internal server error: crash report containing headers Authorization: Bearer SECRET",
+        response=MagicMock(status_code=500),
+        body={},
     )
-    with pytest.raises(RuntimeError, match="Groq service error"):
+    with pytest.raises(SanitizedProviderError) as exc_5xx:
         wrapper._call_provider([])
+    assert exc_5xx.value.category == "service_unavailable"
+    assert "SECRET" not in str(exc_5xx.value)
+    assert "Bearer" not in str(exc_5xx.value)
+
+
+def test_groq_wrapper_uses_strict_json_schema():
+    """Bug regression: Verify Groq API is called with strict JSON schema, not json_object."""
+    mock_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = json.dumps({
+        "answer": "Test answer.",
+        "status": "answered",
+        "citations": ["DOC-TRV-001_TRV-C01"],
+        "referenced_rule_ids": [],
+        "reason": "Test reason.",
+    })
+    mock_comp = MagicMock()
+    mock_comp.choices = [mock_choice]
+    mock_comp.usage.total_tokens = 100
+    mock_client.chat.completions.create.return_value = mock_comp
+
+    wrapper = GroqClientWrapper(client=mock_client)
+    wrapper.generate_answer(
+        question="What is the travel policy?",
+        role="employee",
+        evidence_chunks=[{"chunk_id": "DOC-TRV-001_TRV-C01", "text": "Travel text.", "doc_id": "DOC-TRV-001", "clause_id": "TRV-C01", "title": "T", "department": "Travel", "version": "1.0", "effective_from": "2026-01-01", "source_page": 1}],
+    )
+
+    call_kwargs = mock_client.chat.completions.create.call_args[1]
+    assert call_kwargs["model"] == "openai/gpt-oss-20b"
+    assert "response_format" in call_kwargs
+
+    rf = call_kwargs["response_format"]
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["strict"] is True
+    assert rf["json_schema"]["name"] == "rulelens_answer"
+
+    schema = rf["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"answer", "status", "citations", "referenced_rule_ids", "reason"}

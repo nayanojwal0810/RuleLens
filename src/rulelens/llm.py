@@ -22,6 +22,34 @@ from rulelens.config import GENERATION_MODEL, GROQ_API_KEY, get_env_var
 from rulelens.retrieval import RetrievalResult, is_chunk_eligible, parse_query_date
 
 
+SANITIZED_ERROR_CATEGORIES = {
+    "authentication_error",
+    "rate_limited",
+    "timeout",
+    "service_unavailable",
+    "invalid_generation",
+    "invalid_citation",
+}
+
+
+class SanitizedProviderError(RuntimeError):
+    """Sanitized provider exception without leaking raw headers, keys, or response bodies."""
+
+    def __init__(self, category: str, safe_message: str):
+        if category not in SANITIZED_ERROR_CATEGORIES:
+            category = "service_unavailable"
+        super().__init__(safe_message)
+        self.category = category
+        self.safe_message = safe_message
+
+
+class CitationValidationError(SanitizedProviderError, ValueError):
+    """Sanitized exception raised when citation or rule verification fails."""
+
+    def __init__(self, safe_message: str):
+        super().__init__(category="invalid_citation", safe_message=safe_message)
+
+
 class AnswerStatus(str, Enum):
     """Permitted logical statuses for a policy answer."""
 
@@ -114,6 +142,10 @@ def build_evidence_context(
     if applicable_rule_facts:
         parts.append("=== APPLICABLE STRUCTURED RULE FACTS ===")
         for r in applicable_rule_facts:
+            # Only include rules where the condition was satisfied or is a threshold definition
+            passed = getattr(r, "passed", True)
+            if not passed:
+                continue
             if hasattr(r, "explanation"):
                 parts.append(f"- {r.explanation}")
             elif isinstance(r, dict) and "explanation" in r:
@@ -160,7 +192,7 @@ def validate_citations_and_rules(
         (validated_citations, verified_citation_metadata, validated_rule_ids)
 
     Raises:
-        ValueError: If a citation is fabricated, unauthorized, expired, or invalid.
+        CitationValidationError: If a citation is fabricated, unauthorized, expired, or invalid.
     """
     valid_chunks_by_id = {}
     for c in authorized_chunks:
@@ -171,19 +203,21 @@ def validate_citations_and_rules(
 
     if response.status in (AnswerStatus.INSUFFICIENT, AnswerStatus.RESTRICTED):
         if response.citations:
-            raise ValueError(f"Refusal status '{response.status}' must have empty citations, got: {response.citations}")
+            raise CitationValidationError(
+                f"Refusal status '{response.status.value}' must have empty citations."
+            )
         if response.referenced_rule_ids:
-            raise ValueError(
-                f"Refusal status '{response.status}' must have empty referenced_rule_ids, got: {response.referenced_rule_ids}"
+            raise CitationValidationError(
+                f"Refusal status '{response.status.value}' must have empty referenced_rule_ids."
             )
         return [], [], []
 
     # Status is ANSWERED
     if not response.answer or not response.answer.strip():
-        raise ValueError("Status 'answered' requires a non-empty answer string.")
+        raise CitationValidationError("Status 'answered' requires a non-empty answer string.")
 
     if not response.citations:
-        raise ValueError("Status 'answered' requires at least one valid citation in citations list.")
+        raise CitationValidationError("Status 'answered' requires at least one valid citation in citations list.")
 
     # Deduplicate citations preserving order
     deduped_cids: List[str] = []
@@ -196,14 +230,14 @@ def validate_citations_and_rules(
     validated_metadata: List[Dict[str, Any]] = []
     for cid in deduped_cids:
         if cid not in valid_chunks_by_id:
-            raise ValueError(
-                f"Fabricated or unsupplied citation '{cid}'. Must be one of supplied evidence chunks: {list(valid_chunks_by_id.keys())}"
+            raise CitationValidationError(
+                f"Fabricated or unsupplied citation '{cid}'. Must be one of supplied evidence chunks."
             )
         chunk = valid_chunks_by_id[cid]
         # Defense in depth: re-verify role and date eligibility
         chunk_dict = chunk.to_dict() if isinstance(chunk, RetrievalResult) else chunk
         if not is_chunk_eligible(chunk_dict, role, query_date):
-            raise ValueError(
+            raise CitationValidationError(
                 f"Citation '{cid}' is not eligible for role '{role}' on query date '{query_date}'."
             )
         validated_metadata.append(build_citation_metadata(chunk))
@@ -212,8 +246,8 @@ def validate_citations_and_rules(
     validated_rules: List[str] = []
     for rid in response.referenced_rule_ids:
         if rid not in allowed_rule_ids:
-            raise ValueError(
-                f"Referenced rule ID '{rid}' does not apply to supplied authorized evidence: {list(allowed_rule_ids)}"
+            raise CitationValidationError(
+                f"Referenced rule ID '{rid}' does not apply to supplied authorized evidence."
             )
         if rid not in validated_rules:
             validated_rules.append(rid)
@@ -319,7 +353,7 @@ class GroqClientWrapper:
 
         parsed_response, parse_err = self._parse_json_response(raw_content)
 
-        # Attempt 2: bounded repair if needed
+        # Attempt 2: bounded repair if needed (only for schema/JSON parsing errors)
         if parse_err is not None and max_repair_attempts > 0:
             call_count += 1
             repair_messages = list(messages)
@@ -328,7 +362,7 @@ class GroqClientWrapper:
                 {
                     "role": "user",
                     "content": (
-                        f"Your previous response had a schema or JSON error: {parse_err}. "
+                        "Your previous response had a schema or JSON validation error. "
                         "Please output ONLY the corrected JSON object strictly matching the required schema. "
                         "Do not include any extra text."
                     ),
@@ -344,8 +378,9 @@ class GroqClientWrapper:
         latency_ms = (time.perf_counter() - start_time) * 1000.0
 
         if parse_err is not None or parsed_response is None:
-            raise ValueError(
-                f"Failed to produce a valid structured AnswerResponse after repair attempt: {parse_err}"
+            raise SanitizedProviderError(
+                category="invalid_generation",
+                safe_message="Failed to produce a valid structured AnswerResponse after repair attempt.",
             )
 
         metadata = {
@@ -362,11 +397,20 @@ class GroqClientWrapper:
         """Call Groq chat completion endpoint with safe error mapping."""
         import groq
 
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "rulelens_answer",
+                "strict": True,
+                "schema": AnswerResponse.model_json_schema(),
+            },
+        }
+
         try:
             completion = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                response_format={"type": "json_object"},
+                response_format=response_format,
                 temperature=0.0,
             )
             content = completion.choices[0].message.content or ""
@@ -374,16 +418,33 @@ class GroqClientWrapper:
             total_tokens = getattr(usage, "total_tokens", None) if usage else None
             return {"content": content, "total_tokens": total_tokens}
 
-        except groq.AuthenticationError as exc:
-            raise RuntimeError(f"Groq authentication error (401/403): Please check your {GROQ_API_KEY}.") from exc
-        except groq.RateLimitError as exc:
-            raise RuntimeError("Groq service temporarily unavailable (429 rate limit). Please retry later.") from exc
-        except (groq.APITimeoutError, groq.APIConnectionError) as exc:
-            raise RuntimeError(f"Groq service network/timeout error: {exc}") from exc
-        except groq.InternalServerError as exc:
-            raise RuntimeError(f"Groq service error (5xx): {exc}") from exc
-        except Exception as exc:
-            raise RuntimeError(f"Groq API call failure: {exc}") from exc
+        except groq.AuthenticationError:
+            raise SanitizedProviderError(
+                category="authentication_error",
+                safe_message="Provider authentication failed. Please verify credentials.",
+            )
+        except groq.RateLimitError:
+            raise SanitizedProviderError(
+                category="rate_limited",
+                safe_message="Generation service is currently rate limited. Please retry later.",
+            )
+        except (groq.APITimeoutError, groq.APIConnectionError):
+            raise SanitizedProviderError(
+                category="timeout",
+                safe_message="Generation request timed out. Please retry later.",
+            )
+        except groq.InternalServerError:
+            raise SanitizedProviderError(
+                category="service_unavailable",
+                safe_message="Generation service is temporarily unavailable. Please retry later.",
+            )
+        except SanitizedProviderError:
+            raise
+        except Exception:
+            raise SanitizedProviderError(
+                category="service_unavailable",
+                safe_message="Generation service encountered an unhandled provider error.",
+            )
 
     def _parse_json_response(self, text: str) -> Tuple[Optional[AnswerResponse], Optional[str]]:
         """Attempt to parse and validate text as AnswerResponse."""

@@ -227,3 +227,53 @@ def test_extract_conditions_from_query():
     # Ambiguous / query without conditions
     c4 = extract_conditions_from_query("What is the general vacation policy?")
     assert len(c4) == 0
+
+
+def test_unrelated_numeric_condition_not_cross_assigned():
+    """Bug regression: One currency amount must NOT be assigned to all unrelated condition fields."""
+    query = "Is an incidental receipt required for a dinner expense of INR 800?"
+    conds = extract_conditions_from_query(query)
+    fields = [c["field"] for c in conds]
+    assert "receipt_amount" in fields
+    # Must NOT assign to unrelated fields
+    assert "monthly_spend" not in fields
+    assert "exception_amount" not in fields
+    assert "annual_tuition_claim" not in fields
+    assert "order_amount" not in fields
+    assert "emergency_purchase_amount" not in fields
+
+
+def test_failed_rule_not_treated_as_applicable(repo_root: Path):
+    """Bug regression: Failed rule conditions must NOT be reported as satisfied outcomes."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04"},
+    ]
+    # TRV-C04 has R-TRV-003 (<= 50,000 standard_approval) and R-TRV-004 (> 50,000 additional_approval)
+    # Query with 60,000 INR
+    res = resolve_rules_for_evidence(
+        authorized_chunks=mock_chunks,
+        role="employee",
+        query_date="2026-11-22",
+        base_dir=repo_root,
+        extracted_conditions=[{"field": "expense_amount", "value": 60000, "unit": "INR"}],
+    )
+    r_pass = next(r for r in res if r.rule.rule_id == "R-TRV-004")
+    r_fail = next(r for r in res if r.rule.rule_id == "R-TRV-003")
+
+    assert r_pass.passed is True
+    assert r_pass.outcome == "additional_approval"
+
+    # Failed rule must NOT report standard_approval as satisfied!
+    assert r_fail.passed is False
+    assert r_fail.outcome != "standard_approval"
+    assert "NOT satisfied" in r_fail.explanation
+
+
+def test_rules_cache_isolation_by_base_dir(repo_root: Path, tmp_path: Path):
+    """Bug regression: _RULES_CACHE must be isolated by base_dir to avoid cross-corpus pollution."""
+    rules_orig = load_rules(base_dir=repo_root, reload=True)
+    assert len(rules_orig) == 32
+
+    # A different directory without data/processed/rules.jsonl must fail and not reuse cache
+    with pytest.raises(FileNotFoundError):
+        load_rules(base_dir=tmp_path, reload=False)

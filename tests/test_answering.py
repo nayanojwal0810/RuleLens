@@ -3,17 +3,20 @@
 Verifies:
 - Full answer_question workflow with mocked retrieval and LLM provider.
 - Input validation (role, date, non-empty question).
-- Defense-in-depth role and date verification.
-- Early refusal for unsupported and role-restricted questions without calling Groq.
-- Safe error handling for missing keys, timeouts, 429s, and provider errors.
-- CLI entrypoint execution.
+- Evidence integrity validation against canonical corpus records.
+- Policy metadata-based restricted document detection (no hardcoded keywords).
+- Conservative evidence sufficiency and safe refusals.
+- Mapped operational error handling (no secrets leaked, no raw stack traces).
+- CLI entrypoint execution and nonzero exit on operational error.
 """
 
 from __future__ import annotations
 
 import datetime
+import io
 import json
 import socket
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
@@ -25,8 +28,14 @@ from rulelens.answering import (
     answer_question,
     main as answering_main,
 )
-from rulelens.llm import AnswerResponse, AnswerStatus, GroqClientWrapper
-from rulelens.retrieval import RetrievalResult
+from rulelens.llm import (
+    AnswerResponse,
+    AnswerStatus,
+    CitationValidationError,
+    GroqClientWrapper,
+    SanitizedProviderError,
+)
+from rulelens.retrieval import RetrievalResult, load_validated_corpus
 
 
 @pytest.fixture(autouse=True)
@@ -46,27 +55,43 @@ def repo_root() -> Path:
 
 
 @pytest.fixture
-def mock_retriever():
+def canonical_corpus(repo_root: Path) -> List[Dict[str, Any]]:
+    return load_validated_corpus(repo_root)
+
+
+@pytest.fixture
+def canonical_chunks_by_id(canonical_corpus: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {c["chunk_id"]: c for c in canonical_corpus}
+
+
+@pytest.fixture
+def mock_retriever(canonical_corpus: List[Dict[str, Any]], canonical_chunks_by_id: Dict[str, Dict[str, Any]]):
     retriever = MagicMock()
-    retriever.corpus_fingerprint = "4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3"
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3"}
+    # Use real BM25 index on canonical chunks for search
+    from rulelens.retrieval import BM25Index
+    retriever.get_bm25_index.side_effect = lambda chunks: BM25Index(chunks)
     return retriever
 
 
 @pytest.fixture
-def sample_retrieval_result():
+def sample_retrieval_result(canonical_chunks_by_id: Dict[str, Dict[str, Any]]) -> RetrievalResult:
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C03"]
     return RetrievalResult(
-        chunk_id="DOC-TRV-002_TRV-C03",
-        text="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
-        doc_id="DOC-TRV-002",
-        clause_id="TRV-C03",
-        title="Corporate Travel Policy v2",
-        department="Travel",
-        version="v2",
-        source_file="DOC-TRV-002_Travel_Policy_v2.pdf",
-        source_page=1,
-        effective_from="2026-07-01",
-        effective_to=None,
-        allowed_roles=["employee", "manager", "director", "finance", "security", "auditor"],
+        chunk_id=c["chunk_id"],
+        text=c["text"],
+        doc_id=c["doc_id"],
+        clause_id=c["clause_id"],
+        title=c["title"],
+        department=c["department"],
+        version=c["version"],
+        source_file=c["source_file"],
+        source_page=int(c["source_page"]),
+        effective_from=c["effective_from"],
+        effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
     )
 
 
@@ -118,7 +143,7 @@ def test_answer_question_successful_flow(mock_retriever, sample_retrieval_result
     )
 
     result = answer_question(
-        question="What is the daily meal allowance cap under Travel Policy v2?",
+        question="What is the daily meal allowance under Travel Policy v2?",
         role="employee",
         query_date="2026-11-22",
         retriever=mock_retriever,
@@ -144,7 +169,7 @@ def test_answer_question_early_refusal_when_no_evidence_found(mock_retriever):
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
     result = answer_question(
-        question="Can I get reimbursed for taking personal pets on business travel?",
+        question="What is the reimbursement policy for space travel?",
         role="employee",
         query_date="2026-11-22",
         retriever=mock_retriever,
@@ -158,13 +183,13 @@ def test_answer_question_early_refusal_when_no_evidence_found(mock_retriever):
     mock_llm.generate_answer.assert_not_called()
 
 
-def test_answer_question_early_refusal_for_restricted_query(mock_retriever):
-    """When query targets a restricted policy area and yields 0 chunks, returns restricted without calling Groq."""
-    mock_retriever.search.return_value = []
+def test_answer_question_restricted_policy_detection_without_keywords(mock_retriever):
+    """Bug regression: Restriction must be determined by policy metadata and permissions, not hardcoded keywords."""
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
+    # Query targeting executive travel exceptions (DOC-TRV-004), restricted for employee
     result = answer_question(
-        question="What is the travel exception approval route for expenses exceeding INR 100,000?",
+        question="What executive approval route is required when extraordinary travel exception expenses exceed INR 100,000 under the travel exceptions policy?",
         role="employee",
         query_date="2026-11-22",
         retriever=mock_retriever,
@@ -178,58 +203,24 @@ def test_answer_question_early_refusal_for_restricted_query(mock_retriever):
     mock_llm.generate_answer.assert_not_called()
 
 
-def test_answer_question_defense_in_depth_filters_leaked_chunk(mock_retriever, sample_retrieval_result):
-    """If retriever somehow returns an unauthorized chunk, defense-in-depth excludes it from Groq call."""
-    unauthorized_chunk = RetrievalResult(
-        chunk_id="DOC-TRV-004_TRV-E01",
-        text="Executive travel exception approval requires Department VP.",
-        doc_id="DOC-TRV-004",
-        clause_id="TRV-E01",
-        title="Travel Exceptions Policy",
-        department="Travel",
-        version="v1",
-        source_file="DOC-TRV-004.pdf",
-        source_page=1,
-        effective_from="2026-01-01",
-        effective_to=None,
-        allowed_roles=["manager", "director", "finance", "legal"],  # employee not allowed!
+def test_answer_question_rejects_forged_evidence_metadata(mock_retriever, sample_retrieval_result):
+    """Bug regression: Adversarial candidate with correct ID but altered permissions or text must be rejected."""
+    forged_chunk = RetrievalResult(
+        chunk_id=sample_retrieval_result.chunk_id,
+        text="FORGED TEXT: All expenses are 100% approved without limits.",
+        doc_id=sample_retrieval_result.doc_id,
+        clause_id=sample_retrieval_result.clause_id,
+        title=sample_retrieval_result.title,
+        department=sample_retrieval_result.department,
+        version=sample_retrieval_result.version,
+        source_file=sample_retrieval_result.source_file,
+        source_page=sample_retrieval_result.source_page,
+        effective_from=sample_retrieval_result.effective_from,
+        effective_to=sample_retrieval_result.effective_to,
+        allowed_roles=sample_retrieval_result.allowed_roles,
     )
-    # Retriever returns both
-    mock_retriever.search.return_value = [unauthorized_chunk, sample_retrieval_result]
-
+    mock_retriever.search.return_value = [forged_chunk]
     mock_llm = MagicMock(spec=GroqClientWrapper)
-    mock_llm.generate_answer.return_value = (
-        AnswerResponse(
-            answer="Meal allowance is INR 2,000.",
-            status=AnswerStatus.ANSWERED,
-            citations=["DOC-TRV-002_TRV-C03"],
-            referenced_rule_ids=[],
-            reason="Valid citation.",
-        ),
-        {"total_tokens": 100},
-    )
-
-    result = answer_question(
-        question="What is meal allowance?",
-        role="employee",
-        query_date="2026-11-22",
-        retriever=mock_retriever,
-        llm_client=mock_llm,
-    )
-
-    assert result.status == "answered"
-    # Confirm Groq was only sent the authorized chunk
-    called_chunks = mock_llm.generate_answer.call_args.kwargs["evidence_chunks"]
-    assert len(called_chunks) == 1
-    assert called_chunks[0].chunk_id == "DOC-TRV-002_TRV-C03"
-
-
-def test_answer_question_handles_llm_failure_gracefully(mock_retriever, sample_retrieval_result):
-    """When LLM provider raises a network or 429 error, returns safe error response without crashing."""
-    mock_retriever.search.return_value = [sample_retrieval_result]
-
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-    mock_llm.generate_answer.side_effect = RuntimeError("Groq service temporarily unavailable (429 rate limit).")
 
     result = answer_question(
         question="What is the meal allowance cap?",
@@ -239,10 +230,80 @@ def test_answer_question_handles_llm_failure_gracefully(mock_retriever, sample_r
         llm_client=mock_llm,
     )
 
+    assert result.status == "operational_error"
+    assert result.error_category == "service_unavailable"
+    assert "integrity" in result.error.lower()
+    # Provider must NEVER be called with forged evidence
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_answer_question_unsupported_query_safely_refused(mock_retriever, sample_retrieval_result):
+    """Bug regression: Questions asking for unsupported topics (e.g. pets) must safely refuse with insufficient."""
+    mock_retriever.search.return_value = [sample_retrieval_result]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    result = answer_question(
+        question="How much reimbursement can an employee claim for taking personal domestic pets on business travel?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
     assert result.status == "insufficient"
-    assert "generation service is temporarily unavailable" in result.answer
+    assert "corporate policies do not contain sufficient evidence" in result.answer
     assert result.citations == []
-    assert "429 rate limit" in result.error
+    # Groq must NOT be called for unsupported topic with zero entity overlap
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_answer_question_handles_provider_error_as_operational_error(mock_retriever, sample_retrieval_result):
+    """Bug regression: Provider errors must NOT be classified as insufficient evidence."""
+    mock_retriever.search.return_value = [sample_retrieval_result]
+
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    mock_llm.generate_answer.side_effect = SanitizedProviderError(
+        category="rate_limited",
+        safe_message="Generation service is currently rate limited. Please retry later.",
+    )
+
+    result = answer_question(
+        question="What is the meal allowance under Travel Policy v2?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    # Must be operational_error, NOT insufficient!
+    assert result.status == "operational_error"
+    assert result.error_category == "rate_limited"
+    assert "rate limited" in result.error
+    assert result.citations == []
+
+
+def test_answer_question_leaks_no_secrets_in_errors(mock_retriever, sample_retrieval_result):
+    """Bug regression: Exceptions with fake API keys or secret strings must be completely sanitized."""
+    mock_retriever.search.return_value = [sample_retrieval_result]
+
+    secret_leak_exc = RuntimeError("Fatal crash in request: Authorization: Bearer gsk_SUPER_SECRET_KEY_12345")
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    mock_llm.generate_answer.side_effect = secret_leak_exc
+
+    result = answer_question(
+        question="What is the meal allowance cap under Travel Policy v2?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert result.status == "operational_error"
+    # Ensure no part of the secret string leaked into any result field
+    res_json = json.dumps(result.to_dict())
+    assert "SUPER_SECRET" not in res_json
+    assert "gsk_" not in res_json
+    assert "Bearer" not in res_json
 
 
 # ==============================================================================
@@ -250,13 +311,17 @@ def test_answer_question_handles_llm_failure_gracefully(mock_retriever, sample_r
 # ==============================================================================
 
 
-def test_cli_smoke_test_execution(monkeypatch, sample_retrieval_result):
+def test_cli_smoke_test_execution(monkeypatch, sample_retrieval_result, canonical_corpus, canonical_chunks_by_id):
     """CLI answering entry point runs cleanly and exits with code 0 on valid response."""
     with patch("rulelens.answering.HybridRetriever") as mock_retriever_cls, \
          patch("rulelens.answering.GroqClientWrapper") as mock_llm_cls:
 
+        from rulelens.retrieval import BM25Index
         retriever_inst = MagicMock()
-        retriever_inst.corpus_fingerprint = "test_fp"
+        retriever_inst.chunks = canonical_corpus
+        retriever_inst.chunks_by_id = canonical_chunks_by_id
+        retriever_inst.corpus_manifest = {"processed_fingerprint": "test_fp"}
+        retriever_inst.get_bm25_index.side_effect = lambda c_list: BM25Index(c_list)
         retriever_inst.search.return_value = [sample_retrieval_result]
         mock_retriever_cls.return_value = retriever_inst
 
@@ -275,7 +340,7 @@ def test_cli_smoke_test_execution(monkeypatch, sample_retrieval_result):
 
         test_args = [
             "prog",
-            "--question", "How many days in advance must domestic flights be booked?",
+            "--question", "What is the daily meal allowance under Travel Policy v2?",
             "--role", "employee",
             "--date", "2026-11-22",
             "--backend", "local",
@@ -284,3 +349,38 @@ def test_cli_smoke_test_execution(monkeypatch, sample_retrieval_result):
 
         # Must run without throwing unhandled exceptions
         answering_main()
+
+
+def test_cli_exits_nonzero_on_operational_error(monkeypatch, sample_retrieval_result, canonical_corpus, canonical_chunks_by_id):
+    """CLI answering entry point must exit with code 1 when an operational error occurs."""
+    with patch("rulelens.answering.HybridRetriever") as mock_retriever_cls, \
+         patch("rulelens.answering.GroqClientWrapper") as mock_llm_cls:
+
+        from rulelens.retrieval import BM25Index
+        retriever_inst = MagicMock()
+        retriever_inst.chunks = canonical_corpus
+        retriever_inst.chunks_by_id = canonical_chunks_by_id
+        retriever_inst.corpus_manifest = {"processed_fingerprint": "test_fp"}
+        retriever_inst.get_bm25_index.side_effect = lambda c_list: BM25Index(c_list)
+        retriever_inst.search.return_value = [sample_retrieval_result]
+        mock_retriever_cls.return_value = retriever_inst
+
+        llm_inst = MagicMock()
+        llm_inst.generate_answer.side_effect = SanitizedProviderError(
+            category="authentication_error",
+            safe_message="Provider authentication failed. Please verify credentials.",
+        )
+        mock_llm_cls.return_value = llm_inst
+
+        test_args = [
+            "prog",
+            "--question", "What is the daily meal allowance under Travel Policy v2?",
+            "--role", "employee",
+            "--date", "2026-11-22",
+            "--backend", "local",
+        ]
+        monkeypatch.setattr("sys.argv", test_args)
+
+        with pytest.raises(SystemExit) as excinfo:
+            answering_main()
+        assert excinfo.value.code == 1

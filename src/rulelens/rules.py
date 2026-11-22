@@ -8,6 +8,7 @@ and condition values.
 from __future__ import annotations
 
 import datetime
+from decimal import Decimal, InvalidOperation
 import json
 import re
 from dataclasses import dataclass
@@ -62,8 +63,8 @@ class RuleEvaluationResult:
     explanation: str
 
 
-# Cache loaded rules
-_RULES_CACHE: Optional[List[RuleRecord]] = None
+# Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
+_RULES_CACHE: Dict[Path, List[RuleRecord]] = {}
 
 
 def load_rules(base_dir: Optional[Union[Path, str]] = None, reload: bool = False) -> List[RuleRecord]:
@@ -77,10 +78,10 @@ def load_rules(base_dir: Optional[Union[Path, str]] = None, reload: bool = False
         List of RuleRecord objects.
     """
     global _RULES_CACHE
-    if _RULES_CACHE is not None and not reload:
-        return _RULES_CACHE
+    base = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+    if not reload and base in _RULES_CACHE:
+        return _RULES_CACHE[base]
 
-    base = Path(base_dir) if base_dir else Path.cwd()
     rules_path = base / "data" / "processed" / "rules.jsonl"
     if not rules_path.is_file():
         # Check parent in case cwd is inside tests or a subpackage
@@ -116,7 +117,7 @@ def load_rules(base_dir: Optional[Union[Path, str]] = None, reload: bool = False
     if len(rules) != 32:
         raise ValueError(f"Expected 32 canonical rules in {rules_path}, found {len(rules)}.")
 
-    _RULES_CACHE = rules
+    _RULES_CACHE[base] = rules
     return rules
 
 
@@ -135,7 +136,7 @@ def evaluate_rule_condition(
     value: Any,
     unit: Optional[str] = None,
 ) -> bool:
-    """Evaluate whether an input value satisfies a rule's condition.
+    """Evaluate whether an input value satisfies a rule's condition using exact numeric comparisons.
 
     Args:
         rule: RuleRecord or dict.
@@ -166,11 +167,13 @@ def evaluate_rule_condition(
             return str(value).strip().lower() == threshold.strip().lower()
         return value == threshold
 
-    # Numeric comparisons: <, <=, >, >=
+    # Exact decimal numeric comparisons: <, <=, >, >=
     try:
-        numeric_val = float(value)
-        numeric_threshold = float(threshold)
-    except (ValueError, TypeError) as exc:
+        clean_val_str = str(value).strip().replace(",", "")
+        clean_thresh_str = str(threshold).strip().replace(",", "")
+        numeric_val = Decimal(clean_val_str)
+        numeric_threshold = Decimal(clean_thresh_str)
+    except (InvalidOperation, ValueError, TypeError) as exc:
         raise TypeError(
             f"Cannot evaluate operator '{rule_op}' with non-numeric value '{value}' and threshold '{threshold}'."
         ) from exc
@@ -244,29 +247,46 @@ def resolve_rules_for_evidence(
             val, unit = cond_map[rule.condition_field]
             try:
                 passed = evaluate_rule_condition(rule, val, unit)
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError):
                 # Incompatible unit or type: fails closed
                 passed = False
 
-            explanation = (
-                f"Rule {rule.rule_id} ({rule.condition_field} {rule.operator} {rule.threshold_value} {rule.unit}): "
-                f"Input {val} {unit or rule.unit} -> {'MET' if passed else 'NOT MET'} -> outcome: {rule.outcome}"
-            )
-            results.append(
-                RuleEvaluationResult(
-                    rule=rule,
-                    passed=passed,
-                    input_value=val,
-                    input_unit=unit or rule.unit,
-                    outcome=rule.outcome,
-                    explanation=explanation,
+            if passed:
+                explanation = (
+                    f"Rule {rule.rule_id} condition satisfied: {rule.condition_field} {rule.operator} "
+                    f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit} -> outcome: {rule.outcome}"
                 )
-            )
+                results.append(
+                    RuleEvaluationResult(
+                        rule=rule,
+                        passed=True,
+                        input_value=val,
+                        input_unit=unit or rule.unit,
+                        outcome=rule.outcome,
+                        explanation=explanation,
+                    )
+                )
+            else:
+                # Failed condition: outcome must NOT be described as applicable
+                explanation = (
+                    f"Rule {rule.rule_id} condition NOT satisfied: {rule.condition_field} {rule.operator} "
+                    f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit}."
+                )
+                results.append(
+                    RuleEvaluationResult(
+                        rule=rule,
+                        passed=False,
+                        input_value=val,
+                        input_unit=unit or rule.unit,
+                        outcome="condition_not_met",
+                        explanation=explanation,
+                    )
+                )
         else:
-            # Rule applies structurally to the clause, but no input value was given
+            # Rule applies structurally to the clause, but no transaction amount was provided
             explanation = (
-                f"Rule {rule.rule_id} ({rule.condition_field} {rule.operator} {rule.threshold_value} {rule.unit}): "
-                f"Threshold definition for {rule.outcome}."
+                f"Rule {rule.rule_id} defines: {rule.condition_field} {rule.operator} {rule.threshold_value} {rule.unit} "
+                f"for {rule.outcome}."
             )
             results.append(
                 RuleEvaluationResult(
@@ -305,13 +325,34 @@ _HOURS_PATTERN = re.compile(
 )
 
 
+def _determine_currency_field(query_lower: str, span_lower: str) -> Optional[str]:
+    """Identify the specific currency condition field from query context."""
+    if any(k in query_lower for k in ("receipt", "incidental", "tax invoice")):
+        return "receipt_amount"
+    if "exception" in query_lower:
+        return "exception_amount"
+    if any(k in query_lower for k in ("card", "monthly spend", "credit card")):
+        return "monthly_spend"
+    if any(k in query_lower for k in ("tuition", "education", "course", "degree")):
+        return "annual_tuition_claim"
+    if "emergency" in query_lower and any(k in query_lower for k in ("purchase", "order", "procurement")):
+        return "emergency_purchase_amount"
+    if any(k in query_lower for k in ("purchase order", "po ", "contract", "quote", "single quote", "three competitive")):
+        return "order_amount"
+    if any(k in query_lower for k in ("travel", "flight", "hotel", "per diem", "manager", "director", "approval threshold")):
+        return "expense_amount"
+    if "expense" in query_lower:
+        return "expense_amount"
+    return None
+
+
 def extract_conditions_from_query(
     query: str,
     relevant_fields: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Conservatively extract typed condition values from a natural language query.
 
-    Only extracts when unambiguous. Returns empty list if no clear condition is found.
+    Only extracts when unambiguous. Rejects ambiguous or conflicting field/value matches.
 
     Args:
         query: User question string.
@@ -323,45 +364,46 @@ def extract_conditions_from_query(
     if not query or not query.strip():
         return []
 
+    q_lower = query.lower()
     conditions: List[Dict[str, Any]] = []
 
     # Check for tier values (Information Security)
-    if "confidential" in query.lower():
-        if relevant_fields is None or "data_classification_tier" in relevant_fields:
-            conditions.append({"field": "data_classification_tier", "value": "Confidential", "unit": "tier"})
-    elif "restricted" in query.lower() and "restricted data" in query.lower():
-        if relevant_fields is None or "data_classification_tier" in relevant_fields:
-            conditions.append({"field": "data_classification_tier", "value": "Restricted", "unit": "tier"})
+    if "confidential" in q_lower:
+        conditions.append({"field": "data_classification_tier", "value": "Confidential", "unit": "tier"})
+    elif "restricted" in q_lower and any(k in q_lower for k in ("restricted data", "restricted tier", "data classification")):
+        conditions.append({"field": "data_classification_tier", "value": "Restricted", "unit": "tier"})
 
     # Check for INR currency amounts
-    # Avoid picking up years like 2026 as amounts: check for explicit currency symbol, keyword, or large values
+    found_currency_amounts: List[Tuple[float, str]] = []
     for match in _CURRENCY_PATTERN.finditer(query):
         raw_num = match.group(1).replace(",", "")
         try:
             val = float(raw_num)
         except ValueError:
             continue
-        # Check surrounding text for currency markers or context
+        # Exclude years (e.g. 2026) unless explicitly preceded/followed by currency mark
         span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
-        has_currency_marker = any(k in span for k in ("inr", "rs", "₹", "rupee", "cost", "amount", "spend", "claim", "price"))
-        # Exclude years (e.g. 2026) unless explicitly marked with INR
+        has_curr_mark = any(k in span for k in ("inr", "rs", "₹", "rupee", "cost", "amount", "spend", "claim", "price"))
         if 2000 <= val <= 2099 and not any(k in span for k in ("inr", "rs", "₹")):
             continue
+        if has_curr_mark:
+            field = _determine_currency_field(q_lower, span)
+            if field:
+                found_currency_amounts.append((val, field))
 
-        if has_currency_marker:
-            # Map to potential currency fields if relevant_fields specifies them
-            cand_fields = [
-                "expense_amount",
-                "exception_amount",
-                "receipt_amount",
-                "monthly_spend",
-                "annual_tuition_claim",
-                "order_amount",
-                "emergency_purchase_amount",
-            ]
-            for f in cand_fields:
-                if relevant_fields is None or f in relevant_fields:
-                    conditions.append({"field": f, "value": val, "unit": "INR"})
+    # Reject if multiple distinct amounts claim the same field or if fields are ambiguous
+    seen_fields = set()
+    ambiguous = False
+    for val, field in found_currency_amounts:
+        if field in seen_fields:
+            # Ambiguous: multiple amounts for same field
+            ambiguous = True
+            break
+        seen_fields.add(field)
+
+    if not ambiguous:
+        for val, field in found_currency_amounts:
+            conditions.append({"field": field, "value": val, "unit": "INR"})
 
     # Check for days
     for match in _DAYS_PATTERN.finditer(query):
@@ -369,15 +411,14 @@ def extract_conditions_from_query(
             val = int(match.group(1))
         except ValueError:
             continue
-        cand_fields = [
-            "advance_booking_days",
-            "submission_delay_days",
-            "consecutive_sick_days",
-            "privileged_role_review_interval_days",
-        ]
-        for f in cand_fields:
-            if relevant_fields is None or f in relevant_fields:
-                conditions.append({"field": f, "value": val, "unit": "days"})
+        if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
+            conditions.append({"field": "advance_booking_days", "value": val, "unit": "days"})
+        elif any(k in q_lower for k in ("submit", "submission", "delay", "expense claim", "reimbursement")):
+            conditions.append({"field": "submission_delay_days", "value": val, "unit": "days"})
+        elif any(k in q_lower for k in ("sick", "illness", "medical")):
+            conditions.append({"field": "consecutive_sick_days", "value": val, "unit": "days"})
+        elif any(k in q_lower for k in ("recertification", "access review", "privileged")):
+            conditions.append({"field": "privileged_role_review_interval_days", "value": val, "unit": "days"})
 
     # Check for months
     for match in _MONTHS_PATTERN.finditer(query):
@@ -385,10 +426,8 @@ def extract_conditions_from_query(
             val = int(match.group(1))
         except ValueError:
             continue
-        cand_fields = ["contract_duration_months"]
-        for f in cand_fields:
-            if relevant_fields is None or f in relevant_fields:
-                conditions.append({"field": f, "value": val, "unit": "months"})
+        if any(k in q_lower for k in ("contract", "duration", "agreement")):
+            conditions.append({"field": "contract_duration_months", "value": val, "unit": "months"})
 
     # Check for mbps
     for match in _MBPS_PATTERN.finditer(query):
@@ -396,10 +435,7 @@ def extract_conditions_from_query(
             val = int(match.group(1))
         except ValueError:
             continue
-        cand_fields = ["internet_speed_mbps"]
-        for f in cand_fields:
-            if relevant_fields is None or f in relevant_fields:
-                conditions.append({"field": f, "value": val, "unit": "mbps"})
+        conditions.append({"field": "internet_speed_mbps", "value": val, "unit": "mbps"})
 
     # Check for hours
     for match in _HOURS_PATTERN.finditer(query):
@@ -407,9 +443,11 @@ def extract_conditions_from_query(
             val = int(match.group(1))
         except ValueError:
             continue
-        cand_fields = ["incident_severity_p1_response_hours"]
-        for f in cand_fields:
-            if relevant_fields is None or f in relevant_fields:
-                conditions.append({"field": f, "value": val, "unit": "hours"})
+        if any(k in q_lower for k in ("incident", "p1", "severity", "sla")):
+            conditions.append({"field": "incident_severity_p1_response_hours", "value": val, "unit": "hours"})
+
+    # Filter to relevant fields if specified
+    if relevant_fields is not None:
+        conditions = [c for c in conditions if c["field"] in relevant_fields]
 
     return conditions
