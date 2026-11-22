@@ -1,10 +1,30 @@
 # RuleLens
 
-Enterprise Policy Intelligence Engine with Hybrid Retrieval and Guarded Semantic Caching.
+Enterprise Policy Intelligence Engine with Hybrid Retrieval and Grounded Answer Generation.
 
 ## Project Purpose
 
-RuleLens is an enterprise policy question-answering system designed to deliver verified, clause-grounded policy answers with role-based access control and safe semantic cache reuse. When uncertain or when policy evidence is insufficient, RuleLens safely refuses unsupported questions rather than generating unverified responses.
+RuleLens is an enterprise policy question-answering system designed to deliver verified, clause-grounded policy answers with role-based access control, deterministic rule execution, and strict citation validation. When uncertain or when policy evidence is insufficient, RuleLens safely refuses unsupported questions rather than generating unverified responses.
+
+## Implementation Status & Roadmap
+
+### Implemented Functionality (Stages A–E)
+- **Corpus & Rule Ingestion**: 20 canonical policy documents across 5 departments, 64 validated clauses, and 32 structured rules with SHA-256 fingerprint verification.
+- **Hybrid Retrieval**: Okapi BM25 lexical search combined with `BAAI/bge-small-en-v1.5` dense embeddings (384-dimensional) via Reciprocal Rank Fusion (RRF, $k=60$).
+- **Dual Vector Backends**: 100% offline local in-memory cosine similarity and Qdrant Cloud vector search with server-side payload filtering.
+- **Role & Temporal Filtering**: Deterministic pre-retrieval filtering enforcing 6 employee roles and active temporal version windows.
+- **Restricted Topic Detection**: Non-sensitive public policy topic catalog ensuring role-restricted queries (such as storage media disposal) fail closed before retrieval.
+- **Authoritative Rule Decisions**: Deterministic Python rule evaluation (`Decimal` comparisons) for single-condition decision queries without LLM hallucination.
+- **Grounded Answer Generation**: `openai/gpt-oss-20b` via the Groq SDK with strict Pydantic JSON schema structured output.
+- **Citation & Safety Verification**: Verifies every citation against supplied evidence; rejects fabricated or unauthorized references.
+- **Development Evaluations**: Comprehensive retrieval and generation evaluation harnesses supporting configurable cutoffs ($K=4$, $K=5$).
+
+### Planned / Not Yet Implemented
+- **Stage F**: Guarded Semantic Caching with role-safe cache reuse and cluster invalidation.
+- **Stage G**: Interactive Streamlit web application.
+- **Final Evaluation**: Independent end-to-end benchmark evaluation.
+
+> **Scope Note:** RuleLens is an enterprise policy intelligence prototype. It does not provide production-grade enterprise authentication, identity management, or security hardening, nor does it claim infallible natural language understanding.
 
 ## Architecture
 
@@ -35,7 +55,7 @@ User Query + Role + Effective Date
         ┌────────────────┴────────────────┐
         ▼                                 ▼
  ┌──────────────┐                 ┌──────────────┐
- │ Deterministic│                 │ Safe Refusal │
+ │ Authoritative│                 │ Safe Refusal │
  │ Rule Engine  │                 │ (Early Gate) │
  └──────┬───────┘                 └──────────────┘
         │                                 │
@@ -56,15 +76,16 @@ User Query + Role + Effective Date
   - `local`: High-performance local in-memory cosine similarity over cached document embeddings (100% offline).
   - `qdrant`: Vector database retrieval utilizing server-side payload filtering for permissions, dates, and corpus fingerprints.
 - **Security & Version Integrity:** Role-based permissions (across `employee`, `manager`, `hr`, `finance`, `security`, `auditor`) and temporal version windows are enforced via deterministic pre-filtering before scoring.
-- **Deterministic Rule Engine:** Evaluates 32 canonical structured policy rules in Python for boundary conditions and numeric comparisons (`<`, `<=`, `>`, `>=`, `==`) to eliminate LLM arithmetic hallucinations.
+- **Deterministic Rule Engine:** Evaluates 32 canonical structured policy rules in Python for boundary conditions and numeric comparisons (`<`, `<=`, `>`, `>=`, `==`) to eliminate arithmetic hallucinations. For concrete single-condition decision queries, authoritative decisions are returned directly with linked citations without calling the LLM.
 - **Evidence-Grounded Generation:** Uses `openai/gpt-oss-20b` via the Groq SDK with strict Pydantic JSON schema structured output.
-- **5 Structured Answer Fields:**
-  - `answer`: Clause-grounded textual answer or explicit refusal explanation.
-  - `status`: One of `ANSWERED`, `INSUFFICIENT_EVIDENCE`, `ROLE_RESTRICTED`, `POLICY_CONFLICT`, `OPERATIONAL_ERROR`.
-  - `citations`: List of valid, retrieved chunk IDs directly supporting the answer.
-  - `referenced_rule_ids`: List of deterministic rule IDs applied and verified.
-  - `reason`: Explanation of the status classification and evidence basis.
-- **Strict Citation Validation & Refusal:** Every citation is verified against authorized evidence chunks; fabricated, unretrieved, unauthorized, or expired chunk IDs are rejected. When evidence is insufficient or the role lacks permission, the system safely refuses without generating unverified claims.
+- **Logical Answer Statuses (Model Layer):**
+  - `answered`: Query is directly and unambiguously supported by authorized policy evidence.
+  - `insufficient`: Evidence is missing, out-of-scope, or insufficient to answer the query safely.
+  - `restricted`: Requesting role lacks authorization to access the target policy area.
+- **Application Result Layer:**
+  - In addition to the three logical model statuses, the application layer (`GenerationResult`) reports `status="operational_error"` for infrastructure, provider, or validation errors (e.g. rate limits, network timeouts, invalid citations, or integrity failures).
+- **Strict Citation Validation:** Every citation is verified against authorized evidence chunks; fabricated, unretrieved, unauthorized, or expired chunk IDs are rejected. When evidence is insufficient or the role lacks permission, the system safely refuses without generating unverified claims.
+- **Evaluation Distinction:** Gold-evidence generation evaluation measures model grounding and citation validity given verified gold chunks; it does not measure end-to-end retrieval recall.
 
 ## Installation & Setup
 

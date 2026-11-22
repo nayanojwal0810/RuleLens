@@ -27,6 +27,7 @@ from rulelens.retrieval_eval import (
     compute_mrr_at_k,
     compute_recall_at_k,
     evaluate_retriever_method,
+    generate_summary_markdown,
     main,
     validate_evaluation_dataset,
 )
@@ -556,3 +557,137 @@ def test_canonical_audit_regression_targets(repo_root: Path):
     assert sec004["gold_chunk_ids"] == ["DOC-SEC-003_SEC-I01"]
     assert "Priority 1 (Critical)" in sec004["gold_evidence"][0]["quote"]
     assert "Priority 4 (Minor)" in sec004["gold_evidence"][0]["quote"]
+
+
+# ==============================================================================
+# 11. Corpus Manifest Validation & Dynamic Cutoff Tests
+# ==============================================================================
+
+
+def test_manifest_validation_distinct_steps(tmp_path: Path, repo_root: Path):
+    """validate_evaluation_dataset must distinctly identify manifest errors."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+
+    # 1. Missing manifest
+    missing_dir = tmp_path / "missing_dir"
+    missing_dir.mkdir()
+    (missing_dir / "data" / "processed").mkdir(parents=True)
+    with pytest.raises(ValueError, match="Corpus manifest file does not exist"):
+        validate_evaluation_dataset(data, base_dir=missing_dir)
+
+    # 2. Malformed JSON manifest
+    bad_json_dir = tmp_path / "bad_json_dir"
+    manifest_dir = bad_json_dir / "data" / "processed"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "corpus_manifest.json").write_text("{broken json", encoding="utf-8")
+    with pytest.raises(ValueError, match="Corpus manifest is not valid JSON"):
+        validate_evaluation_dataset(data, base_dir=bad_json_dir)
+
+    # 3. Missing processed_fingerprint field
+    no_fp_dir = tmp_path / "no_fp_dir"
+    no_fp_manifest_dir = no_fp_dir / "data" / "processed"
+    no_fp_manifest_dir.mkdir(parents=True)
+    (no_fp_manifest_dir / "corpus_manifest.json").write_text(
+        json.dumps({"chunk_count": 64, "document_count": 20}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="missing required 'processed_fingerprint' field"):
+        validate_evaluation_dataset(data, base_dir=no_fp_dir)
+
+    # 4. Missing chunk_count or document_count
+    no_cnt_dir = tmp_path / "no_cnt_dir"
+    no_cnt_manifest_dir = no_cnt_dir / "data" / "processed"
+    no_cnt_manifest_dir.mkdir(parents=True)
+    (no_cnt_manifest_dir / "corpus_manifest.json").write_text(
+        json.dumps({"processed_fingerprint": data["corpus_fingerprint"]}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="missing required 'chunk_count' field"):
+        validate_evaluation_dataset(data, base_dir=no_cnt_dir)
+
+    # 5. Fingerprint mismatch
+    mismatch_dir = tmp_path / "mismatch_dir"
+    mismatch_manifest_dir = mismatch_dir / "data" / "processed"
+    mismatch_manifest_dir.mkdir(parents=True)
+    (mismatch_manifest_dir / "corpus_manifest.json").write_text(
+        json.dumps({
+            "processed_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+            "chunk_count": 64,
+            "document_count": 20,
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match processed corpus fingerprint"):
+        validate_evaluation_dataset(data, base_dir=mismatch_dir)
+
+    # 6. Canonical validation succeeds cleanly
+    validated = validate_evaluation_dataset(dev_path, base_dir=repo_root)
+    assert validated["status"] == "valid"
+    assert validated["total_questions"] == 50
+
+
+def test_evaluate_retriever_dynamic_cutoff_k_metrics_and_markdown():
+    """evaluate_retriever_method and summary markdown support arbitrary cutoffs (K=4, K=5)."""
+    mock_retriever = MagicMock()
+
+    def make_res(cid: str) -> RetrievalResult:
+        return RetrievalResult(
+            chunk_id=cid,
+            text="Clause text",
+            doc_id="DOC-TRV-001",
+            clause_id="TRV-C01",
+            title="Travel Policy v1",
+            department="travel",
+            version="1.0",
+            source_file="policies/travel.pdf",
+            source_page=1,
+            effective_from="2026-01-01",
+            effective_to=None,
+            allowed_roles=["employee"],
+        )
+
+    mock_retriever.search.return_value = [
+        make_res("chunk_1"),
+        make_res("chunk_2"),
+        make_res("chunk_3"),
+        make_res("chunk_4"),
+        make_res("chunk_5"),
+    ]
+
+    questions = [
+        {
+            "question_id": "Q1",
+            "question": "What is the policy?",
+            "role": "employee",
+            "query_date": "2026-11-22",
+            "question_type": "direct",
+            "gold_chunk_ids": ["chunk_4"],
+            "answerability": True,
+        }
+    ]
+
+    # Test top_k=4
+    metrics_k4 = evaluate_retriever_method(mock_retriever, questions, top_k=4)
+    assert metrics_k4["cutoff"] == 4
+    assert metrics_k4["hit_at_k"] == 1.0
+    assert metrics_k4["recall_at_k"] == 1.0
+    assert metrics_k4["hit_at_4"] == 1.0
+    assert metrics_k4["recall_at_4"] == 1.0
+
+    report_k4 = generate_summary_markdown({"TestMethod": metrics_k4}, questions)
+    assert "Hit@4" in report_k4
+    assert "Recall@4" in report_k4
+    assert "MRR@4" in report_k4
+
+    # Test top_k=5
+    metrics_k5 = evaluate_retriever_method(mock_retriever, questions, top_k=5)
+    assert metrics_k5["cutoff"] == 5
+    assert metrics_k5["hit_at_k"] == 1.0
+    assert metrics_k5["recall_at_k"] == 1.0
+    assert metrics_k5["hit_at_5"] == 1.0
+    assert metrics_k5["recall_at_5"] == 1.0
+
+    report_k5 = generate_summary_markdown({"TestMethod": metrics_k5}, questions)
+    assert "Hit@5" in report_k5
+    assert "Recall@5" in report_k5
+    assert "Recall@5" in report_k5
+    assert "MRR@5" in report_k5

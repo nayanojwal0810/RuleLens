@@ -31,9 +31,11 @@ from rulelens.llm import (
     GroqClientWrapper,
     ProviderTelemetrySnapshot,
     SanitizedProviderError,
+    build_citation_metadata,
     build_evidence_fingerprint,
     validate_citations_and_rules,
 )
+from rulelens.public_policy_topics import match_public_policy_topics
 from rulelens.qdrant_store import get_qdrant_client
 from rulelens.retrieval import (
     ALLOWED_ROLES_SET,
@@ -43,7 +45,9 @@ from rulelens.retrieval import (
     parse_query_date,
 )
 from rulelens.rules import (
+    AuthoritativeDecision,
     RuleEvaluationResult,
+    evaluate_authoritative_rule_decision,
     extract_conditions_from_query,
     resolve_rules_for_evidence,
 )
@@ -104,6 +108,14 @@ class GenerationResult:
         d["schema_valid"] = self.schema_valid if isinstance(self.schema_valid, bool) else None
         d["has_incomplete_tokens"] = bool(self.has_incomplete_tokens) if isinstance(self.has_incomplete_tokens, bool) else False
         return d
+
+
+def _stem_word(w: str) -> str:
+    """Safely strip common English inflections without mangling short roots."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            return w[:-len(suffix)]
+    return w
 
 
 def check_restricted_policy_access(
@@ -180,7 +192,7 @@ def check_restricted_policy_access(
                     # Stem matching for all title words
                     matched_words = 0
                     for w in words:
-                        root = w.rstrip("s").rstrip("ing").rstrip("ed")
+                        root = _stem_word(w)
                         if re.search(r"\b" + re.escape(root), q_norm):
                             matched_words += 1
                     if matched_words == len(words):
@@ -194,6 +206,16 @@ def check_restricted_policy_access(
             else:
                 restr_matches.append((doc["doc_id"], score))
 
+    # Also evaluate non-sensitive public policy topics catalog
+    topic_matches = match_public_policy_topics(query)
+    for t_did, t_score in topic_matches:
+        doc = next((d for d in active_docs if d["doc_id"] == t_did), None)
+        if doc:
+            if role in doc["allowed_roles"]:
+                auth_matches.append((doc["doc_id"], t_score))
+            else:
+                restr_matches.append((doc["doc_id"], t_score))
+
     if not restr_matches:
         return False
 
@@ -201,7 +223,7 @@ def check_restricted_policy_access(
     max_auth_score = max([s[1] for s in auth_matches], default=0)
 
     # Return True only if the restricted policy match is unambiguous and strictly more specific
-    # than any matching authorized document title
+    # than any matching authorized document title or topic
     return max_restr_score > max_auth_score
 
 
@@ -326,7 +348,7 @@ def check_evidence_support(
 
     matched_salient = []
     for w in salient_words:
-        root = w.rstrip("s").rstrip("ing").rstrip("ed")
+        root = _stem_word(w)
         if re.search(r"\b" + re.escape(root), all_evidence_text):
             matched_salient.append(w)
 
@@ -626,13 +648,49 @@ def answer_question(
     # Only rules that successfully passed without error or define approved thresholds are applicable
     applicable_rule_ids = {r.rule.rule_id for r in rule_results if r.passed and not r.is_error}
 
+    # Step G.1: Authoritative deterministic rule decision for clear single-condition decision queries
+    authoritative_dec = evaluate_authoritative_rule_decision(
+        question=cleaned_question,
+        authorized_chunks=chunk_dicts,
+        rule_results=rule_results,
+        extracted_conditions=extracted_conds,
+    )
+    if authoritative_dec.is_authoritative:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        cited_chunk = canonical_chunks.get(authoritative_dec.citation_chunk_id)
+        cited_meta = [build_citation_metadata(cited_chunk)] if cited_chunk else []
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer=authoritative_dec.answer,
+            status=AnswerStatus.ANSWERED.value,
+            reason=authoritative_dec.reason,
+            citations=[authoritative_dec.citation_chunk_id],
+            citation_metadata=cited_meta,
+            referenced_rule_ids=[authoritative_dec.rule_id],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+            token_usage=None,
+            schema_valid=True,
+            has_incomplete_tokens=False,
+        )
+
     # Step H: Call Groq LLM
     try:
         active_llm = llm_client or GroqClientWrapper()
     except (ValueError, SanitizedProviderError) as client_err:
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
-        safe_msg = getattr(client_err, "safe_message", str(client_err))
-        safe_msg = re.sub(r"gsk_[a-zA-Z0-9_-]+", "[REDACTED_API_KEY]", safe_msg)
+        if isinstance(client_err, SanitizedProviderError):
+            safe_msg = client_err.safe_message
+            err_cat = client_err.category
+        else:
+            safe_msg = "The generation service is unavailable due to an authentication or configuration error."
+            err_cat = "authentication_error"
         return GenerationResult(
             question=cleaned_question,
             role=role,
@@ -652,7 +710,7 @@ def answer_question(
             token_usage=None,
             schema_valid=None,
             has_incomplete_tokens=False,
-            error_category="authentication_error",
+            error_category=err_cat,
             error=safe_msg,
         )
     except Exception:

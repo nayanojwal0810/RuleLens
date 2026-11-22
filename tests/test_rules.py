@@ -375,3 +375,240 @@ def test_ambiguous_condition_marks_rule_evaluation_error(repo_root: Path):
     assert r_err.is_error is True
     assert r_err.error_type == "ambiguous_condition"
     assert "ambiguous" in r_err.explanation.lower()
+
+
+# ==============================================================================
+# 6. Comprehensive Numerical Unit Ambiguity Tests (Correction C)
+# ==============================================================================
+
+
+@pytest.mark.parametrize(
+    "query,expected_field",
+    [
+        ("Can we book flights with 14 days or 10 days advance notice?", "advance_booking_days"),
+        ("If reimbursement submission is delayed by 30 days and 45 days, what applies?", "submission_delay_days"),
+        ("Can a contract be for 12 months versus 18 months without legal signoff?", "contract_duration_months"),
+        ("Is a P1 response time of 1 hour or 2 hours compliant with SLA?", "incident_severity_p1_response_hours"),
+        ("Does home internet of 50 Mbps or 30 Mbps qualify for remote work?", "internet_speed_mbps"),
+        ("Is the project data classified as Confidential versus Restricted tier?", "data_classification_tier"),
+    ],
+)
+def test_ambiguity_detection_across_all_units(query: str, expected_field: str):
+    """Multiple distinct values for any unit (days, months, hours, mbps, tiers) trigger ambiguous status."""
+    cond_res = extract_condition_result(query)
+    assert cond_res.status == "ambiguous"
+    ambig_cond = next((c for c in cond_res.conditions if c.get("field") == expected_field), None)
+    assert ambig_cond is not None
+    assert ambig_cond.get("is_ambiguous") is True
+
+
+def test_repeated_identical_values_deduplicated():
+    """Repeated identical values for amounts or days are deduplicated and valid."""
+    # Repeated amount
+    q_amount = "Can a manager approve an expense of INR 50,000 or INR 50,000?"
+    res_amt = extract_condition_result(q_amount)
+    assert res_amt.status == "valid"
+    assert len([c for c in res_amt.conditions if c["field"] == "expense_amount"]) == 1
+    assert res_amt.conditions[0]["value"] == Decimal("50000")
+
+    # Repeated days
+    q_days = "If booked with 14 days or 14 days advance notice, is approval required?"
+    res_days = extract_condition_result(q_days)
+    assert res_days.status == "valid"
+    assert len([c for c in res_days.conditions if c["field"] == "advance_booking_days"]) == 1
+    assert res_days.conditions[0]["value"] == 14
+
+
+def test_valid_cross_document_distinct_fields_not_ambiguous():
+    """Valid cross-document questions referring to different fields must not trigger ambiguity."""
+    cross_q = "If a flight is booked 14 days in advance for an expense of INR 50,000, what approval is needed?"
+    res = extract_condition_result(cross_q)
+    assert res.status == "valid"
+    fields = {c["field"] for c in res.conditions}
+    assert "advance_booking_days" in fields
+    assert "expense_amount" in fields
+    assert not any(c.get("is_ambiguous") for c in res.conditions)
+
+
+# ==============================================================================
+# 7. Authoritative Rule Decision Tests (Correction B)
+# ==============================================================================
+
+
+from rulelens.rules import evaluate_authoritative_rule_decision
+
+
+def test_authoritative_decision_travel_v1_boundaries(repo_root: Path):
+    """INR 40,000 standard vs 40,001 additional under Travel Policy v1."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-001_TRV-C04", "doc_id": "DOC-TRV-001", "clause_id": "TRV-C04"},
+    ]
+    # 40,000 on 2026-03-15
+    q_40k = "Can a direct manager approve INR 40,000 under Travel Policy v1?"
+    conds_40k = extract_conditions_from_query(q_40k)
+    rules_40k = resolve_rules_for_evidence(mock_chunks, "manager", "2026-03-15", repo_root, conds_40k)
+    dec_40k = evaluate_authoritative_rule_decision(q_40k, mock_chunks, rules_40k, conds_40k)
+    assert dec_40k.is_authoritative is True
+    assert dec_40k.rule_id == "R-TRV-001"
+    assert dec_40k.outcome == "standard_approval"
+    assert "Standard manager approval is permitted" in dec_40k.answer
+
+    # 40,001 on 2026-03-15
+    q_40k1 = "Can a direct manager approve INR 40,001 under Travel Policy v1?"
+    conds_40k1 = extract_conditions_from_query(q_40k1)
+    rules_40k1 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-03-15", repo_root, conds_40k1)
+    dec_40k1 = evaluate_authoritative_rule_decision(q_40k1, mock_chunks, rules_40k1, conds_40k1)
+    assert dec_40k1.is_authoritative is True
+    assert dec_40k1.rule_id == "R-TRV-002"
+    assert dec_40k1.outcome == "additional_approval"
+    assert "Additional approval is required" in dec_40k1.answer
+
+
+def test_authoritative_decision_travel_v2_boundaries(repo_root: Path):
+    """INR 50,000 standard vs 50,001 additional under Travel Policy v2."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04"},
+    ]
+    # 50,000 on 2026-08-15
+    q_50k = "Can a direct manager approve an expense of INR 50,000 under Travel Policy v2?"
+    conds_50k = extract_conditions_from_query(q_50k)
+    rules_50k = resolve_rules_for_evidence(mock_chunks, "manager", "2026-08-15", repo_root, conds_50k)
+    dec_50k = evaluate_authoritative_rule_decision(q_50k, mock_chunks, rules_50k, conds_50k)
+    assert dec_50k.is_authoritative is True
+    assert dec_50k.rule_id == "R-TRV-003"
+    assert dec_50k.outcome == "standard_approval"
+
+    # 50,001 on 2026-08-15
+    q_50k1 = "Can a direct manager approve an expense of INR 50,001 under Travel Policy v2?"
+    conds_50k1 = extract_conditions_from_query(q_50k1)
+    rules_50k1 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-08-15", repo_root, conds_50k1)
+    dec_50k1 = evaluate_authoritative_rule_decision(q_50k1, mock_chunks, rules_50k1, conds_50k1)
+    assert dec_50k1.is_authoritative is True
+    assert dec_50k1.rule_id == "R-TRV-004"
+    assert dec_50k1.outcome == "additional_approval"
+    assert "Additional approval is required" in dec_50k1.answer
+
+
+def test_authoritative_decision_receipt_boundaries(repo_root: Path):
+    """INR 1,000 no receipt vs 1,001 itemized receipt required."""
+    mock_chunks = [
+        {"chunk_id": "DOC-FIN-002_FIN-R03", "doc_id": "DOC-FIN-002", "clause_id": "FIN-R03"},
+    ]
+    # 1,000
+    q_1k = "Does an incidental expense of INR 1,000 require an itemized receipt?"
+    conds_1k = extract_conditions_from_query(q_1k)
+    rules_1k = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds_1k)
+    dec_1k = evaluate_authoritative_rule_decision(q_1k, mock_chunks, rules_1k, conds_1k)
+    assert dec_1k.is_authoritative is True
+    assert dec_1k.rule_id == "R-FIN-003"
+    assert dec_1k.outcome == "no_receipt_required"
+
+    # 1,001
+    q_1k1 = "Does an incidental expense of INR 1,001 require an itemized receipt?"
+    conds_1k1 = extract_conditions_from_query(q_1k1)
+    rules_1k1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds_1k1)
+    dec_1k1 = evaluate_authoritative_rule_decision(q_1k1, mock_chunks, rules_1k1, conds_1k1)
+    assert dec_1k1.is_authoritative is True
+    assert dec_1k1.rule_id == "R-FIN-004"
+    assert dec_1k1.outcome == "itemized_receipt_required"
+
+
+def test_authoritative_decision_procurement_boundaries(repo_root: Path):
+    """INR 150,000 single quote vs 150,001 three competitive quotes."""
+    mock_chunks = [
+        {"chunk_id": "DOC-PRC-001_PRC-P02", "doc_id": "DOC-PRC-001", "clause_id": "PRC-P02"},
+    ]
+    # 150,000
+    q_150k = "Is a single quote permitted for a purchase order of INR 150,000?"
+    conds_150k = extract_conditions_from_query(q_150k)
+    rules_150k = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds_150k)
+    dec_150k = evaluate_authoritative_rule_decision(q_150k, mock_chunks, rules_150k, conds_150k)
+    assert dec_150k.is_authoritative is True
+    assert dec_150k.rule_id == "R-PRC-001"
+    assert dec_150k.outcome == "single_quote_permitted"
+
+    # 150,001
+    q_150k1 = "Is a single quote permitted for a purchase order of INR 150,001?"
+    conds_150k1 = extract_conditions_from_query(q_150k1)
+    rules_150k1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds_150k1)
+    dec_150k1 = evaluate_authoritative_rule_decision(q_150k1, mock_chunks, rules_150k1, conds_150k1)
+    assert dec_150k1.is_authoritative is True
+    assert dec_150k1.rule_id == "R-PRC-002"
+    assert dec_150k1.outcome == "three_competitive_quotes_required"
+
+
+def test_authoritative_decision_emergency_purchases(repo_root: Path):
+    """INR 300,000 director emergency approval vs 300,001 board procurement committee."""
+    mock_chunks = [
+        {"chunk_id": "DOC-PRC-004_PRC-E01", "doc_id": "DOC-PRC-004", "clause_id": "PRC-E01"},
+    ]
+    # 300,000
+    q_300k = "Can a director approve an emergency purchase of INR 300,000?"
+    conds_300k = extract_conditions_from_query(q_300k)
+    rules_300k = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds_300k)
+    dec_300k = evaluate_authoritative_rule_decision(q_300k, mock_chunks, rules_300k, conds_300k)
+    assert dec_300k.is_authoritative is True
+    assert dec_300k.rule_id == "R-PRC-005"
+    assert dec_300k.outcome == "director_emergency_approval"
+
+    # 300,001
+    q_300k1 = "Can a director approve an emergency purchase of INR 300,001?"
+    conds_300k1 = extract_conditions_from_query(q_300k1)
+    rules_300k1 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds_300k1)
+    dec_300k1 = evaluate_authoritative_rule_decision(q_300k1, mock_chunks, rules_300k1, conds_300k1)
+    assert dec_300k1.is_authoritative is True
+    assert dec_300k1.rule_id == "R-PRC-006"
+    assert dec_300k1.outcome == "board_procurement_committee"
+
+
+def test_authoritative_decision_non_currency_boundaries(repo_root: Path):
+    """Non-currency boundaries: 14 days booking, 90 days review, 1 hour incident response."""
+    # 14 days advance booking
+    mock_trv_b02 = [{"chunk_id": "DOC-TRV-003_TRV-B02", "doc_id": "DOC-TRV-003", "clause_id": "TRV-B02"}]
+    q_14d = "Is 14 days advance notice sufficient for standard flight booking?"
+    conds_14d = extract_conditions_from_query(q_14d)
+    rules_14d = resolve_rules_for_evidence(mock_trv_b02, "employee", "2026-11-22", repo_root, conds_14d)
+    dec_14d = evaluate_authoritative_rule_decision(q_14d, mock_trv_b02, rules_14d, conds_14d)
+    assert dec_14d.is_authoritative is True
+    assert dec_14d.rule_id == "R-TRV-005"
+    assert dec_14d.outcome == "standard_booking"
+
+    # 90 days recertification
+    mock_sec_a02 = [{"chunk_id": "DOC-SEC-002_SEC-A02", "doc_id": "DOC-SEC-002", "clause_id": "SEC-A02"}]
+    q_90d = "Is an access review interval of 90 days compliant before automatic suspension?"
+    conds_90d = extract_conditions_from_query(q_90d)
+    rules_90d = resolve_rules_for_evidence(mock_sec_a02, "manager", "2026-11-22", repo_root, conds_90d)
+    dec_90d = evaluate_authoritative_rule_decision(q_90d, mock_sec_a02, rules_90d, conds_90d)
+    assert dec_90d.is_authoritative is True
+    assert dec_90d.rule_id == "R-SEC-003"
+    assert dec_90d.outcome == "access_recertification_compliant"
+
+    # 1 hour incident response
+    mock_sec_i02 = [{"chunk_id": "DOC-SEC-003_SEC-I02", "doc_id": "DOC-SEC-003", "clause_id": "SEC-I02"}]
+    q_1h = "Does a 1 hour response time meet the SLA for a Priority 1 incident?"
+    conds_1h = extract_conditions_from_query(q_1h)
+    rules_1h = resolve_rules_for_evidence(mock_sec_i02, "employee", "2026-11-22", repo_root, conds_1h)
+    dec_1h = evaluate_authoritative_rule_decision(q_1h, mock_sec_i02, rules_1h, conds_1h)
+    assert dec_1h.is_authoritative is True
+    assert dec_1h.rule_id == "R-SEC-005"
+    assert dec_1h.outcome == "sla_met"
+
+
+def test_threshold_definition_and_multidoc_questions_bypass_authoritative_decision(repo_root: Path):
+    """Threshold definition and multi-document questions must NOT trigger authoritative decision."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04"},
+    ]
+    # Threshold definition (no condition value)
+    thresh_q = "What is the maximum reimbursement threshold under Travel Policy v2?"
+    conds_th = extract_conditions_from_query(thresh_q)
+    rules_th = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds_th)
+    dec_th = evaluate_authoritative_rule_decision(thresh_q, mock_chunks, rules_th, conds_th)
+    assert dec_th.is_authoritative is False
+
+    # Multi-document question
+    multi_q = "What deployment restriction applies to developers, and within what timeframe must a report be published?"
+    conds_m = extract_conditions_from_query(multi_q)
+    rules_m = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds_m)
+    dec_m = evaluate_authoritative_rule_decision(multi_q, mock_chunks, rules_m, conds_m)
+    assert dec_m.is_authoritative is False

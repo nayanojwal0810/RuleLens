@@ -133,26 +133,40 @@ def validate_evaluation_dataset(
     if version != "1.0":
         raise ValueError(f"Invalid schema_version '{version}'. Expected '1.0'.")
 
-    # 2. Corpus fingerprint
+    # 2. Corpus fingerprint and manifest validation
     corpus_fp = data.get("corpus_fingerprint")
     if not corpus_fp or not isinstance(corpus_fp, str) or not corpus_fp.strip():
         raise ValueError("Missing or empty corpus_fingerprint in dataset.")
 
     manifest_path = root_dir / "data" / "processed" / "corpus_manifest.json"
-    expected_doc_ids: Set[str] = set()
-    if manifest_path.is_file():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            expected_fp = manifest.get("processed_fingerprint")
-            if corpus_fp != expected_fp:
-                raise ValueError(
-                    f"Dataset corpus_fingerprint '{corpus_fp}' does not match processed corpus fingerprint '{expected_fp}'."
-                )
-            expected_doc_ids = {doc["doc_id"] for doc in manifest.get("documents", [])}
-        except Exception as e:
-            if "does not match" in str(e):
-                raise
-            pass
+    if not manifest_path.is_file():
+        raise ValueError(f"Corpus manifest file does not exist: {manifest_path}")
+
+    try:
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ValueError(f"Failed to read corpus manifest file at {manifest_path}") from exc
+
+    try:
+        manifest = json.loads(manifest_text)
+    except Exception as exc:
+        raise ValueError(f"Corpus manifest is not valid JSON: {exc}") from exc
+
+    if not isinstance(manifest, dict):
+        raise ValueError("Corpus manifest must be a JSON object.")
+
+    expected_fp = manifest.get("processed_fingerprint")
+    if not expected_fp or not isinstance(expected_fp, str) or not expected_fp.strip():
+        raise ValueError("Corpus manifest is missing required 'processed_fingerprint' field.")
+
+    for req_field in ("chunk_count", "document_count"):
+        if req_field not in manifest:
+            raise ValueError(f"Corpus manifest is missing required '{req_field}' field.")
+
+    if corpus_fp != expected_fp:
+        raise ValueError(
+            f"Dataset corpus_fingerprint '{corpus_fp}' does not match processed corpus fingerprint '{expected_fp}'."
+        )
 
     # 3. Questions array
     questions = data.get("questions")
@@ -164,8 +178,7 @@ def validate_evaluation_dataset(
     # Load corpus to validate chunk IDs, permissions, and effective dates
     corpus_chunks = load_validated_corpus(root_dir)
     chunks_by_id = {c["chunk_id"]: c for c in corpus_chunks}
-    if not expected_doc_ids:
-        expected_doc_ids = {c["doc_id"] for c in corpus_chunks}
+    expected_doc_ids = {c["doc_id"] for c in corpus_chunks}
 
     valid_roles_set = set(ROLES)
     valid_departments_set = set(DEPARTMENTS)
@@ -667,48 +680,95 @@ def evaluate_retriever_method(
     diff_summary = {}
     for d_name, d_data in by_diff.items():
         cnt = len(d_data["hits"])
-        diff_summary[d_name] = {
+        h_val = round(float(sum(d_data["hits"]) / cnt), 4) if cnt else 0.0
+        r_val = round(float(sum(d_data["recalls"]) / cnt), 4) if cnt else 0.0
+        m_val = round(float(sum(d_data["mrrs"]) / cnt), 4) if cnt else 0.0
+        fe_val = round(float(sum(d_data["full_evidences"]) / cnt), 4) if cnt else 0.0
+        d_entry = {
             "count": cnt,
-            "hit_at_5": round(float(sum(d_data["hits"]) / cnt), 4) if cnt else 0.0,
-            "recall_at_5": round(float(sum(d_data["recalls"]) / cnt), 4) if cnt else 0.0,
-            "mrr_at_5": round(float(sum(d_data["mrrs"]) / cnt), 4) if cnt else 0.0,
-            "full_evidence_at_5": round(float(sum(d_data["full_evidences"]) / cnt), 4) if cnt else 0.0,
+            "hit_at_k": h_val,
+            "recall_at_k": r_val,
+            "mrr_at_k": m_val,
+            "full_evidence_at_k": fe_val,
+            f"hit_at_{top_k}": h_val,
+            f"recall_at_{top_k}": r_val,
+            f"mrr_at_{top_k}": m_val,
+            f"full_evidence_at_{top_k}": fe_val,
         }
+        if top_k == 5:
+            d_entry["hit_at_5"] = h_val
+            d_entry["recall_at_5"] = r_val
+            d_entry["mrr_at_5"] = m_val
+            d_entry["full_evidence_at_5"] = fe_val
+        diff_summary[d_name] = d_entry
 
     # Aggregate breakdown by department
     dept_summary = {}
     for dep_name, dep_data in by_dept.items():
         cnt = len(dep_data["hits"])
-        dept_summary[dep_name] = {
+        h_val = round(float(sum(dep_data["hits"]) / cnt), 4) if cnt else 0.0
+        r_val = round(float(sum(dep_data["recalls"]) / cnt), 4) if cnt else 0.0
+        m_val = round(float(sum(dep_data["mrrs"]) / cnt), 4) if cnt else 0.0
+        fe_val = round(float(sum(dep_data["full_evidences"]) / cnt), 4) if cnt else 0.0
+        dep_entry = {
             "count": cnt,
-            "hit_at_5": round(float(sum(dep_data["hits"]) / cnt), 4) if cnt else 0.0,
-            "recall_at_5": round(float(sum(dep_data["recalls"]) / cnt), 4) if cnt else 0.0,
-            "mrr_at_5": round(float(sum(dep_data["mrrs"]) / cnt), 4) if cnt else 0.0,
-            "full_evidence_at_5": round(float(sum(dep_data["full_evidences"]) / cnt), 4) if cnt else 0.0,
+            "hit_at_k": h_val,
+            "recall_at_k": r_val,
+            "mrr_at_k": m_val,
+            "full_evidence_at_k": fe_val,
+            f"hit_at_{top_k}": h_val,
+            f"recall_at_{top_k}": r_val,
+            f"mrr_at_{top_k}": m_val,
+            f"full_evidence_at_{top_k}": fe_val,
         }
+        if top_k == 5:
+            dep_entry["hit_at_5"] = h_val
+            dep_entry["recall_at_5"] = r_val
+            dep_entry["mrr_at_5"] = m_val
+            dep_entry["full_evidence_at_5"] = fe_val
+        dept_summary[dep_name] = dep_entry
 
     # Aggregate breakdown by question type
     qtype_summary = {}
     for qt_name, qt_data in sorted(by_qtype.items()):
         cnt = len(qt_data["hits"])
-        qtype_summary[qt_name] = {
+        h_val = round(float(sum(qt_data["hits"]) / cnt), 4) if cnt else 0.0
+        r_val = round(float(sum(qt_data["recalls"]) / cnt), 4) if cnt else 0.0
+        m_val = round(float(sum(qt_data["mrrs"]) / cnt), 4) if cnt else 0.0
+        fe_val = round(float(sum(qt_data["full_evidences"]) / cnt), 4) if cnt else 0.0
+        qt_entry = {
             "count": cnt,
-            "hit_at_5": round(float(sum(qt_data["hits"]) / cnt), 4) if cnt else 0.0,
-            "recall_at_5": round(float(sum(qt_data["recalls"]) / cnt), 4) if cnt else 0.0,
-            "mrr_at_5": round(float(sum(qt_data["mrrs"]) / cnt), 4) if cnt else 0.0,
-            "full_evidence_at_5": round(float(sum(qt_data["full_evidences"]) / cnt), 4) if cnt else 0.0,
+            "hit_at_k": h_val,
+            "recall_at_k": r_val,
+            "mrr_at_k": m_val,
+            "full_evidence_at_k": fe_val,
+            f"hit_at_{top_k}": h_val,
+            f"recall_at_{top_k}": r_val,
+            f"mrr_at_{top_k}": m_val,
+            f"full_evidence_at_{top_k}": fe_val,
         }
+        if top_k == 5:
+            qt_entry["hit_at_5"] = h_val
+            qt_entry["recall_at_5"] = r_val
+            qt_entry["mrr_at_5"] = m_val
+            qt_entry["full_evidence_at_5"] = fe_val
+        qtype_summary[qt_name] = qt_entry
 
-    return {
+    res_dict = {
         "mode": mode,
         "dense_backend": dense_backend,
+        "cutoff": top_k,
         "total_questions_evaluated": len(questions),
         "total_answerable_questions": answerable_count,
         "total_diagnostic_questions": len(diagnostic_results),
-        "hit_at_5": round(avg_hit, 4),
-        "recall_at_5": round(avg_recall, 4),
-        "mrr_at_5": round(avg_mrr, 4),
-        "full_evidence_at_5": round(avg_full_ev, 4),
+        "hit_at_k": round(avg_hit, 4),
+        "recall_at_k": round(avg_recall, 4),
+        "mrr_at_k": round(avg_mrr, 4),
+        "full_evidence_at_k": round(avg_full_ev, 4),
+        f"hit_at_{top_k}": round(avg_hit, 4),
+        f"recall_at_{top_k}": round(avg_recall, 4),
+        f"mrr_at_{top_k}": round(avg_mrr, 4),
+        f"full_evidence_at_{top_k}": round(avg_full_ev, 4),
         "complete_evidence_count": sum(1 for fe in full_evidences if fe == 1.0),
         "rank_one_hits_count": sum(1 for m in mrrs if m == 1.0),
         "median_latency_ms": round(median_lat, 2),
@@ -727,6 +787,13 @@ def evaluate_retriever_method(
         "diagnostic_results": diagnostic_results,
         "per_question_details": per_question_details,
     }
+    if top_k == 5:
+        res_dict["hit_at_5"] = round(avg_hit, 4)
+        res_dict["recall_at_5"] = round(avg_recall, 4)
+        res_dict["mrr_at_5"] = round(avg_mrr, 4)
+        res_dict["full_evidence_at_5"] = round(avg_full_ev, 4)
+
+    return res_dict
 
 
 def generate_summary_markdown(
@@ -738,6 +805,10 @@ def generate_summary_markdown(
     meta = metadata or {}
     ts = meta.get("timestamp", datetime.datetime.now(datetime.timezone.utc).isoformat())
     backend = meta.get("dense_backend", "local")
+    cutoff_k = meta.get("top_k") or next(
+        (res.get("cutoff") for res in eval_results.values() if isinstance(res, dict) and "cutoff" in res),
+        5,
+    )
 
     ans_q = [q for q in questions if q.get("answerability", True)]
     diag_restr = [q for q in questions if not q.get("answerability", True) and q.get("restricted_target_chunk_ids")]
@@ -761,18 +832,18 @@ def generate_summary_markdown(
         "- **Department Balance**: Exactly 10 questions per department across all 5 departments",
         f"- **Dense Backend**: `{backend}` (BGE-small-en-v1.5, 384-dimensional cosine)",
         "- **Retrieval Modes Evaluated**: BM25 Lexical, BGE Dense, Hybrid (BM25 + BGE via RRF with k=60)",
-        "- **Candidate Depth & Cutoff**: Candidate depth 20, evaluation cutoff top-5\n",
+        f"- **Candidate Depth & Cutoff**: Candidate depth 20, evaluation cutoff top-{cutoff_k}\n",
         "## 2. Quantitative Performance Comparison\n",
-        "| Retrieval Method | Recall@5 | Hit@5 | MRR@5 | FullEvidence@5 | Median Latency (ms) | P95 Latency (ms) | Role Violations | Version Violations |",
+        f"| Retrieval Method | Recall@{cutoff_k} | Hit@{cutoff_k} | MRR@{cutoff_k} | FullEvidence@{cutoff_k} | Median Latency (ms) | P95 Latency (ms) | Role Violations | Version Violations |",
         "|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
 
     for mode in ("bm25", "dense", "hybrid"):
         res = eval_results.get(mode, {})
-        rec = f"{res.get('recall_at_5', 0.0):.4f}"
-        hit = f"{res.get('hit_at_5', 0.0):.4f}"
-        mrr = f"{res.get('mrr_at_5', 0.0):.4f}"
-        fe = f"{res.get('full_evidence_at_5', 0.0):.4f}"
+        rec = f"{res.get(f'recall_at_{cutoff_k}', res.get('recall_at_k', res.get('recall_at_5', 0.0))):.4f}"
+        hit = f"{res.get(f'hit_at_{cutoff_k}', res.get('hit_at_k', res.get('hit_at_5', 0.0))):.4f}"
+        mrr = f"{res.get(f'mrr_at_{cutoff_k}', res.get('mrr_at_k', res.get('mrr_at_5', 0.0))):.4f}"
+        fe = f"{res.get(f'full_evidence_at_{cutoff_k}', res.get('full_evidence_at_k', res.get('full_evidence_at_5', 0.0))):.4f}"
         med = f"{res.get('median_latency_ms', 0.0):.2f}"
         p95 = f"{res.get('p95_latency_ms', 0.0):.2f}"
         pv = res.get("permission_violations", 0)
@@ -787,7 +858,7 @@ def generate_summary_markdown(
     md.extend([
         f"\n> **Security & Version Verification**: Across all evaluated modes, exactly {total_pv} role violations and {total_vv} version violations occurred, confirming strict deterministic pre-filtering.",
         "\n## 3. Breakdown by Question Difficulty\n",
-        "| Difficulty | Mode | Hit@5 | Recall@5 | MRR@5 | FullEvidence@5 | Question Count |",
+        f"| Difficulty | Mode | Hit@{cutoff_k} | Recall@{cutoff_k} | MRR@{cutoff_k} | FullEvidence@{cutoff_k} | Question Count |",
         "|---|---|:---:|:---:|:---:|:---:|:---:|",
     ])
 
@@ -795,16 +866,16 @@ def generate_summary_markdown(
         for mode in ("bm25", "dense", "hybrid"):
             res = eval_results.get(mode, {})
             diff_data = res.get("by_difficulty", {}).get(diff, {})
-            h = f"{diff_data.get('hit_at_5', 0.0):.4f}"
-            r = f"{diff_data.get('recall_at_5', 0.0):.4f}"
-            m = f"{diff_data.get('mrr_at_5', 0.0):.4f}"
-            fe = f"{diff_data.get('full_evidence_at_5', 0.0):.4f}"
+            h = f"{diff_data.get(f'hit_at_{cutoff_k}', diff_data.get('hit_at_k', diff_data.get('hit_at_5', 0.0))):.4f}"
+            r = f"{diff_data.get(f'recall_at_{cutoff_k}', diff_data.get('recall_at_k', diff_data.get('recall_at_5', 0.0))):.4f}"
+            m = f"{diff_data.get(f'mrr_at_{cutoff_k}', diff_data.get('mrr_at_k', diff_data.get('mrr_at_5', 0.0))):.4f}"
+            fe = f"{diff_data.get(f'full_evidence_at_{cutoff_k}', diff_data.get('full_evidence_at_k', diff_data.get('full_evidence_at_5', 0.0))):.4f}"
             c = diff_data.get("count", 0)
             md.append(f"| {diff.capitalize()} | {mode.upper()} | {h} | {r} | {m} | {fe} | {c} |")
 
     md.extend([
         "\n## 4. Breakdown by Department\n",
-        "| Department | BM25 Recall@5 | BGE Dense Recall@5 | Hybrid Recall@5 | Hybrid MRR@5 | Hybrid FullEvidence@5 | Answerable Qs |",
+        f"| Department | BM25 Recall@{cutoff_k} | BGE Dense Recall@{cutoff_k} | Hybrid Recall@{cutoff_k} | Hybrid MRR@{cutoff_k} | Hybrid FullEvidence@{cutoff_k} | Answerable Qs |",
         "|---|:---:|:---:|:---:|:---:|:---:|:---:|",
     ])
 
@@ -812,18 +883,18 @@ def generate_summary_markdown(
         bm25_d = eval_results.get("bm25", {}).get("by_department", {}).get(d, {})
         dense_d = eval_results.get("dense", {}).get("by_department", {}).get(d, {})
         hybrid_d = eval_results.get("hybrid", {}).get("by_department", {}).get(d, {})
-        b_rec = f"{bm25_d.get('recall_at_5', 0.0):.4f}"
-        d_rec = f"{dense_d.get('recall_at_5', 0.0):.4f}"
-        h_rec = f"{hybrid_d.get('recall_at_5', 0.0):.4f}"
-        h_mrr = f"{hybrid_d.get('mrr_at_5', 0.0):.4f}"
-        h_fe = f"{hybrid_d.get('full_evidence_at_5', 0.0):.4f}"
+        b_rec = f"{bm25_d.get(f'recall_at_{cutoff_k}', bm25_d.get('recall_at_k', bm25_d.get('recall_at_5', 0.0))):.4f}"
+        d_rec = f"{dense_d.get(f'recall_at_{cutoff_k}', dense_d.get('recall_at_k', dense_d.get('recall_at_5', 0.0))):.4f}"
+        h_rec = f"{hybrid_d.get(f'recall_at_{cutoff_k}', hybrid_d.get('recall_at_k', hybrid_d.get('recall_at_5', 0.0))):.4f}"
+        h_mrr = f"{hybrid_d.get(f'mrr_at_{cutoff_k}', hybrid_d.get('mrr_at_k', hybrid_d.get('mrr_at_5', 0.0))):.4f}"
+        h_fe = f"{hybrid_d.get(f'full_evidence_at_{cutoff_k}', hybrid_d.get('full_evidence_at_k', hybrid_d.get('full_evidence_at_5', 0.0))):.4f}"
         cnt = hybrid_d.get("count", 0)
         md.append(f"| {d} | {b_rec} | {d_rec} | {h_rec} | {h_mrr} | {h_fe} | {cnt} |")
 
     # Question Type Breakdown
     md.extend([
         "\n## 5. Breakdown by Question Type\n",
-        "| Question Type | Count | BM25 Recall@5 | Dense Recall@5 | Hybrid Recall@5 | Hybrid MRR@5 | Hybrid FullEvidence@5 |",
+        f"| Question Type | Count | BM25 Recall@{cutoff_k} | Dense Recall@{cutoff_k} | Hybrid Recall@{cutoff_k} | Hybrid MRR@{cutoff_k} | Hybrid FullEvidence@{cutoff_k} |",
         "|---|:---:|:---:|:---:|:---:|:---:|:---:|",
     ])
 
@@ -833,11 +904,11 @@ def generate_summary_markdown(
         d_qt = eval_results.get("dense", {}).get("by_question_type", {}).get(qt, {})
         h_qt = hybrid_qtypes.get(qt, {})
         cnt = h_qt.get("count", 0)
-        b_rec = f"{b_qt.get('recall_at_5', 0.0):.4f}"
-        d_rec = f"{d_qt.get('recall_at_5', 0.0):.4f}"
-        h_rec = f"{h_qt.get('recall_at_5', 0.0):.4f}"
-        h_mrr = f"{h_qt.get('mrr_at_5', 0.0):.4f}"
-        h_fe = f"{h_qt.get('full_evidence_at_5', 0.0):.4f}"
+        b_rec = f"{b_qt.get(f'recall_at_{cutoff_k}', b_qt.get('recall_at_k', b_qt.get('recall_at_5', 0.0))):.4f}"
+        d_rec = f"{d_qt.get(f'recall_at_{cutoff_k}', d_qt.get('recall_at_k', d_qt.get('recall_at_5', 0.0))):.4f}"
+        h_rec = f"{h_qt.get(f'recall_at_{cutoff_k}', h_qt.get('recall_at_k', h_qt.get('recall_at_5', 0.0))):.4f}"
+        h_mrr = f"{h_qt.get(f'mrr_at_{cutoff_k}', h_qt.get('mrr_at_k', h_qt.get('mrr_at_5', 0.0))):.4f}"
+        h_fe = f"{h_qt.get(f'full_evidence_at_{cutoff_k}', h_qt.get('full_evidence_at_k', h_qt.get('full_evidence_at_5', 0.0))):.4f}"
         md.append(f"| `{qt}` | {cnt} | {b_rec} | {d_rec} | {h_rec} | {h_mrr} | {h_fe} |")
 
     # Diagnostic question performance
@@ -878,7 +949,7 @@ def generate_summary_markdown(
     # Check for actual complete misses in any mode
     total_complete_misses = sum(len(eval_results.get(m, {}).get("misses", [])) for m in ("bm25", "dense", "hybrid"))
     if total_complete_misses > 0:
-        md.append("### Complete Misses (Hit@5 = 0.0)")
+        md.append(f"### Complete Misses (Hit@{cutoff_k} = 0.0)")
         for mode in ("bm25", "dense", "hybrid"):
             mode_misses = eval_results.get(mode, {}).get("misses", [])
             if mode_misses:
@@ -889,20 +960,28 @@ def generate_summary_markdown(
                     md.append(f"  - Expected Gold: `{m['expected_gold_chunk_ids']}`")
                     md.append(f"  - Actual Retrieved: `{m['actual_top_k_chunk_ids']}`")
     else:
-        md.append("Across all three retrieval modes, **Hit@5 achieved 1.000** on all 40 answerable questions (every answerable query retrieved at least one gold chunk in its top-5 candidates).\n")
+        hybrid_hit_val = eval_results.get("hybrid", {}).get(f"hit_at_{cutoff_k}", eval_results.get("hybrid", {}).get("hit_at_k", 0.0))
+        all_perfect = all(
+            eval_results.get(m, {}).get(f"hit_at_{cutoff_k}", eval_results.get(m, {}).get("hit_at_k", 0.0)) == 1.0
+            for m in ("bm25", "dense", "hybrid") if m in eval_results
+        )
+        if all_perfect:
+            md.append(f"Across all three retrieval modes, **Hit@{cutoff_k} achieved 1.000** on all {len(ans_q)} answerable questions (every answerable query retrieved at least one gold chunk in its top candidates).\n")
+        else:
+            md.append(f"Across evaluated retrieval modes, Hybrid Hit@{cutoff_k} was {hybrid_hit_val:.4f} on answerable questions.\n")
 
     # Partial evidence misses
     hybrid_partial = eval_results.get("hybrid", {}).get("partial_evidence_misses", [])
     if hybrid_partial:
-        md.append(f"### Hybrid Partial Evidence Misses ({len(hybrid_partial)} questions where 0 < Recall@5 < 1.0)")
+        md.append(f"### Hybrid Partial Evidence Misses ({len(hybrid_partial)} questions where 0 < Recall@{cutoff_k} < 1.0)")
         for pm in hybrid_partial:
-            md.append(f"- **{pm['question_id']}** ({pm['department']} - Recall@5: {pm['recall']}): \"{pm['question']}\"")
+            md.append(f"- **{pm['question_id']}** ({pm['department']} - Recall@{cutoff_k}: {pm['recall']}): \"{pm['question']}\"")
             md.append(f"  - Expected Gold: `{pm['expected_gold_chunk_ids']}`")
             md.append(f"  - Retrieved Gold: `{pm['retrieved_gold_ids']}` | Missing: `{pm['missing_gold_ids']}`")
     else:
         hybrid_fe_count = eval_results.get("hybrid", {}).get("complete_evidence_count", 0)
         hybrid_ans_count = eval_results.get("hybrid", {}).get("total_answerable_questions", 0)
-        md.append(f"No partial evidence misses recorded for Hybrid retrieval ({hybrid_fe_count}/{hybrid_ans_count} answerable questions retrieved 100% of gold clauses in top-5).\n")
+        md.append(f"No partial evidence misses recorded for Hybrid retrieval ({hybrid_fe_count}/{hybrid_ans_count} answerable questions retrieved 100% of gold clauses in top-{cutoff_k}).\n")
 
     # Dynamic Sub-Optimal Ranking comparisons (BM25 vs Dense trade-offs)
     md.append("\n### Architectural Case Studies: BM25 vs Dense vs Hybrid Dynamics\n")
@@ -928,8 +1007,8 @@ def generate_summary_markdown(
                 f"- **Question**: \"{info['question']}\"",
                 f"- **Department**: {info['department']} | **Role**: `{info['role']}` | **Date**: `{info['query_date']}`",
                 f"- **Expected Gold**: `{info['expected_gold_chunk_ids']}`",
-                f"- **BM25 Top-5**: `{info['actual_top_k_chunk_ids']}`",
-                f"- **Dense Top-5**: `{dense_cids}`",
+                f"- **BM25 Top-{cutoff_k}**: `{info['actual_top_k_chunk_ids']}`",
+                f"- **Dense Top-{cutoff_k}**: `{dense_cids}`",
                 f"- **Observed Dynamics**: Dense semantic retrieval ranked gold chunk at position {dense_rank}, whereas BM25 placed it at rank {info['first_gold_rank']}.",
                 "",
             ])
@@ -947,8 +1026,8 @@ def generate_summary_markdown(
                 f"- **Question**: \"{info['question']}\"",
                 f"- **Department**: {info['department']} | **Role**: `{info['role']}` | **Date**: `{info['query_date']}`",
                 f"- **Expected Gold**: `{info['expected_gold_chunk_ids']}`",
-                f"- **BM25 Top-5**: `{bm25_cids}`",
-                f"- **Dense Top-5**: `{info['actual_top_k_chunk_ids']}`",
+                f"- **BM25 Top-{cutoff_k}**: `{bm25_cids}`",
+                f"- **Dense Top-{cutoff_k}**: `{info['actual_top_k_chunk_ids']}`",
                 f"- **Observed Dynamics**: BM25 lexical retrieval placed gold chunk at position {bm25_rank}, whereas Dense semantic retrieval placed it at rank {info['first_gold_rank']}.",
                 "",
             ])
@@ -1085,9 +1164,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             eval_results[mode] = res
             print(
-                f"  [{mode.upper()}] Recall@5: {res['recall_at_5']:.4f} | "
-                f"Hit@5: {res['hit_at_5']:.4f} | "
-                f"MRR@5: {res['mrr_at_5']:.4f} | "
+                f"  [{mode.upper()}] Recall@{args.top_k}: {res.get(f'recall_at_{args.top_k}', res.get('recall_at_k', res.get('recall_at_5', 0.0))):.4f} | "
+                f"Hit@{args.top_k}: {res.get(f'hit_at_{args.top_k}', res.get('hit_at_k', res.get('hit_at_5', 0.0))):.4f} | "
+                f"MRR@{args.top_k}: {res.get(f'mrr_at_{args.top_k}', res.get('mrr_at_k', res.get('mrr_at_5', 0.0))):.4f} | "
                 f"Median Lat: {res['median_latency_ms']:.2f}ms"
             )
 

@@ -634,3 +634,307 @@ def test_missing_credentials_and_rule_loading_errors_return_sanitized(mock_retri
         assert "/var/secrets" not in str(res_rule.error)
         assert "/var/secrets" not in str(res_rule.answer)
         assert res_rule.provider_calls_attempted == 0
+
+
+# ==============================================================================
+# 4. Correction A: Restricted Topic Detection (SEC-009) & Diagnostic Coverage
+# ==============================================================================
+
+
+def test_sec_009_restricted_topic_detection_across_roles(canonical_corpus, canonical_chunks_by_id):
+    """SEC-009 (storage drive sanitization) returns restricted for finance and employee, but permits security and auditor."""
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.search.return_value = []
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "What standards and physical methods must be used when sanitizing decommissioned storage drives before disposal?"
+
+    # Role: finance (unauthorized -> restricted)
+    res_fin = answer_question(
+        question=q,
+        role="finance",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=mock_llm,
+    )
+    assert res_fin.status == "restricted"
+    assert res_fin.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+    # Role: employee (unauthorized -> restricted)
+    res_emp = answer_question(
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=mock_llm,
+    )
+    assert res_emp.status == "restricted"
+    assert res_emp.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+    # Role: security (authorized -> not restricted, proceeds to retrieval)
+    res_sec = answer_question(
+        question=q,
+        role="security",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=mock_llm,
+    )
+    assert res_sec.status != "restricted"
+
+    # Role: auditor (authorized -> not restricted, proceeds to retrieval)
+    res_aud = answer_question(
+        question=q,
+        role="auditor",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=mock_llm,
+    )
+    assert res_aud.status != "restricted"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What standards and physical methods must be used when sanitizing decommissioned storage drives before disposal?",
+        "Sanitizing decommissioned storage drives.",
+        "Secure disposal of retired storage media.",
+        "Drive sanitization.",
+        "Disk wiping before disposal.",
+        "Secure erasure of decommissioned disks.",
+    ],
+)
+def test_drive_sanitization_paraphrases_detected_as_restricted(canonical_corpus, canonical_chunks_by_id, query: str):
+    """Multiple paraphrases of drive sanitization are recognized and refused as restricted for unauthorized roles."""
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+
+    res = answer_question(
+        question=query,
+        role="finance",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=MagicMock(),
+    )
+    assert res.status == "restricted"
+    assert res.provider_calls_attempted == 0
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What is the company storage policy?",
+        "How is data storage managed across teams?",
+        "General corporate policy overview.",
+    ],
+)
+def test_generic_terms_do_not_trigger_restrictions(canonical_corpus, canonical_chunks_by_id, query: str):
+    """Generic terms like 'storage', 'data', or 'policy' alone do not trigger restricted classification."""
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.search.return_value = []
+
+    res = answer_question(
+        question=query,
+        role="finance",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=MagicMock(),
+    )
+    assert res.status != "restricted"
+
+
+def test_all_five_restricted_diagnostics_refuse_correctly(canonical_corpus, canonical_chunks_by_id):
+    """All 5 restricted diagnostic queries from dev_questions.json produce status 'restricted'."""
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    cases = [
+        # TRV-009: Travel Exceptions Policy (role: employee)
+        ("What executive approval route is required when extraordinary travel exception expenses exceed INR 100,000 under the travel exceptions policy?", "employee", "2026-11-22"),
+        # FIN-009: Corporate Cards Policy (role: employee)
+        ("Who is eligible to be issued an Asterline corporate credit card, and what approval is required for card limit escalation?", "employee", "2026-11-22"),
+        # PPO-009: Employee Transfers Policy (role: auditor)
+        ("What minimum tenure and performance criteria are required for an employee to apply for an internal transfer under the employee transfer policy?", "auditor", "2026-11-22"),
+        # PRC-009: Vendor Onboarding Policy (role: employee)
+        ("What supplier code of conduct must onboarded vendors sign affirming compliance with anti-bribery and fair labor regulations?", "employee", "2026-11-22"),
+        # SEC-009: Storage Media Sanitization / Data Retention (role: finance)
+        ("What standards and physical methods must be used when sanitizing decommissioned storage drives before disposal?", "finance", "2026-11-22"),
+    ]
+
+    for q, role, dt in cases:
+        res = answer_question(
+            question=q,
+            role=role,
+            query_date=dt,
+            retriever=retriever,
+            llm_client=mock_llm,
+        )
+        assert res.status == "restricted", f"Expected restricted for query: {q} with role {role}"
+        assert res.provider_calls_attempted == 0
+        mock_llm.generate_answer.assert_not_called()
+
+
+def test_all_five_unsupported_diagnostics_refuse_as_insufficient(canonical_corpus, canonical_chunks_by_id):
+    """All 5 unsupported diagnostic queries produce safe status 'insufficient' without hallucinations."""
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.search.return_value = []
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    cases = [
+        ("Can employees expense personal spa treatments during business trips?", "employee", "2026-11-22"),
+        ("What is the reimbursement limit for purchasing luxury watches?", "employee", "2026-11-22"),
+        ("Can employees bring their personal pets to work every day?", "employee", "2026-11-22"),
+        ("Can departments procure jet planes without procurement committee approval?", "employee", "2026-11-22"),
+        ("Can employees connect personal smart-home IoT lightbulbs and voice assistants to the corporate internal corporate network?", "employee", "2026-11-22"),
+    ]
+
+    for q, role, dt in cases:
+        res = answer_question(
+            question=q,
+            role=role,
+            query_date=dt,
+            retriever=retriever,
+            llm_client=mock_llm,
+        )
+        assert res.status == "insufficient", f"Expected insufficient for query: {q}"
+        assert res.citations == []
+        mock_llm.generate_answer.assert_not_called()
+
+
+# ==============================================================================
+# 5. Correction B: Authoritative Rule Decision Precedence (Adversarial Groq Test)
+# ==============================================================================
+
+
+def test_adversarial_wrong_groq_approval_cannot_override_rule_decision(mock_retriever, canonical_chunks_by_id):
+    """An intentionally wrong mocked Groq approval cannot override an authoritative rule decision."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"],
+        text=c["text"],
+        doc_id=c["doc_id"],
+        clause_id=c["clause_id"],
+        title=c["title"],
+        department=c["department"],
+        version=c["version"],
+        source_file=c["source_file"],
+        source_page=int(c["source_page"]),
+        effective_from=c["effective_from"],
+        effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+
+    # Adversarial mock LLM that would falsely claim manager can approve INR 50,001
+    adversarial_llm = MagicMock(spec=GroqClientWrapper)
+    adversarial_llm.generate_answer.return_value = (
+        AnswerResponse(
+            answer="Yes, your direct manager has full authority to approve INR 50,001 without escalation.",
+            status=AnswerStatus.ANSWERED,
+            citations=["DOC-TRV-002_TRV-C04"],
+            referenced_rule_ids=["R-TRV-004"],
+            reason="Adversarial false approval.",
+        ),
+        {"total_tokens": 100},
+    )
+
+    q = "Can a direct manager approve an expense of INR 50,001 under Travel Policy v2?"
+    res = answer_question(
+        question=q,
+        role="manager",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=adversarial_llm,
+    )
+
+    # Must be answered deterministically using authoritative rule R-TRV-004
+    assert res.status == "answered"
+    assert "Additional approval is required" in res.answer
+    assert "not sufficient" in res.answer
+    assert res.citations == ["DOC-TRV-002_TRV-C04"]
+    assert res.referenced_rule_ids == ["R-TRV-004"]
+    assert res.provider_calls_attempted == 0
+    # Groq was bypassed completely!
+    adversarial_llm.generate_answer.assert_not_called()
+
+
+# ==============================================================================
+# 6. Correction E: Evidence Support Behavior Tests
+# ==============================================================================
+
+
+def test_check_evidence_support_direct_paraphrase_and_unsupported(canonical_chunks_by_id):
+    """Test check_evidence_support on direct questions, paraphrases, and unsupported queries."""
+    from rulelens.answering import check_evidence_support
+
+    c04 = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    chunks = [c04]
+
+    # Direct question
+    assert check_evidence_support("What is the expense approval threshold for managers under Travel Policy v2?", chunks) is True
+
+    # Strong paraphrase
+    assert check_evidence_support("What approval threshold applies to direct reporting managers?", chunks) is True
+
+    # Relevant question with different vocabulary
+    assert check_evidence_support("When does an expense require approval from the department director?", chunks) is True
+
+    # Unsupported query
+    assert check_evidence_support("Can employees expense personal cryptocurrency mining rigs?", chunks) is False
+
+    # Unrelated query with superficial corporate words
+    assert check_evidence_support("What are the employee wellness leave policies for family illness?", chunks) is False
+
+
+# ==============================================================================
+# 7. Correction F: Strict Error Sanitization (Arbitrary Secrets & Paths)
+# ==============================================================================
+
+
+@pytest.mark.parametrize(
+    "secret_string",
+    [
+        "gsk_abcdef1234567890_VERY_SECRET_GROQ_KEY",
+        "qdrant_sec_998877665544332211",
+        "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secretpayload.sig",
+        "C:\\Users\\admin\\.ssh\\id_rsa",
+        "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        "postgres://user:super_secret_pw@db.internal:5432/asterline",
+    ],
+)
+def test_operational_error_never_leaks_arbitrary_secrets_or_paths(
+    mock_retriever, sample_retrieval_result, secret_string: str
+):
+    """Injected arbitrary secrets, bearer tokens, and private paths must never appear in error outputs."""
+    mock_retriever.search.return_value = [sample_retrieval_result]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    mock_llm.generate_answer.side_effect = RuntimeError(f"Connection failed to endpoint: {secret_string}")
+
+    res = answer_question(
+        question="What is the meal allowance?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+
+    assert res.status == "operational_error"
+    res_str = json.dumps(res.to_dict())
+    assert secret_string not in res_str
+    assert "super_secret" not in res_str.lower()
+    assert "id_rsa" not in res_str

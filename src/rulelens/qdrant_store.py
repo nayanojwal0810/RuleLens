@@ -801,8 +801,8 @@ def main(args: Optional[Sequence[str]] = None) -> None:
 
     try:
         client = get_qdrant_client()
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    except ValueError:
+        print("Error: Qdrant client initialization failed. Please check configuration.", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -814,8 +814,8 @@ def main(args: Optional[Sequence[str]] = None) -> None:
             print(f"Verifying Qdrant collection '{QDRANT_COLLECTION_NAME}'...")
             res = verify_collection(client)
             print("Verification complete:", res)
-    except Exception as exc:
-        print(f"Operation failed: {exc}", file=sys.stderr)
+    except Exception:
+        print("Operation failed: An unexpected infrastructure error occurred during Qdrant operation.", file=sys.stderr)
         sys.exit(1)
 
 

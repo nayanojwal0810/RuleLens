@@ -22,8 +22,10 @@ from rulelens.generation_eval import (
     DEV_SUBSET_QUESTION_IDS,
     evaluate_single_question,
     format_rate,
+    generate_reconciled_markdown,
     generate_summary_markdown,
     load_evaluation_dataset,
+    reconcile_stage_e_evaluations,
     run_generation_evaluation,
 )
 from rulelens.llm import AnswerResponse, AnswerStatus, GroqClientWrapper
@@ -812,3 +814,150 @@ def test_http_429_stops_run_and_marks_partial(repo_root: Path, mock_retriever):
         assert summary["planned_questions"] == 5
         assert summary["evaluation_state"] == "partial"
         assert "Rate limit" in summary["stop_reason"]
+
+
+# ==============================================================================
+# 5. Reconciliation Utility Tests
+# ==============================================================================
+
+
+def test_reconcile_stage_e_evaluations_happy_path(tmp_path: Path):
+    """reconcile_stage_e_evaluations combines base and remaining run results accurately."""
+    base_file = tmp_path / "base.json"
+    remaining_file = tmp_path / "remaining.json"
+    output_json = tmp_path / "reconciled.json"
+    output_md = tmp_path / "reconciled.md"
+
+    # Base run: Q1 answered, Q2 rate_limited
+    base_data = {
+        "model": "openai/gpt-oss-20b",
+        "timestamp": "2026-11-22T00:00:00Z",
+        "per_question_results": [
+            {
+                "question_id": "Q1",
+                "status": "answered",
+                "schema_valid": True,
+                "citation_valid": True,
+                "citation_expected": True,
+                "refusal_correct": None,
+                "provider_error": False,
+                "other_operational_failure": False,
+                "provider_calls_attempted": 1,
+                "token_usage": 100,
+                "latency_ms": 200.0,
+                "provider_latency_ms": 150.0,
+                "answerability": True,
+            },
+            {
+                "question_id": "Q2",
+                "status": "operational_error",
+                "error_category": "rate_limited",
+                "schema_valid": False,
+                "citation_valid": False,
+                "citation_expected": False,
+                "refusal_correct": False,
+                "provider_error": True,
+                "other_operational_failure": False,
+                "provider_calls_attempted": 1,
+                "token_usage": None,
+                "latency_ms": 50.0,
+                "provider_latency_ms": None,
+                "answerability": True,
+            },
+        ],
+    }
+
+    # Remaining run: Q2 answered, Q3 restricted
+    remaining_data = {
+        "model": "openai/gpt-oss-20b",
+        "timestamp": "2026-11-22T01:00:00Z",
+        "per_question_results": [
+            {
+                "question_id": "Q2",
+                "status": "answered",
+                "schema_valid": True,
+                "citation_valid": True,
+                "citation_expected": True,
+                "refusal_correct": None,
+                "provider_error": False,
+                "other_operational_failure": False,
+                "provider_calls_attempted": 1,
+                "token_usage": 150,
+                "latency_ms": 250.0,
+                "provider_latency_ms": 180.0,
+                "answerability": True,
+            },
+            {
+                "question_id": "Q3",
+                "status": "restricted",
+                "schema_valid": True,
+                "citation_valid": True,
+                "citation_expected": False,
+                "refusal_correct": True,
+                "provider_error": False,
+                "other_operational_failure": False,
+                "provider_calls_attempted": 0,
+                "token_usage": 0,
+                "latency_ms": 10.0,
+                "provider_latency_ms": None,
+                "restricted_target_chunk_ids": ["DOC-TRV-004_TRV-X01"],
+                "answerability": False,
+            },
+        ],
+    }
+
+    base_file.write_text(json.dumps(base_data), encoding="utf-8")
+    remaining_file.write_text(json.dumps(remaining_data), encoding="utf-8")
+
+    reconciled = reconcile_stage_e_evaluations(
+        base_file, remaining_file, output_json, output_md, subset_question_ids=["Q1", "Q2", "Q3"]
+    )
+
+    assert reconciled["planned_questions"] == 3
+    assert reconciled["completed_questions"] == 3
+    assert reconciled["unique_questions_evaluated"] == 3
+    assert reconciled["historical_retries_attempted"] == 1
+    assert reconciled["total_provider_requests_attempted"] == 3  # Q1 (1) + Q2-base (1) + Q2-rem (1) + Q3 (0)
+    assert reconciled["total_tokens_consumed"] == 250  # 100 + 150
+    assert output_json.is_file()
+    assert output_md.is_file()
+
+    # Verify Q2 was updated to answered
+    q2_rec = next(q for q in reconciled["per_question_results"] if q["question_id"] == "Q2")
+    assert q2_rec["status"] == "answered"
+
+
+def test_reconcile_stage_e_evaluations_on_actual_reports(repo_root: Path):
+    """Verify reconciliation on real local evaluation outputs if present."""
+    base_file = repo_root / "local_eval" / "generation_development_results.json"
+    rem_file = repo_root / "local_eval" / "generation_remaining_results.json"
+    if base_file.is_file() and rem_file.is_file():
+        reconciled = reconcile_stage_e_evaluations(base_file, rem_file)
+        assert reconciled["unique_questions_evaluated"] == 30
+        assert reconciled["planned_questions"] == 30
+        assert reconciled["historical_retries_attempted"] == 1
+        assert reconciled["total_provider_requests_attempted"] == 22
+
+
+def test_reconcile_stage_e_evaluations_model_mismatch(tmp_path: Path):
+    """reconcile_stage_e_evaluations raises ValueError on model mismatch."""
+    base_file = tmp_path / "base.json"
+    remaining_file = tmp_path / "remaining.json"
+    base_file.write_text(json.dumps({"model": "model-a", "per_question_results": []}), encoding="utf-8")
+    remaining_file.write_text(json.dumps({"model": "model-b", "per_question_results": []}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Model mismatch"):
+        reconcile_stage_e_evaluations(base_file, remaining_file)
+
+
+def test_reconcile_stage_e_evaluations_missing_file(tmp_path: Path):
+    """reconcile_stage_e_evaluations raises FileNotFoundError if either input is missing."""
+    valid_file = tmp_path / "valid.json"
+    valid_file.write_text("{}", encoding="utf-8")
+    missing = tmp_path / "missing.json"
+
+    with pytest.raises(FileNotFoundError):
+        reconcile_stage_e_evaluations(missing, valid_file)
+
+    with pytest.raises(FileNotFoundError):
+        reconcile_stage_e_evaluations(valid_file, missing)

@@ -74,6 +74,19 @@ class ConditionExtractionResult:
     reason: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class AuthoritativeDecision:
+    """Represents a deterministic, authoritative rule decision."""
+
+    is_authoritative: bool
+    rule: Optional[RuleRecord] = None
+    answer: Optional[str] = None
+    citation_chunk_id: Optional[str] = None
+    rule_id: Optional[str] = None
+    outcome: Optional[str] = None
+    reason: Optional[str] = None
+
+
 # Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
 _RULES_CACHE: Dict[Path, List[RuleRecord]] = {}
 
@@ -260,13 +273,14 @@ def resolve_rules_for_evidence(
             continue
 
         # 3. Check for condition evaluation or ambiguity
-        if rule.condition_field in cond_map or (has_ambiguity and rule.condition_field in ("expense_amount", "order_amount", "monthly_spend", "receipt_amount", "exception_amount")):
+        if rule.condition_field in cond_map:
             cond_entry = cond_map.get(rule.condition_field)
-            if (cond_entry and cond_entry[2]) or has_ambiguity:
+            val, unit, is_ambig, ambig_err = cond_entry
+            if is_ambig:
                 # Ambiguous input condition
                 explanation = (
                     f"Rule {rule.rule_id} condition ambiguous: "
-                    f"{ambiguity_reason or 'Multiple conflicting condition inputs detected in query.'}"
+                    f"{ambig_err or 'Multiple conflicting condition inputs detected in query.'}"
                 )
                 results.append(
                     RuleEvaluationResult(
@@ -422,37 +436,40 @@ def extract_conditions_from_query(
 ) -> List[Dict[str, Any]]:
     """Conservatively extract typed condition values from a natural language query.
 
-    Only extracts when unambiguous. Rejects ambiguous or conflicting field/value matches.
+    Only extracts when unambiguous. Rejects ambiguous or conflicting field/value matches
+    across all numerical units (currency, days, months, mbps, hours) and categorical tiers.
 
     Args:
         query: User question string.
         relevant_fields: Optional set of condition_field names to restrict extraction to.
 
     Returns:
-        List of dicts: [{"field": condition_field, "value": value, "unit": unit}]
+        List of dicts: [{"field": condition_field, "value": value, "unit": unit, "is_ambiguous": bool}]
     """
     if not query or not query.strip():
         return []
 
     q_lower = query.lower()
-    conditions: List[Dict[str, Any]] = []
+    raw_candidates: List[Dict[str, Any]] = []
 
     # Check for tier values (Information Security)
-    if "confidential" in q_lower:
-        conditions.append({"field": "data_classification_tier", "value": "Confidential", "unit": "tier"})
-    elif "restricted" in q_lower and any(k in q_lower for k in ("restricted data", "restricted tier", "data classification")):
-        conditions.append({"field": "data_classification_tier", "value": "Restricted", "unit": "tier"})
+    has_confidential = "confidential" in q_lower
+    has_restricted = "restricted" in q_lower and any(
+        k in q_lower for k in ("restricted data", "restricted tier", "data classification", "restricted")
+    )
+    if has_confidential:
+        raw_candidates.append({"field": "data_classification_tier", "value": "Confidential", "unit": "tier"})
+    if has_restricted:
+        raw_candidates.append({"field": "data_classification_tier", "value": "Restricted", "unit": "tier"})
 
     # Check for INR currency amounts using Decimal precision directly from string
-    found_currency_amounts: List[Tuple[Decimal, str]] = []
-    has_or_connector = bool(re.search(r"\b(?:or|and/or)\b|/", q_lower))
     for match in _CURRENCY_PATTERN.finditer(query):
         raw_num = match.group(1).replace(",", "")
         try:
             val = Decimal(raw_num)
         except (InvalidOperation, ValueError):
             continue
-        # Exclude years (e.g. 2026) unless explicitly preceded/followed by currency mark
+        # Exclude calendar years (e.g. 2026) unless explicitly preceded/followed by currency mark
         span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
         has_curr_mark = any(k in span for k in ("inr", "rs", "₹", "rupee", "cost", "amount", "spend", "claim", "price"))
         if 2000 <= val <= 2099 and not any(k in span for k in ("inr", "rs", "₹")):
@@ -460,32 +477,7 @@ def extract_conditions_from_query(
         if has_curr_mark:
             field = _determine_currency_field(q_lower, span)
             if field:
-                found_currency_amounts.append((val, field))
-
-    # Reject if multiple distinct amounts claim the same field or if query presents ambiguous alternatives
-    seen_amounts_by_field: Dict[str, List[Decimal]] = {}
-    for val, field in found_currency_amounts:
-        seen_amounts_by_field.setdefault(field, []).append(val)
-
-    ambiguous_fields = {f for f, vals in seen_amounts_by_field.items() if len(set(vals)) > 1}
-    distinct_vals = {v for v, _ in found_currency_amounts}
-    if len(distinct_vals) > 1 and has_or_connector:
-        for f in seen_amounts_by_field:
-            ambiguous_fields.add(f)
-
-    if ambiguous_fields:
-        for f in ambiguous_fields:
-            vals_str = ", ".join(str(v) for v in sorted(set(seen_amounts_by_field[f])))
-            conditions.append({
-                "field": f,
-                "value": None,
-                "unit": "INR",
-                "is_ambiguous": True,
-                "error": f"Multiple conflicting amounts [{vals_str}] detected for condition '{f}'.",
-            })
-    else:
-        for val, field in found_currency_amounts:
-            conditions.append({"field": field, "value": val, "unit": "INR", "is_ambiguous": False})
+                raw_candidates.append({"field": field, "value": val, "unit": "INR"})
 
     # Check for days
     for match in _DAYS_PATTERN.finditer(query):
@@ -494,13 +486,13 @@ def extract_conditions_from_query(
         except ValueError:
             continue
         if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
-            conditions.append({"field": "advance_booking_days", "value": val, "unit": "days"})
+            raw_candidates.append({"field": "advance_booking_days", "value": val, "unit": "days"})
         elif any(k in q_lower for k in ("submit", "submission", "delay", "expense claim", "reimbursement")):
-            conditions.append({"field": "submission_delay_days", "value": val, "unit": "days"})
+            raw_candidates.append({"field": "submission_delay_days", "value": val, "unit": "days"})
         elif any(k in q_lower for k in ("sick", "illness", "medical")):
-            conditions.append({"field": "consecutive_sick_days", "value": val, "unit": "days"})
+            raw_candidates.append({"field": "consecutive_sick_days", "value": val, "unit": "days"})
         elif any(k in q_lower for k in ("recertification", "access review", "privileged")):
-            conditions.append({"field": "privileged_role_review_interval_days", "value": val, "unit": "days"})
+            raw_candidates.append({"field": "privileged_role_review_interval_days", "value": val, "unit": "days"})
 
     # Check for months
     for match in _MONTHS_PATTERN.finditer(query):
@@ -509,7 +501,7 @@ def extract_conditions_from_query(
         except ValueError:
             continue
         if any(k in q_lower for k in ("contract", "duration", "agreement")):
-            conditions.append({"field": "contract_duration_months", "value": val, "unit": "months"})
+            raw_candidates.append({"field": "contract_duration_months", "value": val, "unit": "months"})
 
     # Check for mbps
     for match in _MBPS_PATTERN.finditer(query):
@@ -517,7 +509,7 @@ def extract_conditions_from_query(
             val = int(match.group(1))
         except ValueError:
             continue
-        conditions.append({"field": "internet_speed_mbps", "value": val, "unit": "mbps"})
+        raw_candidates.append({"field": "internet_speed_mbps", "value": val, "unit": "mbps"})
 
     # Check for hours
     for match in _HOURS_PATTERN.finditer(query):
@@ -526,11 +518,57 @@ def extract_conditions_from_query(
         except ValueError:
             continue
         if any(k in q_lower for k in ("incident", "p1", "severity", "sla")):
-            conditions.append({"field": "incident_severity_p1_response_hours", "value": val, "unit": "hours"})
+            raw_candidates.append({"field": "incident_severity_p1_response_hours", "value": val, "unit": "hours"})
 
     # Filter to relevant fields if specified
     if relevant_fields is not None:
-        conditions = [c for c in conditions if c["field"] in relevant_fields]
+        raw_candidates = [c for c in raw_candidates if c["field"] in relevant_fields]
+
+    # Group candidate conditions by condition_field
+    candidates_by_field: Dict[str, List[Dict[str, Any]]] = {}
+    for cand in raw_candidates:
+        field = cand["field"]
+        candidates_by_field.setdefault(field, []).append(cand)
+
+    has_alternative_connector = bool(re.search(r"\b(?:or|and/or|versus|vs\.?)\b|/", q_lower))
+    conditions: List[Dict[str, Any]] = []
+
+    for field, c_list in candidates_by_field.items():
+        # Check for conflicting units
+        units = list(dict.fromkeys(c["unit"] for c in c_list if c.get("unit")))
+        if len(units) > 1:
+            conditions.append({
+                "field": field,
+                "value": None,
+                "unit": units[0],
+                "is_ambiguous": True,
+                "error": f"Conflicting units [{', '.join(sorted(units))}] detected for condition '{field}'.",
+            })
+            continue
+
+        primary_unit = units[0] if units else ""
+
+        # Check for multiple distinct values
+        vals = [c["value"] for c in c_list]
+        unique_vals = list(dict.fromkeys(vals))
+
+        if len(unique_vals) > 1 or (len(unique_vals) > 1 and has_alternative_connector):
+            vals_str = ", ".join(str(v) for v in sorted(unique_vals, key=lambda x: str(x)))
+            conditions.append({
+                "field": field,
+                "value": None,
+                "unit": primary_unit,
+                "is_ambiguous": True,
+                "error": f"Multiple conflicting values [{vals_str}] detected for condition '{field}'.",
+            })
+        else:
+            # Exactly one unique value: valid (deduplicated)
+            conditions.append({
+                "field": field,
+                "value": unique_vals[0],
+                "unit": primary_unit,
+                "is_ambiguous": False,
+            })
 
     return conditions
 
@@ -554,3 +592,159 @@ def extract_condition_result(
     if conds:
         return ConditionExtractionResult(status="valid", conditions=conds)
     return ConditionExtractionResult(status="missing", conditions=[])
+
+
+def _format_canonical_decision_answer(
+    rule: RuleRecord,
+    cond_val: Any,
+    cond_unit: str,
+) -> str:
+    """Format an authoritative, policy-grounded natural language decision answer from a canonical rule outcome."""
+    outcome = rule.outcome
+    field = rule.condition_field
+    thresh = rule.threshold_value
+    unit = cond_unit or rule.unit
+
+    if outcome == "standard_approval":
+        return f"Standard manager approval is permitted. The expense amount of {cond_val} {unit} is within the policy approval limit of {thresh} {rule.unit}."
+    elif outcome == "additional_approval":
+        return f"Additional approval is required. Standard manager approval is not sufficient for an expense of {cond_val} {unit} as it exceeds the standard limit of {thresh} {rule.unit}."
+    elif outcome == "standard_booking":
+        return f"Standard flight booking is permitted as the travel is booked with {cond_val} days advance notice, meeting the {thresh}-day policy requirement."
+    elif outcome == "expedited_approval_required":
+        return f"Expedited approval is required because the flight is booked with {cond_val} days advance notice, which is less than the required {thresh} days."
+    elif outcome == "vp_approval":
+        return f"Vice President (VP) approval is required for travel exception expenses of {cond_val} {unit} (up to {thresh} {rule.unit})."
+    elif outcome == "cfo_approval":
+        return f"Chief Financial Officer (CFO) approval is required for travel exception expenses of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+    elif outcome == "eligible_reimbursement":
+        return f"The expense claim submitted within {cond_val} days is eligible for standard reimbursement (within the {thresh}-day limit)."
+    elif outcome == "requires_late_exception":
+        return f"A late submission exception approval is required for expense claims submitted after {cond_val} days (exceeding the {thresh}-day deadline)."
+    elif outcome == "no_receipt_required":
+        return f"No receipt is required for incidental expenses of {cond_val} {unit} (up to {thresh} {rule.unit})."
+    elif outcome == "itemized_receipt_required":
+        return f"An itemized receipt or tax invoice is required for expenses of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+    elif outcome == "within_standard_card_limit":
+        return f"The monthly spend of {cond_val} {unit} is within the standard corporate credit card limit of {thresh} {rule.unit}."
+    elif outcome == "card_limit_escalation_required":
+        return f"Corporate credit card limit escalation approval is required for monthly spend of {cond_val} {unit} exceeding the standard {thresh} {rule.unit} limit."
+    elif outcome == "self_certification":
+        return f"Self-certification is permitted for sick leave of {cond_val} consecutive days (up to {thresh} days)."
+    elif outcome == "medical_certificate_required":
+        return f"A formal medical certificate is required for sick leave of {cond_val} consecutive days (exceeding {thresh} days)."
+    elif outcome == "remote_setup_compliant":
+        return f"The internet connection speed of {cond_val} Mbps meets the remote work setup policy minimum of {thresh} {rule.unit}."
+    elif outcome == "remediation_required":
+        return f"Internet speed remediation is required because {cond_val} Mbps does not meet the minimum requirement of {thresh} {rule.unit}."
+    elif outcome == "standard_tuition_grant":
+        return f"The tuition claim of {cond_val} {unit} is eligible for a standard tuition grant (within {thresh} {rule.unit})."
+    elif outcome == "committee_review_required":
+        return f"Tuition reimbursement committee review is required for claims of {cond_val} {unit} exceeding the standard {thresh} {rule.unit} grant."
+    elif outcome == "single_quote_permitted":
+        return f"A single supplier quote is permitted for purchase orders of {cond_val} {unit} (up to {thresh} {rule.unit})."
+    elif outcome == "three_competitive_quotes_required":
+        return f"Three competitive supplier quotes are required for purchase orders of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+    elif outcome == "department_lead_signoff":
+        return f"Department lead signoff is sufficient for vendor contracts of {cond_val} months duration (up to {thresh} months)."
+    elif outcome == "legal_and_procurement_signoff":
+        return f"Both Legal and Procurement signoff are required for vendor contracts of {cond_val} months duration (exceeding {thresh} months)."
+    elif outcome == "director_emergency_approval":
+        return f"Director emergency approval is permitted for emergency purchases of {cond_val} {unit} (up to {thresh} {rule.unit})."
+    elif outcome == "board_procurement_committee":
+        return f"Board Procurement Committee approval is required for emergency purchases of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+    elif outcome == "aes_256_mandatory":
+        return "AES-256 encryption is mandatory for Confidential tier data at rest."
+    elif outcome == "hsm_tokenized_encryption":
+        return "Hardware Security Module (HSM) tokenized encryption is mandatory for Restricted tier data at rest."
+    elif outcome == "access_recertification_compliant":
+        return f"Privileged access review interval of {cond_val} days is compliant within the permitted {thresh}-day recertification cycle."
+    elif outcome == "automatic_account_suspension":
+        return f"Automatic account suspension applies to privileged accounts exceeding the {thresh}-day recertification interval ({cond_val} days)."
+    elif outcome == "sla_met":
+        return f"Priority 1 incident response within {cond_val} hour(s) meets the SLA requirement of {thresh} hour(s)."
+    elif outcome == "sla_breach_escalation":
+        return f"Priority 1 incident response time of {cond_val} hour(s) exceeds the {thresh}-hour SLA window, requiring immediate breach escalation."
+    else:
+        return f"The policy rule ({rule.rule_id}) establishes the outcome '{outcome}' for {field} {rule.operator} {thresh} {rule.unit}."
+
+
+def evaluate_authoritative_rule_decision(
+    question: str,
+    authorized_chunks: Sequence[Dict[str, Any]],
+    rule_results: Sequence[RuleEvaluationResult],
+    extracted_conditions: Sequence[Dict[str, Any]],
+) -> AuthoritativeDecision:
+    """Evaluate whether a single-condition policy query can be answered deterministically from canonical rules.
+
+    Requirements:
+    1. Query asks for a concrete policy decision (e.g., approval, permission, compliance).
+    2. Exactly one unambiguous condition is extracted.
+    3. Exactly one active, authorized rule condition passes for this condition.
+    4. The passing rule's chunk is present in authorized evidence.
+    5. Query is not an open-ended definition question or multi-clause question.
+    """
+    if not question or not question.strip():
+        return AuthoritativeDecision(is_authoritative=False)
+
+    q_lower = question.lower()
+
+    # Rule out open-ended threshold definitions or cross-clause questions
+    explanatory_markers = (
+        "what is the maximum", "what is the threshold", "what is the limit",
+        "what are the tiers", "into what four", "what four severity",
+        "and what timeframe", "and who", "and when", "and within what"
+    )
+    if any(em in q_lower for em in explanatory_markers):
+        return AuthoritativeDecision(is_authoritative=False)
+
+    # Must contain a decision indicator
+    decision_markers = (
+        "can ", "could ", "is ", "are ", "does ", "do ", "may ", "require", "required",
+        "permit", "permitted", "allow", "allowed", "eligible", "approval", "approve",
+        "compliant", "exceed", "escalat"
+    )
+    if not any(m in q_lower for m in decision_markers):
+        return AuthoritativeDecision(is_authoritative=False)
+
+    # Must have exactly one valid condition, and no ambiguous conditions
+    if any(c.get("is_ambiguous") for c in extracted_conditions):
+        return AuthoritativeDecision(is_authoritative=False)
+
+    valid_conds = [c for c in extracted_conditions if c.get("value") is not None and not c.get("is_ambiguous")]
+    if len(valid_conds) != 1:
+        return AuthoritativeDecision(is_authoritative=False)
+
+    target_cond = valid_conds[0]
+    cond_field = target_cond["field"]
+    cond_val = target_cond["value"]
+    cond_unit = target_cond.get("unit", "")
+
+    # Find rules evaluated against this condition field with input_value
+    evaluated_for_field = [
+        r for r in rule_results
+        if not r.is_error and r.input_value is not None and r.rule.condition_field == cond_field
+    ]
+    passing_rules = [r for r in evaluated_for_field if r.passed]
+    if len(passing_rules) != 1:
+        return AuthoritativeDecision(is_authoritative=False)
+
+    passing_result = passing_rules[0]
+    rule = passing_result.rule
+
+    # Verify rule's linked chunk is present in authorized chunks
+    auth_cids = {c["chunk_id"] for c in authorized_chunks}
+    if rule.chunk_id not in auth_cids:
+        return AuthoritativeDecision(is_authoritative=False)
+
+    answer_text = _format_canonical_decision_answer(rule, cond_val, cond_unit)
+
+    return AuthoritativeDecision(
+        is_authoritative=True,
+        rule=rule,
+        answer=answer_text,
+        citation_chunk_id=rule.chunk_id,
+        rule_id=rule.rule_id,
+        outcome=rule.outcome,
+        reason=f"Authoritative deterministic decision based on canonical rule {rule.rule_id} ({rule.outcome}).",
+    )
