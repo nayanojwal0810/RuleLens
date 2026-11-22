@@ -41,7 +41,7 @@ User Query + Role + Effective Date
 - **Dual Dense Backends:**
   - `local`: High-performance local in-memory cosine similarity over cached document embeddings (100% offline).
   - `qdrant`: Vector database retrieval utilizing server-side payload filtering for permissions, dates, and corpus fingerprints.
-- **Security & Version Integrity:** Role-based permissions (across `employee`, `manager`, `hr`, `finance`, `legal`, `auditor`) and temporal version windows are enforced via deterministic pre-filtering before scoring.
+- **Security & Version Integrity:** Role-based permissions (across `employee`, `manager`, `hr`, `finance`, `security`, `auditor`) and temporal version windows are enforced via deterministic pre-filtering before scoring.
 
 ## Installation & Setup
 

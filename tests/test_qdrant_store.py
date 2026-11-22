@@ -383,7 +383,7 @@ def test_search_qdrant_server_side_filtering(repo_root: Path, sample_chunks: Lis
 
 
 def test_search_qdrant_mandatory_auditor_filter(repo_root: Path):
-    """Mandatory test case: Auditor cannot retrieve Employee Transfers (DOC-PCO-003)."""
+    """Mandatory test case: Auditor cannot retrieve Employee Transfers (DOC-PPO-004), but authorized role (hr) can."""
     client = QdrantClient(":memory:")
     col_name = "test_auditor_filter"
     fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
@@ -397,7 +397,7 @@ def test_search_qdrant_mandatory_auditor_filter(repo_root: Path):
     fp = sync_result["corpus_fingerprint"]
 
     query_vec = fake_embedder.embed_query("employee transfer relocation procedures")
-    results = search_qdrant(
+    auditor_results = search_qdrant(
         client=client,
         query_vector=query_vec,
         role="auditor",
@@ -406,10 +406,23 @@ def test_search_qdrant_mandatory_auditor_filter(repo_root: Path):
         collection_name=col_name,
         top_k=64,
     )
-    result_cids = {cid for cid, score in results}
-    # DOC-PCO-003 is Employee Transfers (accessible to employee, manager, hr, but NOT auditor)
-    for cid in result_cids:
-        assert not cid.startswith("DOC-PCO-003"), f"Auditor must not access DOC-PCO-003: {cid}"
+    auditor_cids = {cid for cid, score in auditor_results}
+    # DOC-PPO-004 is Employee Transfers (accessible to manager, hr, but strictly forbidden for auditor)
+    for cid in auditor_cids:
+        assert not cid.startswith("DOC-PPO-004"), f"Auditor must not access DOC-PPO-004: {cid}"
+
+    # HR role is allowed for DOC-PPO-004
+    hr_results = search_qdrant(
+        client=client,
+        query_vector=query_vec,
+        role="hr",
+        query_date="2026-11-22",
+        corpus_fingerprint=fp,
+        collection_name=col_name,
+        top_k=64,
+    )
+    hr_cids = {cid for cid, score in hr_results}
+    assert any(cid.startswith("DOC-PPO-004") for cid in hr_cids), "HR must be allowed to retrieve DOC-PPO-004"
 
 
 def test_search_qdrant_mandatory_date_boundaries(repo_root: Path):
@@ -526,6 +539,107 @@ def test_verify_collection_detects_payload_field_mismatch(repo_root: Path):
 
     with pytest.raises(ValueError, match="Payload mismatch"):
         verify_collection(client=client, base_dir=repo_root, collection_name=col_name)
+
+
+def test_sync_corpus_rejects_corrupted_existing_point_before_upsert(repo_root: Path, sample_chunks: List[Dict[str, Any]]):
+    """sync_corpus must validate existing points before upserting and abort if any point is corrupted."""
+    client = QdrantClient(":memory:")
+    col_name = "test_corrupted_existing"
+    fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
+
+    ensure_collection(client, collection_name=col_name)
+
+    # Insert 1 valid point and 1 corrupted point
+    c0 = sample_chunks[0]
+    c1 = sample_chunks[1]
+    pid0 = get_point_id(c0["chunk_id"])
+    pid1 = get_point_id(c1["chunk_id"])
+    payload0 = prepare_chunk_payload(c0, corpus_fingerprint="4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3")
+    payload1 = prepare_chunk_payload(c1, corpus_fingerprint="4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3")
+    payload1["allowed_roles"] = ["unauthorized_role_xyz"]  # Corrupt allowed_roles
+
+    client.upsert(
+        collection_name=col_name,
+        points=[
+            models.PointStruct(id=pid0, vector=[0.1] * 384, payload=payload0),
+            models.PointStruct(id=pid1, vector=[0.1] * 384, payload=payload1),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="mismatched"):
+        sync_corpus(
+            client=client,
+            base_dir=repo_root,
+            collection_name=col_name,
+            embedder=fake_embedder,
+        )
+
+    # Confirm point count did not change (zero upserts occurred)
+    col_info = client.get_collection(col_name)
+    assert col_info.points_count == 2
+
+
+def test_sync_corpus_rejects_unexpected_point_uuid_before_upsert(repo_root: Path):
+    """sync_corpus must abort if existing collection has points with non-canonical point IDs."""
+    client = QdrantClient(":memory:")
+    col_name = "test_unexpected_point_uuid"
+    fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
+
+    ensure_collection(client, collection_name=col_name)
+    client.upsert(
+        collection_name=col_name,
+        points=[
+            models.PointStruct(
+                id=str(uuid.uuid4()),  # Random UUID not corresponding to any chunk
+                vector=[0.1] * 384,
+                payload={"corpus_fingerprint": "4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3"},
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="missing chunk_id|does not belong to valid corpus chunk"):
+        sync_corpus(
+            client=client,
+            base_dir=repo_root,
+            collection_name=col_name,
+            embedder=fake_embedder,
+        )
+
+    col_info = client.get_collection(col_name)
+    assert col_info.points_count == 1
+
+
+def test_sync_corpus_safe_completion_of_partial_collection(repo_root: Path, sample_chunks: List[Dict[str, Any]]):
+    """sync_corpus must safely complete an existing partial valid collection without re-syncing valid points."""
+    client = QdrantClient(":memory:")
+    col_name = "test_partial_sync"
+    fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
+
+    manifest_path = repo_root / "data" / "processed" / "corpus_manifest.json"
+    import json
+    fp = json.loads(manifest_path.read_text(encoding="utf-8"))["processed_fingerprint"]
+
+    ensure_collection(client, collection_name=col_name)
+
+    # Pre-populate first 5 points accurately
+    initial_points = []
+    for c in sample_chunks[:5]:
+        pid = get_point_id(c["chunk_id"])
+        pl = prepare_chunk_payload(c, corpus_fingerprint=fp)
+        initial_points.append(models.PointStruct(id=pid, vector=[0.1] * 384, payload=pl))
+    client.upsert(collection_name=col_name, points=initial_points)
+
+    assert client.get_collection(col_name).points_count == 5
+
+    res = sync_corpus(
+        client=client,
+        base_dir=repo_root,
+        collection_name=col_name,
+        embedder=fake_embedder,
+    )
+    assert res["points_synced"] == 59
+    assert res["total_points_in_collection"] == 64
+    assert client.get_collection(col_name).points_count == 64
 
 
 # ==============================================================================

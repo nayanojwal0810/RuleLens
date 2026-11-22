@@ -20,8 +20,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from rulelens.retrieval import RetrievalResult
+from rulelens.retrieval import RetrievalResult, load_validated_corpus
 from rulelens.retrieval_eval import (
+    compute_full_evidence_at_k,
     compute_hit_at_k,
     compute_mrr_at_k,
     compute_recall_at_k,
@@ -102,6 +103,27 @@ def test_compute_mrr_at_k():
 
     # Empty gold set
     assert compute_mrr_at_k(["chunk_A"], set(), k=5) == 0.0
+
+
+def test_compute_full_evidence_at_k():
+    """compute_full_evidence_at_k returns 1.0 when all gold chunks are in top K, else 0.0."""
+    gold = {"chunk_A", "chunk_B"}
+
+    # Both retrieved in top K
+    assert compute_full_evidence_at_k(["chunk_A", "chunk_B", "chunk_C"], gold, k=5) == 1.0
+    assert compute_full_evidence_at_k(["chunk_B", "chunk_A"], gold, k=5) == 1.0
+
+    # Only one retrieved
+    assert compute_full_evidence_at_k(["chunk_A", "chunk_C", "chunk_D"], gold, k=5) == 0.0
+    # None retrieved
+    assert compute_full_evidence_at_k(["chunk_C", "chunk_D", "chunk_E"], gold, k=5) == 0.0
+
+    # Cut off at K (second gold at index 2, K=2)
+    assert compute_full_evidence_at_k(["chunk_A", "chunk_C", "chunk_B"], gold, k=2) == 0.0
+    assert compute_full_evidence_at_k(["chunk_A", "chunk_C", "chunk_B"], gold, k=3) == 1.0
+
+    # Empty gold set
+    assert compute_full_evidence_at_k(["chunk_A"], set(), k=5) == 0.0
 
 
 # ==============================================================================
@@ -202,6 +224,8 @@ def test_evaluate_retriever_method_diagnostic_separation():
     assert report["hit_at_5"] == 0.5
     assert report["recall_at_5"] == 0.5
     assert report["mrr_at_5"] == 0.5
+    assert report["full_evidence_at_5"] == 0.5
+    assert len(report["per_question_details"]) == 3
 
     assert report["missed_questions_count"] == 1
     assert report["misses"][0]["question_id"] == "Q2"
@@ -342,8 +366,60 @@ def test_validate_evaluation_dataset_rejects_mutations(repo_root: Path):
     bad_unsupp = copy.deepcopy(canonical_data)
     unsupp_q = next(q for q in bad_unsupp["questions"] if not q.get("answerability") and not q.get("restricted_target_chunk_ids"))
     unsupp_q["evidence_reason"] = "   "
-    with pytest.raises(ValueError, match="must have non-empty evidence_reason"):
+    with pytest.raises(ValueError, match="must have non-empty 'evidence_reason'"):
         validate_evaluation_dataset(bad_unsupp, base_dir=repo_root)
+
+    # 10. Missing required field (difficulty_reason)
+    bad_missing = copy.deepcopy(canonical_data)
+    del bad_missing["questions"][0]["difficulty_reason"]
+    with pytest.raises(ValueError, match="missing required fields"):
+        validate_evaluation_dataset(bad_missing, base_dir=repo_root)
+
+    # 11. Empty difficulty_reason
+    bad_diff_reason = copy.deepcopy(canonical_data)
+    bad_diff_reason["questions"][0]["difficulty_reason"] = "  "
+    with pytest.raises(ValueError, match="must have non-empty 'difficulty_reason'"):
+        validate_evaluation_dataset(bad_diff_reason, base_dir=repo_root)
+
+    # 12. Invalid question_type
+    bad_qtype = copy.deepcopy(canonical_data)
+    bad_qtype["questions"][0]["question_type"] = "unsupported_custom_type"
+    with pytest.raises(ValueError, match="invalid question_type"):
+        validate_evaluation_dataset(bad_qtype, base_dir=repo_root)
+
+    # 13. Employee role count exceeds 30
+    bad_emp = copy.deepcopy(canonical_data)
+    corpus_chunks = load_validated_corpus(repo_root)
+    chunks_by_id = {c["chunk_id"]: c for c in corpus_chunks}
+    switched = 0
+    for q in bad_emp["questions"]:
+        if q.get("answerability") and q["role"] != "employee":
+            if all("employee" in chunks_by_id[cid]["allowed_roles"] for cid in q["gold_chunk_ids"]):
+                q["role"] = "employee"
+                switched += 1
+                if switched >= 6:  # 26 + 6 = 32 > 30
+                    break
+    with pytest.raises(ValueError, match="exceed maximum 30"):
+        validate_evaluation_dataset(bad_emp, base_dir=repo_root)
+
+    # 14. Less than 2 non-employee restricted diagnostics
+    bad_diag = copy.deepcopy(canonical_data)
+    for q in bad_diag["questions"]:
+        if q.get("restricted_target_chunk_ids"):
+            q["role"] = "employee"
+            q["restricted_target_chunk_ids"] = ["DOC-TRV-004_TRV-E01"]
+    with pytest.raises(ValueError, match="Expected at least 2 non-employee restricted diagnostic"):
+        validate_evaluation_dataset(bad_diag, base_dir=repo_root)
+
+    # 15. Less than 10 historical answerable questions
+    bad_hist = copy.deepcopy(canonical_data)
+    for q in bad_hist["questions"]:
+        if q.get("answerability") and q["query_date"] < "2026-07-01":
+            q["query_date"] = "2026-08-01"
+            q["gold_chunk_ids"] = ["DOC-TRV-002_TRV-C01"]
+            q["role"] = "employee"
+    with pytest.raises(ValueError, match="historical answerable questions"):
+        validate_evaluation_dataset(bad_hist, base_dir=repo_root)
 
 
 def test_cli_validate_command(repo_root: Path):
