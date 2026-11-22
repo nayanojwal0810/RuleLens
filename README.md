@@ -31,6 +31,20 @@ User Query + Role + Effective Date
  └───────────────────────┬────────────────────────────────┘
                          ▼
         Top-K Clause-Grounded Evidence Chunks
+                         │
+        ┌────────────────┴────────────────┐
+        ▼                                 ▼
+ ┌──────────────┐                 ┌──────────────┐
+ │ Deterministic│                 │ Safe Refusal │
+ │ Rule Engine  │                 │ (Early Gate) │
+ └──────┬───────┘                 └──────────────┘
+        │                                 │
+        └────────────────┬────────────────┘
+                         ▼
+ ┌────────────────────────────────────────────────────────┐
+ │ Groq Generation (openai/gpt-oss-20b)                   │
+ │ Strict JSON Schema + Citation & Rule Validation       │
+ └────────────────────────────────────────────────────────┘
 ```
 
 - **Hybrid as Primary Retrieval Architecture:** RuleLens uses Hybrid Retrieval as its standard mode, combining lexical precision (BM25) with semantic recall (`BAAI/bge-small-en-v1.5`, 384-dimensional normalized embeddings) fused via Reciprocal Rank Fusion (RRF, $k=60$).
@@ -42,6 +56,15 @@ User Query + Role + Effective Date
   - `local`: High-performance local in-memory cosine similarity over cached document embeddings (100% offline).
   - `qdrant`: Vector database retrieval utilizing server-side payload filtering for permissions, dates, and corpus fingerprints.
 - **Security & Version Integrity:** Role-based permissions (across `employee`, `manager`, `hr`, `finance`, `security`, `auditor`) and temporal version windows are enforced via deterministic pre-filtering before scoring.
+- **Deterministic Rule Engine:** Evaluates 32 canonical structured policy rules in Python for boundary conditions and numeric comparisons (`<`, `<=`, `>`, `>=`, `==`) to eliminate LLM arithmetic hallucinations.
+- **Evidence-Grounded Generation:** Uses `openai/gpt-oss-20b` via the Groq SDK with strict Pydantic JSON schema structured output.
+- **5 Structured Answer Fields:**
+  - `answer`: Clause-grounded textual answer or explicit refusal explanation.
+  - `status`: One of `ANSWERED`, `INSUFFICIENT_EVIDENCE`, `ROLE_RESTRICTED`, `POLICY_CONFLICT`, `OPERATIONAL_ERROR`.
+  - `citations`: List of valid, retrieved chunk IDs directly supporting the answer.
+  - `referenced_rule_ids`: List of deterministic rule IDs applied and verified.
+  - `reason`: Explanation of the status classification and evidence basis.
+- **Strict Citation Validation & Refusal:** Every citation is verified against authorized evidence chunks; fabricated, unretrieved, unauthorized, or expired chunk IDs are rejected. When evidence is insufficient or the role lacks permission, the system safely refuses without generating unverified claims.
 
 ## Installation & Setup
 
@@ -121,3 +144,18 @@ python -m rulelens.retrieval_eval run --questions data/evaluation/dev_questions.
 python -m rulelens.retrieval_eval run --questions data/evaluation/dev_questions.json --backend qdrant
 ```
 Detailed results and markdown summaries are generated in `local_eval/development_results.json` and `local_eval/development_summary.md` (ignored by version control).
+
+### 7. Evidence-Grounded Answer Generation
+Ask policy questions with role-based access control, temporal version windows, and deterministic rule evaluation:
+```bash
+python -m rulelens.answering --question "How many days in advance must domestic flights be booked?" --role employee --date 2026-11-22 --backend local
+```
+
+### 8. Run Generation Evaluation
+Evaluate grounded answer generation against the development evaluation dataset:
+```bash
+# Evaluate development questions (e.g., balanced 30-question subset)
+python -m rulelens.generation_eval run --questions data/evaluation/dev_questions.json --limit 30 --backend local
+```
+
+> **Development Evaluation Status:** On the 30-question development subset (20 answerable, 5 role-restricted, 5 unsupported), 22 questions were evaluated live (16 answerable, 6 diagnostics) before reaching Groq free-tier per-minute rate limits (HTTP 429). The evaluation runner cleanly stopped without crashing, preserving all completed responses in `local_eval/generation_development_results.json` and `local_eval/generation_development_summary.md`. Across all evaluated questions: 100% schema validity, 100% citation validity, and 100% appropriate refusal on diagnostic probes.
