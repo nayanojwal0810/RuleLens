@@ -75,6 +75,7 @@ REQUIRED_QUESTION_FIELDS: Set[str] = {
     "restricted_target_chunk_ids",
     "difficulty_reason",
     "evidence_reason",
+    "gold_evidence",
 }
 
 VALID_QUESTION_TYPES: Set[str] = {
@@ -258,6 +259,10 @@ def validate_evaluation_dataset(
         if not isinstance(restr_cids, list):
             raise ValueError(f"Question '{qid}' 'restricted_target_chunk_ids' must be a list.")
 
+        gold_ev = q.get("gold_evidence")
+        if not isinstance(gold_ev, list):
+            raise ValueError(f"Question '{qid}' 'gold_evidence' must be a list.")
+
         if is_answerable:
             answerable_count += 1
             role_answerable_counts[role] += 1
@@ -268,6 +273,8 @@ def validate_evaluation_dataset(
                 raise ValueError(f"Question '{qid}' has duplicate gold_chunk_ids.")
             if restr_cids:
                 raise ValueError(f"Answerable question '{qid}' must have empty restricted_target_chunk_ids.")
+            if not gold_ev:
+                raise ValueError(f"Answerable question '{qid}' must have non-empty gold_evidence.")
             if len(gold_cids) >= 2:
                 multi_clause_count += 1
 
@@ -289,6 +296,43 @@ def validate_evaluation_dataset(
                         f"Question '{qid}' query_date '{query_date_str}' falls outside gold chunk '{cid}' validity [{eff_from}, {eff_to}]."
                     )
 
+            # Validate each quote in gold_evidence
+            seen_ev = set()
+            quoted_cids = set()
+            for ev_idx, ev in enumerate(gold_ev, start=1):
+                if not isinstance(ev, dict):
+                    raise ValueError(f"Question '{qid}' gold_evidence entry #{ev_idx} is not a dict.")
+                ev_cid = ev.get("chunk_id")
+                quote = ev.get("quote")
+                if not ev_cid or not isinstance(ev_cid, str) or not ev_cid.strip():
+                    raise ValueError(f"Question '{qid}' gold_evidence entry #{ev_idx} missing valid 'chunk_id'.")
+                if not quote or not isinstance(quote, str) or not quote.strip():
+                    raise ValueError(f"Question '{qid}' gold_evidence entry #{ev_idx} missing valid non-empty 'quote'.")
+                if ev_cid not in gold_cids:
+                    raise ValueError(
+                        f"Question '{qid}' gold_evidence references chunk '{ev_cid}' not in gold_chunk_ids {sorted(gold_cids)}."
+                    )
+                if ev_cid not in chunks_by_id:
+                    raise ValueError(f"Question '{qid}' gold_evidence references non-existent chunk '{ev_cid}'.")
+
+                chunk_text = chunks_by_id[ev_cid]["text"]
+                if quote not in chunk_text:
+                    raise ValueError(
+                        f"Question '{qid}' evidence quote for chunk '{ev_cid}' is not an exact substring of canonical chunk text: {quote!r}"
+                    )
+
+                pair = (ev_cid, quote)
+                if pair in seen_ev:
+                    raise ValueError(f"Question '{qid}' contains duplicate gold_evidence entry for chunk '{ev_cid}'.")
+                seen_ev.add(pair)
+                quoted_cids.add(ev_cid)
+
+            missing_quoted = set(gold_cids) - quoted_cids
+            if missing_quoted:
+                raise ValueError(
+                    f"Question '{qid}' gold_chunk_ids {sorted(missing_quoted)} have no supporting quotes in gold_evidence."
+                )
+
             if len(gold_docs) >= 2:
                 cross_document_count += 1
 
@@ -299,6 +343,8 @@ def validate_evaluation_dataset(
                 raise ValueError(f"Diagnostic question '{qid}' must be 'hard' difficulty, got '{diff}'.")
             if gold_cids:
                 raise ValueError(f"Diagnostic question '{qid}' must have empty gold_chunk_ids.")
+            if gold_ev:
+                raise ValueError(f"Diagnostic question '{qid}' must have empty gold_evidence list.")
 
             if restr_cids:
                 restricted_count += 1
@@ -402,20 +448,17 @@ def evaluate_retriever_method(
     Measures warmed-up latency, permission violations, version violations, and miss analysis.
     """
     if warmup and questions:
-        # Warm up caches and models before recording latency
+        # Warm up caches and models before recording latency (propagate any unexpected failures)
         first_q = questions[0]
-        try:
-            retriever.search(
-                query=first_q["question"],
-                role=first_q["role"],
-                query_date=first_q["query_date"],
-                mode=mode,
-                dense_backend=dense_backend,
-                qdrant_client=qdrant_client,
-                top_k=top_k,
-            )
-        except Exception:
-            pass
+        retriever.search(
+            query=first_q["question"],
+            role=first_q["role"],
+            query_date=first_q["query_date"],
+            mode=mode,
+            dense_backend=dense_backend,
+            qdrant_client=qdrant_client,
+            top_k=top_k,
+        )
 
     latencies_ms: List[float] = []
     hits: List[float] = []
@@ -805,8 +848,16 @@ def generate_summary_markdown(
     ])
 
     for q in diag_restr:
+        leaked_modes = [
+            m for m in ("bm25", "dense", "hybrid")
+            if any(
+                d.get("question_id") == q["question_id"] and d.get("leakage_detected")
+                for d in eval_results.get(m, {}).get("diagnostic_results", [])
+            )
+        ]
+        leakage_str = f"Leaked in {leaked_modes}" if leaked_modes else "0 leaks across all modes"
         md.append(
-            f"- **{q['question_id']}** ({q['department']} - role: `{q['role']}`): \"{q['question']}\" -> Targets: `{q.get('restricted_target_chunk_ids')}` (Leakage: **0** across all modes)"
+            f"- **{q['question_id']}** ({q['department']} - role: `{q['role']}`): \"{q['question']}\" -> Targets: `{q.get('restricted_target_chunk_ids')}` (Leakage: **{leakage_str}**)"
         )
 
     md.extend([
@@ -849,7 +900,9 @@ def generate_summary_markdown(
             md.append(f"  - Expected Gold: `{pm['expected_gold_chunk_ids']}`")
             md.append(f"  - Retrieved Gold: `{pm['retrieved_gold_ids']}` | Missing: `{pm['missing_gold_ids']}`")
     else:
-        md.append("Hybrid retrieval achieved **1.000 FullEvidence@5** on all multi-clause answerable questions.\n")
+        hybrid_fe_count = eval_results.get("hybrid", {}).get("complete_evidence_count", 0)
+        hybrid_ans_count = eval_results.get("hybrid", {}).get("total_answerable_questions", 0)
+        md.append(f"No partial evidence misses recorded for Hybrid retrieval ({hybrid_fe_count}/{hybrid_ans_count} answerable questions retrieved 100% of gold clauses in top-5).\n")
 
     # Dynamic Sub-Optimal Ranking comparisons (BM25 vs Dense trade-offs)
     md.append("\n### Architectural Case Studies: BM25 vs Dense vs Hybrid Dynamics\n")
@@ -866,13 +919,18 @@ def generate_summary_markdown(
         for qid in dense_better[:3]:
             case_count += 1
             info = bm25_sub[qid]
+            dense_top = eval_results.get("dense", {}).get("per_question_details", [])
+            dense_q = next((d for d in dense_top if d.get("question_id") == qid), None)
+            dense_cids = dense_q.get("retrieved_chunk_ids", []) if dense_q else []
+            dense_rank = next((idx for idx, c in enumerate(dense_cids, start=1) if c in info['expected_gold_chunk_ids']), 1)
             md.extend([
-                f"#### Case {case_count}: Question {qid} (Dense Rank 1 vs BM25 Rank {info['first_gold_rank']})",
+                f"#### Case {case_count}: Question {qid} (Dense Rank {dense_rank} vs BM25 Rank {info['first_gold_rank']})",
                 f"- **Question**: \"{info['question']}\"",
                 f"- **Department**: {info['department']} | **Role**: `{info['role']}` | **Date**: `{info['query_date']}`",
                 f"- **Expected Gold**: `{info['expected_gold_chunk_ids']}`",
                 f"- **BM25 Top-5**: `{info['actual_top_k_chunk_ids']}`",
-                "- **Analysis**: BM25 struggled due to paraphrasing or vocabulary divergence, while BGE dense embeddings mapped the underlying semantic intent directly to the target clause at rank 1.",
+                f"- **Dense Top-5**: `{dense_cids}`",
+                f"- **Observed Dynamics**: Dense semantic retrieval ranked gold chunk at position {dense_rank}, whereas BM25 placed it at rank {info['first_gold_rank']}.",
                 "",
             ])
 
@@ -880,13 +938,18 @@ def generate_summary_markdown(
         for qid in bm25_better[:3]:
             case_count += 1
             info = dense_sub[qid]
+            bm25_top = eval_results.get("bm25", {}).get("per_question_details", [])
+            bm25_q = next((d for d in bm25_top if d.get("question_id") == qid), None)
+            bm25_cids = bm25_q.get("retrieved_chunk_ids", []) if bm25_q else []
+            bm25_rank = next((idx for idx, c in enumerate(bm25_cids, start=1) if c in info['expected_gold_chunk_ids']), 1)
             md.extend([
-                f"#### Case {case_count}: Question {qid} (BM25 Rank 1 vs Dense Rank {info['first_gold_rank']})",
+                f"#### Case {case_count}: Question {qid} (BM25 Rank {bm25_rank} vs Dense Rank {info['first_gold_rank']})",
                 f"- **Question**: \"{info['question']}\"",
                 f"- **Department**: {info['department']} | **Role**: `{info['role']}` | **Date**: `{info['query_date']}`",
                 f"- **Expected Gold**: `{info['expected_gold_chunk_ids']}`",
+                f"- **BM25 Top-5**: `{bm25_cids}`",
                 f"- **Dense Top-5**: `{info['actual_top_k_chunk_ids']}`",
-                "- **Analysis**: The query contained precise numeric boundaries or statutory identifiers. BM25 placed the exact clause at rank 1, whereas dense embeddings exhibited slight semantic proximity drift to neighboring clauses.",
+                f"- **Observed Dynamics**: BM25 lexical retrieval placed gold chunk at position {bm25_rank}, whereas Dense semantic retrieval placed it at rank {info['first_gold_rank']}.",
                 "",
             ])
 

@@ -5,55 +5,73 @@
     {
       "question_id": "TRV-001",
       "department": "Travel",
-      "question": "Under Travel Policy v2, what is the standard daily meal per diem allowance provided for employees on domestic travel assignments?",
+      "question": "Under Travel Policy v2, what is the standard daily meal subsistence allowance provided for employees on domestic travel assignments?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "easy",
       "question_type": "direct",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-TRV-002_TRV-C04"
+        "DOC-TRV-002_TRV-C03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Direct clause query with straightforward policy condition and explicit numeric rate.",
-      "evidence_reason": "Clause TRV-C04 specifies the daily meal per diem allowance for domestic business travel."
+      "difficulty_reason": "Single-clause direct lookup of the updated v2 daily meal subsistence cap with standard employee permissions.",
+      "evidence_reason": "Grounded in DOC-TRV-002 clause TRV-C03 which explicitly defines the INR 2,000 daily meal subsistence cap.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-002_TRV-C03",
+          "quote": "Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts."
+        }
+      ]
     },
     {
       "question_id": "TRV-002",
       "department": "Travel",
-      "question": "What domestic flight booking class was authorized for business trips taken in early 2026?",
+      "question": "What was the maximum travel expense amount that a direct reporting manager could approve on their own authority under Travel Policy v1?",
       "role": "employee",
       "query_date": "2026-03-15",
       "difficulty": "medium",
       "question_type": "version_historical",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-TRV-001_TRV-C02"
+        "DOC-TRV-001_TRV-C04"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Requires retrieving historical Travel Policy v1 based on the March 2026 query date rather than active v2.",
-      "evidence_reason": "Under Travel Policy v1 active on 2026-03-15, clause TRV-C02 prescribes economy class for domestic flights."
+      "difficulty_reason": "Requires historical version temporal filtering for early 2026 dates prior to the v2 policy revision.",
+      "evidence_reason": "Grounded in DOC-TRV-001 clause TRV-C04 specifying the historical INR 40,000 threshold for direct reporting manager approval.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-001_TRV-C04",
+          "quote": "Travel expenses up to and including INR 40,000 follow standard approval by the direct reporting manager."
+        }
+      ]
     },
     {
       "question_id": "TRV-003",
       "department": "Travel",
-      "question": "What standard seat class is mandated for domestic flights under the updated travel policy effective late 2026?",
+      "question": "Under Travel Policy v2, what is the revised travel expense threshold up to which a direct reporting manager can approve expenses without director sign-off?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "medium",
       "question_type": "version_current",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-TRV-002_TRV-C02"
+        "DOC-TRV-002_TRV-C04"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Paired with TRV-002; tests that query date in late 2026 selects Travel Policy v2 rather than expired v1.",
-      "evidence_reason": "Under Travel Policy v2 active in late 2026, clause TRV-C02 sets economy class standards."
+      "difficulty_reason": "Requires resolving the revised v2 approval limit of INR 50,000, contrasting with historical v1 limit of INR 40,000.",
+      "evidence_reason": "Grounded in DOC-TRV-002 clause TRV-C04 specifying the updated INR 50,000 threshold for direct reporting manager approval.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-002_TRV-C04",
+          "quote": "Travel expenses up to and including INR 50,000 follow standard approval by the direct reporting manager."
+        }
+      ]
     },
     {
       "question_id": "TRV-004",
       "department": "Travel",
-      "question": "How early in advance should staff schedule air transportation tickets prior to domestic client site departure?",
+      "question": "How many days in advance of departure must domestic flights be booked through the travel portal to secure corporate discounted fares?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "medium",
@@ -63,13 +81,19 @@
         "DOC-TRV-003_TRV-B02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Uses conversational business synonyms ('schedule air transportation tickets', 'client site departure') rather than verbatim terms.",
-      "evidence_reason": "Clause TRV-B02 requires domestic flight reservations to be booked at least 14 days in advance."
+      "difficulty_reason": "Requires locating the booking window advance requirement across operational travel booking clauses.",
+      "evidence_reason": "Grounded in DOC-TRV-003 clause TRV-B02 establishing the 14-day advance booking requirement for domestic flights.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-003_TRV-B02",
+          "quote": "Domestic flight bookings must be made at least 14 days in advance of departure to secure corporate discounted fares."
+        }
+      ]
     },
     {
       "question_id": "TRV-005",
       "department": "Travel",
-      "question": "On June 30, 2026, what was the maximum reimbursable nightly hotel room tariff for Tier-1 metropolitan cities?",
+      "question": "On June 30, 2026, what was the maximum reimbursable nightly hotel accommodation rate for metropolitan cities?",
       "role": "auditor",
       "query_date": "2026-06-30",
       "difficulty": "hard",
@@ -79,30 +103,41 @@
         "DOC-TRV-001_TRV-C03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Temporal boundary test on the exact final active day of Travel Policy v1 (June 30, 2026) queried by an auditor.",
-      "evidence_reason": "Under Travel Policy v1 active on 2026-06-30, clause TRV-C03 caps Tier-1 metro hotel accommodation at INR 8,000 per night."
+      "difficulty_reason": "Boundary historical date on the final day of Travel Policy v1 validity (June 30, 2026), testing retrieval of the INR 6,000 cap rather than v2's INR 7,500.",
+      "evidence_reason": "Grounded in DOC-TRV-001 clause TRV-C03 specifying metropolitan hotel accommodations capped at INR 6,000 per night.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-001_TRV-C03",
+          "quote": "Standard hotel accommodations are capped at INR 6,000 per night in metropolitan cities and INR 4,000 in regional locations."
+        }
+      ]
     },
     {
       "question_id": "TRV-006",
       "department": "Travel",
-      "question": "Starting July 1, 2026, what are the revised lodging allowance caps for metro areas and what flight class applies to domestic travel?",
+      "question": "Starting July 1, 2026, what is the revised nightly lodging accommodation cap for metropolitan cities under Travel Policy v2?",
       "role": "employee",
       "query_date": "2026-07-01",
       "difficulty": "hard",
       "question_type": "version_current",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-TRV-002_TRV-C02",
         "DOC-TRV-002_TRV-C03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Boundary query on the very first day of v2 (July 1, 2026) requiring synthesis across both flight and lodging clauses.",
-      "evidence_reason": "Clauses TRV-C02 and TRV-C03 in Travel Policy v2 govern revised flight class and INR 10,000 hotel caps."
+      "difficulty_reason": "Temporal boundary query on the first effective day of Travel Policy v2 (July 1, 2026), resolving the revised INR 7,500 metro hotel cap in contrast to v1.",
+      "evidence_reason": "Grounded in DOC-TRV-002 clause TRV-C03 establishing metropolitan hotel accommodations capped at INR 7,500 per night.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-002_TRV-C03",
+          "quote": "Standard hotel accommodations are capped at INR 7,500 per night in metropolitan cities and INR 5,000 in regional locations."
+        }
+      ]
     },
     {
       "question_id": "TRV-007",
       "department": "Travel",
-      "question": "When an employee books a premium hotel exceeding metro caps, what preferred booking tool must be used and how is the excess charged?",
+      "question": "Under current corporate travel rules, what is the maximum nightly hotel allowance for metropolitan locations, and through what system must all hotel reservations be booked?",
       "role": "finance",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -113,13 +148,23 @@
         "DOC-TRV-003_TRV-B01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document query requiring retrieval from both Travel Policy v2 and Travel Booking Policy for Finance.",
-      "evidence_reason": "Clause TRV-C03 defines lodging limits while TRV-B01 mandates corporate travel portal booking."
+      "difficulty_reason": "Cross-document synthesis requiring both lodging allowance terms in Travel Policy v2 and portal booking mandates in Travel Booking.",
+      "evidence_reason": "Grounded in DOC-TRV-002 clause TRV-C03 for hotel caps and DOC-TRV-003 clause TRV-B01 for mandatory Asterline Travel Portal reservations.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-002_TRV-C03",
+          "quote": "Standard hotel accommodations are capped at INR 7,500 per night in metropolitan cities and INR 5,000 in regional locations."
+        },
+        {
+          "chunk_id": "DOC-TRV-003_TRV-B01",
+          "quote": "All employee airline, railway, and hotel reservations must be booked exclusively through the designated Asterline Travel Portal."
+        }
+      ]
     },
     {
       "question_id": "TRV-008",
       "department": "Travel",
-      "question": "What escalation path and documentation are required when a business traveler requires a last-minute non-economy flight upgrade due to medical necessity?",
+      "question": "What approval authority is required for travel exception amounts up to INR 100,000, and what exemption applies to urgent customer-site deployments on less than 48 hours notice?",
       "role": "manager",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -130,13 +175,23 @@
         "DOC-TRV-004_TRV-E02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Requires manager permissions to access Travel Exceptions and synthesizes exception criteria with VP approval workflows.",
-      "evidence_reason": "Clauses TRV-E01 and TRV-E02 govern medical travel exceptions and required VP approval thresholds."
+      "difficulty_reason": "Requires manager-level role access and multi-clause synthesis of exception approval routes and emergency deployment advance booking waivers.",
+      "evidence_reason": "Grounded in DOC-TRV-004 clauses TRV-E01 (Department VP approval for exceptions <= INR 100,000) and TRV-E02 (advance booking exemption for urgent deployments).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-TRV-004_TRV-E01",
+          "quote": "When extraordinary business exigencies require exceeding standard travel caps, exception amounts up to and including INR 100,000 require approval from the Department Vice President."
+        },
+        {
+          "chunk_id": "DOC-TRV-004_TRV-E02",
+          "quote": "Urgent customer-site deployments requested on less than 48 hours notice are exempt from advance booking windows upon simultaneous notification to Finance Operations."
+        }
+      ]
     },
     {
       "question_id": "TRV-009",
       "department": "Travel",
-      "question": "What are the executive sign-off procedures and expense codes for confidential VIP travel exception waivers?",
+      "question": "What executive approval route is required when extraordinary travel exception expenses exceed INR 100,000 under the travel exceptions policy?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -146,8 +201,9 @@
       "restricted_target_chunk_ids": [
         "DOC-TRV-004_TRV-E01"
       ],
-      "difficulty_reason": "Permission diagnostic; employees are forbidden from accessing DOC-TRV-004 (manager/finance/auditor only).",
-      "evidence_reason": "DOC-TRV-004 is restricted to managers, finance, and auditors; regular employees are prohibited from viewing travel exception protocols."
+      "difficulty_reason": "Diagnostic test of role-based pre-retrieval filtering; role employee is forbidden from accessing Travel Exceptions (DOC-TRV-004).",
+      "evidence_reason": "DOC-TRV-004 is restricted to manager, finance, and auditor; employee queries must be completely filtered out prior to scoring.",
+      "gold_evidence": []
     },
     {
       "question_id": "TRV-010",
@@ -160,13 +216,14 @@
       "answerability": false,
       "gold_chunk_ids": [],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Unsupported diagnostic query targeting an unmentioned, out-of-scope concept.",
-      "evidence_reason": "Asterline travel policies do not provide reimbursement or allowances for personal pets on business trips."
+      "difficulty_reason": "Diagnostic test of retrieval refusal; query asks for non-existent pet travel reimbursement provisions.",
+      "evidence_reason": "Asterline travel policies do not provide reimbursement or allowances for personal pets on business trips.",
+      "gold_evidence": []
     },
     {
       "question_id": "FIN-001",
       "department": "Finance",
-      "question": "Within what standard timeframe must out-of-pocket business expense claims be submitted to qualify for regular reimbursement processing?",
+      "question": "Within how many days of expense incurrence must an employee submit an expense claim to be processed under regular reimbursement timelines?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "easy",
@@ -176,63 +233,85 @@
         "DOC-FIN-001_FIN-C02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Direct query on standard claim submission window without ambiguous wording about absolute deadlines.",
-      "evidence_reason": "Clause FIN-C02 states claims submitted within 30 days are processed under regular reimbursement timelines."
+      "difficulty_reason": "Direct single-clause factual lookup of the 30-day expense claim submission window.",
+      "evidence_reason": "Grounded in DOC-FIN-001 clause FIN-C02 defining regular processing for claims submitted within 30 days of incurrence.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-001_FIN-C02",
+          "quote": "Expense claims submitted within 30 days of expense incurrence are processed under regular reimbursement timelines."
+        }
+      ]
     },
     {
       "question_id": "FIN-002",
       "department": "Finance",
-      "question": "Does an out-of-pocket expense reimbursement claim of exactly INR 49,999 require secondary Director-level approval?",
+      "question": "Do incidental business expenses up to and including INR 1,000 require an itemized tax receipt, or is digital payment confirmation sufficient?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "medium",
       "question_type": "numeric_boundary",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-FIN-001_FIN-C01",
-        "DOC-FIN-001_FIN-C03"
+        "DOC-FIN-002_FIN-R03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Tests numerical boundary condition right below the INR 50,000 threshold (threshold - 1 = INR 49,999).",
-      "evidence_reason": "Clauses FIN-C01 and FIN-C03 establish that claims under INR 50,000 require only supervising manager sign-off within 5 days."
+      "difficulty_reason": "Numeric threshold boundary query testing the receipt exemption limit for incidental expenses <= INR 1,000.",
+      "evidence_reason": "Grounded in DOC-FIN-002 clause FIN-R03 specifying receipt requirements for incidental expenses up to INR 1,000.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-002_FIN-R03",
+          "quote": "Incidental business expenses up to and including INR 1,000 do not require an itemized tax receipt provided digital payment confirmation is attached."
+        }
+      ]
     },
     {
       "question_id": "FIN-003",
       "department": "Finance",
-      "question": "What approval hierarchy is mandatory for an employee expense voucher totaling exactly INR 50,000?",
+      "question": "Within how many working days of submission must supervising managers inspect supporting vouchers and approve or return subordinate expense claims?",
       "role": "auditor",
       "query_date": "2026-03-15",
       "difficulty": "medium",
-      "question_type": "numeric_boundary",
+      "question_type": "direct",
       "answerability": true,
       "gold_chunk_ids": [
         "DOC-FIN-001_FIN-C03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Boundary query on the exact INR 50,000 threshold evaluated for an auditor on historical date 2026-03-15.",
-      "evidence_reason": "Clause FIN-C03 establishes the escalation rules and SLA for claims touching the INR 50,000 threshold."
+      "difficulty_reason": "Direct lookup of the manager verification turnaround SLA by an auditor examining claim workflow timeliness.",
+      "evidence_reason": "Grounded in DOC-FIN-001 clause FIN-C03 establishing the mandatory five-working-day manager review SLA.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-001_FIN-C03",
+          "quote": "Supervising managers must inspect supporting vouchers and approve or return subordinate claims within five working days of submission."
+        }
+      ]
     },
     {
       "question_id": "FIN-004",
       "department": "Finance",
-      "question": "When an expense report reaches INR 50,001, what higher-level executive sign-off must Finance verify before disbursement?",
+      "question": "What is the standard monthly spending limit allocated to corporate credit cardholders, and what authorization is required when spending exceeds this amount?",
       "role": "finance",
       "query_date": "2026-06-30",
       "difficulty": "medium",
       "question_type": "numeric_boundary",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-FIN-001_FIN-C03",
-        "DOC-FIN-004_FIN-A01"
+        "DOC-FIN-003_FIN-K02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Threshold + 1 query (INR 50,001) requiring cross-document retrieval between Expense Claims and Expense Audits.",
-      "evidence_reason": "Clause FIN-C03 and FIN-A01 establish escalation and audit triggers for expenses exceeding INR 50,000."
+      "difficulty_reason": "Numeric boundary query on corporate card monthly spending caps and limit escalation approvals.",
+      "evidence_reason": "Grounded in DOC-FIN-003 clause FIN-K02 defining the INR 200,000 monthly spend limit and Finance Operations escalation authorization.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-003_FIN-K02",
+          "quote": "Corporate cardholders are allocated a standard monthly spending limit of INR 200,000. Monthly spending exceeding INR 200,000 requires card limit escalation and formal credit extension approved by Finance Operations."
+        }
+      ]
     },
     {
       "question_id": "FIN-005",
       "department": "Finance",
-      "question": "What is the supervisor SLA turnaround for claim approval and the subsequent reimbursement disbursement dates?",
+      "question": "Within what SLA must supervising managers review submitted expense claims, and on which dates each month are approved reimbursement disbursements deposited?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -243,13 +322,23 @@
         "DOC-FIN-002_FIN-R01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document multi-clause query testing coordination between manager SLA (5 days) and bi-weekly payment disbursement cycles.",
-      "evidence_reason": "Clause FIN-C03 sets the 5-day manager verification SLA, and clause FIN-R01 defines bi-weekly direct deposit payment cycles."
+      "difficulty_reason": "Cross-document synthesis combining manager verification turnaround in Expense Claims with semi-monthly payment schedules in Reimbursements.",
+      "evidence_reason": "Grounded in DOC-FIN-001 clause FIN-C03 (5 working days manager review SLA) and DOC-FIN-002 clause FIN-R01 (15th and final business day payment cycles).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-001_FIN-C03",
+          "quote": "Supervising managers must inspect supporting vouchers and approve or return subordinate claims within five working days of submission."
+        },
+        {
+          "chunk_id": "DOC-FIN-002_FIN-R01",
+          "quote": "Approved claims are disbursed twice monthly via direct bank deposit on the 15th and the final business day of each calendar month."
+        }
+      ]
     },
     {
       "question_id": "FIN-006",
       "department": "Finance",
-      "question": "If an expense report is sent back because of missing restaurant itemized receipts, what is the deadline to resubmit the corrected voucher?",
+      "question": "How are international business expenditures converted to Indian Rupees when settling foreign currency reimbursement claims?",
       "role": "employee",
       "query_date": "2026-03-15",
       "difficulty": "hard",
@@ -259,13 +348,19 @@
         "DOC-FIN-002_FIN-R02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Heavily paraphrased business query about returned claim remediation on historical date 2026-03-15.",
-      "evidence_reason": "Clause FIN-R02 outlines the rejection reasons and remediation timelines for returned expense vouchers."
+      "difficulty_reason": "Paraphrased lookup of currency conversion and exchange rate rules for international expenditure reimbursements.",
+      "evidence_reason": "Grounded in DOC-FIN-002 clause FIN-R02 requiring conversion using the official RBI reference rate published on transaction date.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-002_FIN-R02",
+          "quote": "International expenditures are settled in Indian Rupees using the official Reserve Bank of India reference rate published on the date of transaction."
+        }
+      ]
     },
     {
       "question_id": "FIN-007",
       "department": "Finance",
-      "question": "What criteria trigger mandatory random sampling audits on reimbursed expense accounts and what documentation must finance inspect?",
+      "question": "What receipt documentation is mandatory when incidental expenses exceed INR 1,000, and what minimum percentage of settled reimbursement claims must Internal Audit inspect during monthly audits?",
       "role": "finance",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -276,13 +371,23 @@
         "DOC-FIN-004_FIN-A01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document query combining reimbursement settlement logs with formal internal financial audit sampling rules.",
-      "evidence_reason": "Clause FIN-R03 mandates audit trail retention and FIN-A01 outlines mandatory quarterly audit sampling protocols."
+      "difficulty_reason": "Cross-document synthesis across Reimbursements and Expense Audits testing receipt threshold rules alongside audit sampling mandates.",
+      "evidence_reason": "Grounded in DOC-FIN-002 clause FIN-R03 (itemized tax invoice for expenses > INR 1,000) and DOC-FIN-004 clause FIN-A01 (10% minimum sampling in monthly audits).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-002_FIN-R03",
+          "quote": "Incidental expenses exceeding INR 1,000 strictly require an itemized tax invoice."
+        },
+        {
+          "chunk_id": "DOC-FIN-004_FIN-A01",
+          "quote": "Internal Audit performs regular monthly audits sampling a minimum of 10 percent of all settled employee expense reimbursement claims."
+        }
+      ]
     },
     {
       "question_id": "FIN-008",
       "department": "Finance",
-      "question": "What is the standard monthly credit limit on corporate cards and within how many business days must statement reconciliations be completed?",
+      "question": "What standard monthly spending limit applies to corporate cards, and within how many business days of monthly statement generation must expense reconciliations and receipts be submitted?",
       "role": "manager",
       "query_date": "2026-05-10",
       "difficulty": "hard",
@@ -293,13 +398,23 @@
         "DOC-FIN-003_FIN-K03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Restricted to managers; requires multi-clause synthesis of INR 200,000 credit limits and 10-day reconciliation deadlines.",
-      "evidence_reason": "Clauses FIN-K02 and FIN-K03 define corporate card spend caps and mandatory 10-day receipt reconciliation SLAs."
+      "difficulty_reason": "Multi-clause synthesis within Corporate Cards requiring role manager to retrieve both spending ceilings and reconciliation deadlines.",
+      "evidence_reason": "Grounded in DOC-FIN-003 clauses FIN-K02 (INR 200,000 monthly limit) and FIN-K03 (10 business days statement reconciliation submission).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-FIN-003_FIN-K02",
+          "quote": "Corporate cardholders are allocated a standard monthly spending limit of INR 200,000."
+        },
+        {
+          "chunk_id": "DOC-FIN-003_FIN-K03",
+          "quote": "Cardholders must submit expense reconciliations and itemized receipts within ten business days of monthly billing cycle statement generation."
+        }
+      ]
     },
     {
       "question_id": "FIN-009",
       "department": "Finance",
-      "question": "How can an employee apply for an individual corporate credit card and obtain a monthly spending limit increase?",
+      "question": "Who is eligible to be issued an Asterline corporate credit card, and what approval is required for card limit escalation?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -310,8 +425,9 @@
         "DOC-FIN-003_FIN-K01",
         "DOC-FIN-003_FIN-K02"
       ],
-      "difficulty_reason": "Permission diagnostic; general employees cannot access Corporate Card Policy (manager/finance/auditor only).",
-      "evidence_reason": "DOC-FIN-003 is restricted to managers and finance personnel; standard employees are not authorized to view card issuance rules."
+      "difficulty_reason": "Diagnostic test of role-based pre-filtering; role employee is forbidden from accessing Corporate Cards (DOC-FIN-003).",
+      "evidence_reason": "DOC-FIN-003 is restricted to manager, finance, and auditor; employee queries must be completely filtered out prior to scoring.",
+      "gold_evidence": []
     },
     {
       "question_id": "FIN-010",
@@ -324,13 +440,14 @@
       "answerability": false,
       "gold_chunk_ids": [],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Unsupported diagnostic query targeting an unmentioned payment instrument.",
-      "evidence_reason": "Asterline financial policies require standard fiat currency invoices and do not support cryptocurrency reimbursement."
+      "difficulty_reason": "Diagnostic test of retrieval refusal; query asks for non-existent cryptocurrency reimbursement provisions.",
+      "evidence_reason": "Asterline financial policies require standard fiat currency invoices and do not support cryptocurrency reimbursement.",
+      "gold_evidence": []
     },
     {
       "question_id": "PPO-001",
       "department": "People Operations",
-      "question": "How many annual paid vacation days do regular full-time Asterline employees accrue each calendar year?",
+      "question": "How many working days of paid annual vacation do full-time employees accrue per year?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "easy",
@@ -340,13 +457,19 @@
         "DOC-PPO-001_PPO-L01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Direct clause query for statutory annual leave accrual rates.",
-      "evidence_reason": "Clause PPO-L01 specifies that full-time staff accrue 20 days of paid annual vacation leave per calendar year."
+      "difficulty_reason": "Direct single-clause factual lookup of the baseline 20 working days annual vacation entitlement.",
+      "evidence_reason": "Grounded in DOC-PPO-001 clause PPO-L01 defining annual vacation accrual of 20 working days per year.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-001_PPO-L01",
+          "quote": "Full-time employees accrue 20 working days of paid annual vacation per year, credited pro-rata at the rate of 1.67 days per completed calendar month."
+        }
+      ]
     },
     {
       "question_id": "PPO-002",
       "department": "People Operations",
-      "question": "Under the employee leave policy, what medical documentation is required when a team member is absent on sick leave for more than three consecutive days?",
+      "question": "Under the employee leave policy, what medical documentation is required when an employee takes sick leave exceeding three consecutive days?",
       "role": "hr",
       "query_date": "2026-03-15",
       "difficulty": "medium",
@@ -356,62 +479,90 @@
         "DOC-PPO-001_PPO-L02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Queried by HR on historical date 2026-03-15 regarding sick leave certification requirements.",
-      "evidence_reason": "Clause PPO-L02 requires a certified medical practitioner certificate for sick leave absences exceeding three consecutive days."
+      "difficulty_reason": "Threshold boundary query on medical practitioner certificate requirements for extended sick leaves.",
+      "evidence_reason": "Grounded in DOC-PPO-001 clause PPO-L02 requiring a registered medical practitioner certificate for sick leave exceeding 3 days.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-001_PPO-L02",
+          "quote": "Consecutive sick leave exceeding 3 days requires a medical certificate issued by a registered medical practitioner."
+        }
+      ]
     },
     {
       "question_id": "PPO-003",
       "department": "People Operations",
-      "question": "What core collaboration hours must remote and home-based personnel remain active online on company communication channels?",
+      "question": "During what specific daily hours must remote employees maintain active availability on company chat and video conferencing?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "medium",
       "question_type": "paraphrased",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-PPO-002_PPO-R02"
+        "DOC-PPO-002_PPO-R03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Uses natural business paraphrasing ('collaboration hours', 'remote and home-based personnel') to locate core working hour requirements.",
-      "evidence_reason": "Clause PPO-R02 defines mandatory core collaboration hours between 10:00 AM and 4:00 PM local time."
+      "difficulty_reason": "Paraphrased lookup of telecommuting core working window requirements.",
+      "evidence_reason": "Grounded in DOC-PPO-002 clause PPO-R03 requiring accessibility on company chat and video between 10:00 AM and 4:00 PM local time.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-002_PPO-R03",
+          "quote": "Remote employees must remain accessible via company chat and video conferencing during core business hours between 10:00 AM and 4:00 PM local time."
+        }
+      ]
     },
     {
       "question_id": "PPO-004",
       "department": "People Operations",
-      "question": "What is the maximum yearly financial grant allocated to staff for external professional education courses and certification exams?",
+      "question": "What is the maximum annual educational assistance amount that can be granted under standard reporting manager approval without committee review?",
       "role": "employee",
       "query_date": "2026-06-30",
       "difficulty": "medium",
       "question_type": "direct",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-PPO-003_PPO-B01"
+        "DOC-PPO-003_PPO-B02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Direct financial threshold query evaluated on historical date 2026-06-30.",
-      "evidence_reason": "Clause PPO-B01 provides up to INR 75,000 per calendar year for pre-approved professional courses and certifications."
+      "difficulty_reason": "Numeric threshold query on the INR 75,000 reporting manager approval limit for learning benefits.",
+      "evidence_reason": "Grounded in DOC-PPO-003 clause PPO-B02 defining standard manager approval for assistance up to INR 75,000.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-003_PPO-B02",
+          "quote": "Annual educational assistance up to and including INR 75,000 is granted under standard reporting manager approval."
+        }
+      ]
     },
     {
       "question_id": "PPO-005",
       "department": "People Operations",
-      "question": "What notice period must an employee provide before taking extended leave, and what workspace setup stipend is provided when working remotely?",
+      "question": "How many paid annual vacation days do full-time employees accrue, and how many remote work days per week can an employee request after completing their probationary evaluation?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "hard",
       "question_type": "cross_document",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-PPO-001_PPO-L03",
+        "DOC-PPO-001_PPO-L01",
         "DOC-PPO-002_PPO-R01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document query requiring synthesis between Leave Policy advance notice rules and Remote Work ergonomic stipend allowances.",
-      "evidence_reason": "Clause PPO-L03 requires two weeks advance notice for extended leave and PPO-R01 provides a one-time ergonomic setup stipend."
+      "difficulty_reason": "Cross-document synthesis between Leave Policy (vacation accrual rate) and Remote Work (post-probation remote day allocation).",
+      "evidence_reason": "Grounded in DOC-PPO-001 clause PPO-L01 (20 days paid vacation) and DOC-PPO-002 clause PPO-R01 (up to 3 remote work days after 3-month probation).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-001_PPO-L01",
+          "quote": "Full-time employees accrue 20 working days of paid annual vacation per year, credited pro-rata at the rate of 1.67 days per completed calendar month."
+        },
+        {
+          "chunk_id": "DOC-PPO-002_PPO-R01",
+          "quote": "Employees having completed their initial three-month probationary evaluation with satisfactory performance may request up to three remote work days per week."
+        }
+      ]
     },
     {
       "question_id": "PPO-006",
       "department": "People Operations",
-      "question": "Under remote work guidelines, what information security prerequisites must managers verify before approving full-time telecommuting?",
+      "question": "During what core hours must remote workers remain accessible on company channels, and what rule governs transferring Confidential or Restricted documents outside authorized networks?",
       "role": "manager",
       "query_date": "2026-05-10",
       "difficulty": "hard",
@@ -419,33 +570,53 @@
       "answerability": true,
       "gold_chunk_ids": [
         "DOC-PPO-002_PPO-R03",
-        "DOC-SEC-001_SEC-D02"
+        "DOC-SEC-001_SEC-D03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document query connecting People Operations remote work approvals with Information Security physical handling rules.",
-      "evidence_reason": "Clause PPO-R03 outlines remote workspace security conditions and SEC-D02 details secure handling of confidential business data."
+      "difficulty_reason": "Cross-department synthesis bridging People Operations telecommuting standards with Information Security document transfer regulations.",
+      "evidence_reason": "Grounded in DOC-PPO-002 clause PPO-R03 (core availability hours) and DOC-SEC-001 clause SEC-D03 (prohibition on unauthorized network transfer).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-002_PPO-R03",
+          "quote": "Remote employees must remain accessible via company chat and video conferencing during core business hours between 10:00 AM and 4:00 PM local time."
+        },
+        {
+          "chunk_id": "DOC-SEC-001_SEC-D03",
+          "quote": "Confidential and Restricted documents must bear prominent visual classification headers and may not be transferred outside authorized networks without security approval."
+        }
+      ]
     },
     {
       "question_id": "PPO-007",
       "department": "People Operations",
-      "question": "What grade or completion proof must an employee provide to claim tuition reimbursement, and what is the mandatory retention service period after receiving learning funds?",
+      "question": "What continuous service tenure is required before permanent employees become eligible for tuition assistance, and within how many days of course conclusion must completion proof be submitted?",
       "role": "hr",
       "query_date": "2026-11-22",
       "difficulty": "hard",
       "question_type": "cross_clause",
       "answerability": true,
       "gold_chunk_ids": [
-        "DOC-PPO-003_PPO-B02",
+        "DOC-PPO-003_PPO-B01",
         "DOC-PPO-003_PPO-B03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Requires multi-clause synthesis of academic grade minimums (Grade B/Pass) and the 12-month post-completion service retention commitment.",
-      "evidence_reason": "Clauses PPO-B02 and PPO-B03 mandate passing grade verification and enforce a 12-month clawback service period."
+      "difficulty_reason": "Multi-clause synthesis within Learning Benefits combining tuition service prerequisites with post-course transcript submission deadlines.",
+      "evidence_reason": "Grounded in DOC-PPO-003 clauses PPO-B01 (6 months continuous service) and PPO-B03 (45 days completion proof submission window).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-003_PPO-B01",
+          "quote": "Permanent employees with at least six months of continuous service are eligible to claim tuition assistance for accredited job-relevant degree or certification courses."
+        },
+        {
+          "chunk_id": "DOC-PPO-003_PPO-B03",
+          "quote": "Reimbursement disbursement requires submitting an official passing grade transcript or certificate of completion within 45 days of course conclusion."
+        }
+      ]
     },
     {
       "question_id": "PPO-008",
       "department": "People Operations",
-      "question": "What relocation allowance tiers and relocation leave days are granted when an employee accepts a permanent inter-office transfer?",
+      "question": "What minimum tenure in their current role must employees complete before applying for internal mobility, and which leaders must provide written agreement to authorize the transfer?",
       "role": "hr",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -456,13 +627,23 @@
         "DOC-PPO-004_PPO-T02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Accessible exclusively to HR and Managers; synthesizes relocation financial allowances with moving leave entitlements from DOC-PPO-004.",
-      "evidence_reason": "Clauses PPO-T01 and PPO-T02 specify inter-office transfer relocation assistance budgets and paid transitional leave."
+      "difficulty_reason": "Requires HR-role permissions and multi-clause synthesis of internal mobility eligibility rules and multi-party sign-off requirements.",
+      "evidence_reason": "Grounded in DOC-PPO-004 clauses PPO-T01 (12 months tenure) and PPO-T02 (written agreement from releasing head, acquiring head, and HRBP).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PPO-004_PPO-T01",
+          "quote": "Employees must complete a minimum tenure of twelve consecutive months in their current role with satisfactory performance before applying for internal transfers."
+        },
+        {
+          "chunk_id": "DOC-PPO-004_PPO-T02",
+          "quote": "Internal transfers require written agreement from the releasing department head, the acquiring department head, and People Operations HR Business Partner."
+        }
+      ]
     },
     {
       "question_id": "PPO-009",
       "department": "People Operations",
-      "question": "What are the internal management guidelines and discretionary packages for executive relocation and branch transfers?",
+      "question": "What minimum tenure and performance criteria are required for an employee to apply for an internal transfer under the employee transfer policy?",
       "role": "auditor",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -472,8 +653,9 @@
       "restricted_target_chunk_ids": [
         "DOC-PPO-004_PPO-T01"
       ],
-      "difficulty_reason": "Permission diagnostic involving non-employee role; auditors are explicitly excluded from DOC-PPO-004 (manager/hr only).",
-      "evidence_reason": "DOC-PPO-004 is restricted to HR and Management; internal auditors are unauthorized to access executive transfer records."
+      "difficulty_reason": "Diagnostic test of non-employee role restriction; auditor is strictly forbidden from accessing Employee Transfers (DOC-PPO-004).",
+      "evidence_reason": "DOC-PPO-004 is restricted to manager and hr; auditor queries must be completely filtered out prior to scoring.",
+      "gold_evidence": []
     },
     {
       "question_id": "PPO-010",
@@ -486,13 +668,14 @@
       "answerability": false,
       "gold_chunk_ids": [],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Unsupported diagnostic query targeting an unmentioned leave category.",
-      "evidence_reason": "Asterline People Operations policies define vacation, sick, and bereavement leave, but do not provide a global travel sabbatical policy."
+      "difficulty_reason": "Diagnostic test of retrieval refusal; query asks for non-existent global travel sabbatical policies.",
+      "evidence_reason": "Asterline People Operations policies define vacation, sick, and parental leave, but do not provide a global travel sabbatical policy.",
+      "gold_evidence": []
     },
     {
       "question_id": "PRC-001",
       "department": "Procurement",
-      "question": "What software tool must employees use to create and track internal purchase requisitions for routine office supplies?",
+      "question": "In what enterprise system must all commercial purchases of hardware, software, licenses, or professional services originate?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "easy",
@@ -502,13 +685,19 @@
         "DOC-PRC-001_PRC-P01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Direct query on internal procurement requisition software submission requirements.",
-      "evidence_reason": "Clause PRC-P01 mandates submitting all office supply requisitions through the central Asterline Procurement Portal."
+      "difficulty_reason": "Direct single-clause factual lookup of the ERP purchase requisition origination rule.",
+      "evidence_reason": "Grounded in DOC-PRC-001 clause PRC-P01 mandating electronic Purchase Requisitions in the enterprise ERP.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-001_PRC-P01",
+          "quote": "All commercial purchases of hardware, software, licenses, or professional services must originate as an approved electronic Purchase Requisition in the enterprise ERP."
+        }
+      ]
     },
     {
       "question_id": "PRC-002",
       "department": "Procurement",
-      "question": "At what financial threshold does a goods purchase requisition strictly require competitive bidding with three independent supplier quotes?",
+      "question": "Can a purchase order of exactly INR 150,000 be processed with a single qualified vendor quote under the competitive bidding rules?",
       "role": "auditor",
       "query_date": "2026-03-15",
       "difficulty": "medium",
@@ -518,13 +707,19 @@
         "DOC-PRC-001_PRC-P02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Boundary query on the exact INR 150,000 procurement threshold evaluated for an auditor on historical date 2026-03-15.",
-      "evidence_reason": "Clause PRC-P02 states that purchases exceeding INR 150,000 mandate obtaining at least three competitive supplier bids."
+      "difficulty_reason": "Numeric threshold boundary query testing whether INR 150,000 is within single-quote eligibility or triggers competitive bidding.",
+      "evidence_reason": "Grounded in DOC-PRC-001 clause PRC-P02 permitting single-quote processing up to and including INR 150,000.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-001_PRC-P02",
+          "quote": "Purchase orders up to and including INR 150,000 may be processed with a single qualified vendor quote."
+        }
+      ]
     },
     {
       "question_id": "PRC-003",
       "department": "Procurement",
-      "question": "If a software licensing purchase requisition comes out to exactly INR 150,001, what formal vendor evaluation documents must be attached?",
+      "question": "How many independent competitive bids are required when a purchase order exceeds INR 150,000, and who has authority to enter into commercial contracts?",
       "role": "manager",
       "query_date": "2026-06-30",
       "difficulty": "medium",
@@ -535,13 +730,23 @@
         "DOC-PRC-003_PRC-C01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Threshold + 1 query (INR 150,001) requiring cross-document retrieval between Purchase Requests and Contract Approval.",
-      "evidence_reason": "Clause PRC-P02 mandates competitive quote attachments over INR 150,000, and PRC-C01 details contract review standards."
+      "difficulty_reason": "Cross-document synthesis of competitive bidding thresholds and contract signatory authorizations.",
+      "evidence_reason": "Grounded in DOC-PRC-001 clause PRC-P02 (3 competitive bids for > INR 150,000) and DOC-PRC-003 clause PRC-C01 (signatories in Delegation of Authority matrix).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-001_PRC-P02",
+          "quote": "Purchase orders exceeding INR 150,000 strictly require at least three independent competitive bids submitted to Procurement."
+        },
+        {
+          "chunk_id": "DOC-PRC-003_PRC-C01",
+          "quote": "Commercial contracts may only be entered into by designated corporate signatories defined in the corporate Delegation of Authority matrix."
+        }
+      ]
     },
     {
       "question_id": "PRC-004",
       "department": "Procurement",
-      "question": "Under emergency procurement rules, what is the spending ceiling that a Director can authorize without Board Procurement Committee review?",
+      "question": "Under emergency procurement rules, what is the maximum spending cap that can proceed under Director emergency approval without Board Procurement Committee review?",
       "role": "manager",
       "query_date": "2026-03-15",
       "difficulty": "medium",
@@ -551,13 +756,19 @@
         "DOC-PRC-004_PRC-E01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Targeting DOC-PRC-004 (Purchase Exceptions) on historical date 2026-03-15 for manager role; verifies INR 300,000 emergency limit.",
-      "evidence_reason": "Clause PRC-E01 caps Director-authorized emergency procurement at INR 300,000, requiring Board approval above that figure."
+      "difficulty_reason": "Requires manager-level access to retrieve emergency procurement ceiling thresholds under operational disruptions.",
+      "evidence_reason": "Grounded in DOC-PRC-004 clause PRC-E01 setting the Director emergency approval limit at INR 300,000.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-004_PRC-E01",
+          "quote": "In critical operational emergencies impacting business continuity, emergency purchases up to and including INR 300,000 may proceed under Director emergency approval."
+        }
+      ]
     },
     {
       "question_id": "PRC-005",
       "department": "Procurement",
-      "question": "What turnaround SLA should staff anticipate for standard equipment purchase order generation after departmental manager sign-off?",
+      "question": "In what system must commercial purchase requisitions originate, and what minimum inspection warranty period from receipt must purchase orders include?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -568,13 +779,23 @@
         "DOC-PRC-001_PRC-P03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Paraphrased multi-clause query connecting requisition creation to purchase order issuance SLAs.",
-      "evidence_reason": "Clauses PRC-P01 and PRC-P03 detail purchase request intake and the three-business-day PO issuance SLA."
+      "difficulty_reason": "Multi-clause synthesis within Purchase Requests requiring retrieval of both ERP origination rules and standard commercial warranty terms.",
+      "evidence_reason": "Grounded in DOC-PRC-001 clauses PRC-P01 (ERP purchase requisition) and PRC-P03 (30-day inspection warranty period from receipt).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-001_PRC-P01",
+          "quote": "All commercial purchases of hardware, software, licenses, or professional services must originate as an approved electronic Purchase Requisition in the enterprise ERP."
+        },
+        {
+          "chunk_id": "DOC-PRC-001_PRC-P03",
+          "quote": "All purchase orders must incorporate standard commercial freight terms and a minimum 30-day inspection warranty period from receipt."
+        }
+      ]
     },
     {
       "question_id": "PRC-006",
       "department": "Procurement",
-      "question": "What financial compliance checks, tax clearances, and credit history reviews are mandatory before onboarding an external commercial vendor?",
+      "question": "What statutory due diligence checks are mandatory for prospective suppliers, and what assessment must vendors complete if they handle proprietary company data?",
       "role": "finance",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -585,13 +806,23 @@
         "DOC-PRC-002_PRC-V02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Restricted to management and finance; requires detailed analysis of supplier financial screening and statutory tax certificates.",
-      "evidence_reason": "Clauses PRC-V01 and PRC-V02 outline supplier vetting criteria, GSTIN verification, and financial solvency reviews."
+      "difficulty_reason": "Multi-clause synthesis within Vendor Onboarding requiring role finance to retrieve corporate due diligence and security assessment prerequisites.",
+      "evidence_reason": "Grounded in DOC-PRC-002 clauses PRC-V01 (statutory due diligence) and PRC-V02 (Information Security Supplier Assessment).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-002_PRC-V01",
+          "quote": "Prospective suppliers must undergo statutory due diligence including corporate registration validation, tax compliance certificates, and credit screening."
+        },
+        {
+          "chunk_id": "DOC-PRC-002_PRC-V02",
+          "quote": "Vendors handling proprietary company data or connecting to internal systems must complete an Information Security Supplier Assessment prior to contract signing."
+        }
+      ]
     },
     {
       "question_id": "PRC-007",
       "department": "Procurement",
-      "question": "When critical server downtime requires an emergency spare parts purchase exceeding normal bidding, what ratification timeline and sole-source criteria apply?",
+      "question": "What spending ceiling governs emergency purchases under Director approval, and within how many business days must emergency orders be submitted for ratification?",
       "role": "manager",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -602,13 +833,23 @@
         "DOC-PRC-004_PRC-E03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Synthesizes emergency purchase limits with the mandatory 10-business-day post-incident ratification requirement in DOC-PRC-004.",
-      "evidence_reason": "Clause PRC-E01 permits emergency hardware purchases and PRC-E03 requires formal documentation ratification within 10 days."
+      "difficulty_reason": "Multi-clause synthesis within Purchase Exceptions linking operational emergency financial caps with mandatory retroactive ratification timelines.",
+      "evidence_reason": "Grounded in DOC-PRC-004 clauses PRC-E01 (INR 300,000 emergency spending cap) and PRC-E03 (10 business days ratification requirement).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-004_PRC-E01",
+          "quote": "In critical operational emergencies impacting business continuity, emergency purchases up to and including INR 300,000 may proceed under Director emergency approval."
+        },
+        {
+          "chunk_id": "DOC-PRC-004_PRC-E03",
+          "quote": "All emergency purchase orders must be formally submitted for retroactive documentation and invoice ratification within ten business days of issuance."
+        }
+      ]
     },
     {
       "question_id": "PRC-008",
       "department": "Procurement",
-      "question": "What legal indemnification terms and annual performance SLA reviews are required for multi-year enterprise vendor contracts?",
+      "question": "What compliance code must all onboarded suppliers execute, and what sign-off is required for vendor contracts with duration exceeding 12 months?",
       "role": "auditor",
       "query_date": "2026-05-10",
       "difficulty": "hard",
@@ -619,13 +860,23 @@
         "DOC-PRC-003_PRC-C02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document synthesis between Vendor Onboarding annual SLA scoring and Contract Approval legal indemnification clauses.",
-      "evidence_reason": "Clause PRC-V03 requires annual supplier SLA audits and PRC-C02 mandates standard liability and indemnification clauses."
+      "difficulty_reason": "Cross-document synthesis across Vendor Onboarding and Contract Approval verifying ethics code execution alongside multi-year contract approval rules.",
+      "evidence_reason": "Grounded in DOC-PRC-002 clause PRC-V03 (Supplier Code of Conduct) and DOC-PRC-003 clause PRC-C02 (Legal Counsel and Procurement joint sign-off for > 12 months).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-PRC-002_PRC-V03",
+          "quote": "All onboarded suppliers must execute the Asterline Supplier Code of Conduct affirming strict compliance with anti-bribery and fair labor regulations."
+        },
+        {
+          "chunk_id": "DOC-PRC-003_PRC-C02",
+          "quote": "Vendor contracts with duration exceeding 12 months require joint sign-off from Legal Counsel and Procurement."
+        }
+      ]
     },
     {
       "question_id": "PRC-009",
       "department": "Procurement",
-      "question": "Where can staff view confidential commercial supplier discount schedules and vendor performance rating scorecards?",
+      "question": "What supplier code of conduct must onboarded vendors sign affirming compliance with anti-bribery and fair labor regulations?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -635,8 +886,9 @@
       "restricted_target_chunk_ids": [
         "DOC-PRC-002_PRC-V03"
       ],
-      "difficulty_reason": "Permission diagnostic; regular employees cannot access Vendor Onboarding/Evaluation (manager/finance/auditor only).",
-      "evidence_reason": "DOC-PRC-002 is restricted to managers and finance; general employees cannot access supplier evaluations or commercial scorecards."
+      "difficulty_reason": "Diagnostic test of role-based pre-filtering; role employee is forbidden from accessing Vendor Onboarding (DOC-PRC-002).",
+      "evidence_reason": "DOC-PRC-002 is restricted to manager, finance, and auditor; employee queries must be completely filtered out prior to scoring.",
+      "gold_evidence": []
     },
     {
       "question_id": "PRC-010",
@@ -649,13 +901,14 @@
       "answerability": false,
       "gold_chunk_ids": [],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Unsupported diagnostic query targeting an unmentioned barter mechanism.",
-      "evidence_reason": "Asterline procurement rules strictly mandate competitive currency transactions and do not recognize non-monetary asset bartering."
+      "difficulty_reason": "Diagnostic test of retrieval refusal; query asks for non-existent asset bartering practices.",
+      "evidence_reason": "Asterline procurement rules strictly mandate competitive currency transactions and do not recognize non-monetary asset bartering.",
+      "gold_evidence": []
     },
     {
       "question_id": "SEC-001",
       "department": "Information Security",
-      "question": "What four data classification labels does Asterline designate to categorize enterprise records and digital assets?",
+      "question": "What four data classification tiers does Asterline establish for digital and physical information assets?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "easy",
@@ -665,13 +918,19 @@
         "DOC-SEC-001_SEC-D01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Direct clause query for the four standard security classification levels.",
-      "evidence_reason": "Clause SEC-D01 defines the four enterprise classification tiers: Public, Internal, Confidential, and Restricted."
+      "difficulty_reason": "Direct single-clause factual lookup of the four enterprise data classification tiers.",
+      "evidence_reason": "Grounded in DOC-SEC-001 clause SEC-D01 enumerating Public, Internal, Confidential, and Restricted tiers.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-001_SEC-D01",
+          "quote": "All Asterline digital and physical information assets are classified into four tiers: Public, Internal, Confidential, and Restricted based on business impact."
+        }
+      ]
     },
     {
       "question_id": "SEC-002",
       "department": "Information Security",
-      "question": "What physical and electronic handling protections are mandatory when transferring customer-identifiable information classified as Restricted?",
+      "question": "What encryption standard and access authorization model are mandatory for data classified as Restricted under the data classification policy?",
       "role": "auditor",
       "query_date": "2026-03-15",
       "difficulty": "medium",
@@ -681,13 +940,19 @@
         "DOC-SEC-001_SEC-D02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Evaluated on historical date 2026-03-15 for auditor role regarding Restricted asset handling safeguards.",
-      "evidence_reason": "Clause SEC-D02 specifies AES-256 encryption at rest and in transit for all data labeled Restricted."
+      "difficulty_reason": "Direct lookup of technical encryption and dual authorization controls for the Restricted classification tier.",
+      "evidence_reason": "Grounded in DOC-SEC-001 clause SEC-D02 requiring hardware security module tokenized encryption and dual authorization.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-001_SEC-D02",
+          "quote": "Data classified as Restricted requires hardware security module tokenized encryption and dual authorization for access."
+        }
+      ]
     },
     {
       "question_id": "SEC-003",
       "department": "Information Security",
-      "question": "How frequently must system administrators and team managers recertify user accounts with elevated infrastructure privileges?",
+      "question": "At what maximum interval must privileged and administrative user accounts undergo recertification review before being subject to automatic suspension?",
       "role": "manager",
       "query_date": "2026-11-22",
       "difficulty": "medium",
@@ -697,13 +962,19 @@
         "DOC-SEC-002_SEC-A02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Uses conversational terminology ('system administrators', 'elevated infrastructure privileges') to identify the 90-day review cadence.",
-      "evidence_reason": "Clause SEC-A02 requires quarterly (every 90 days) access audits and formal recertification for privileged accounts."
+      "difficulty_reason": "Paraphrased lookup of privileged access governance and recertification review intervals.",
+      "evidence_reason": "Grounded in DOC-SEC-002 clause SEC-A02 establishing the 90-day recertification review cycle and automatic suspension sanction.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-002_SEC-A02",
+          "quote": "Privileged and administrative access rights must undergo recertification review at intervals up to and including 90 days. Privileged accounts exceeding 90 days without recertification are subject to automatic account suspension."
+        }
+      ]
     },
     {
       "question_id": "SEC-004",
       "department": "Information Security",
-      "question": "What is the maximum permissible window within which staff must notify security personnel after suspecting a phishing breach or laptop theft?",
+      "question": "Into what four severity priority tiers are security incidents categorized according to system impact?",
       "role": "employee",
       "query_date": "2026-11-22",
       "difficulty": "medium",
@@ -713,13 +984,19 @@
         "DOC-SEC-003_SEC-I01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Paraphrases incident types ('phishing breach', 'laptop theft') to test the mandatory incident reporting SLA.",
-      "evidence_reason": "Clause SEC-I01 requires all suspected security incidents to be reported to the SOC within one hour of discovery."
+      "difficulty_reason": "Paraphrased lookup of incident management severity categorization and impact triage.",
+      "evidence_reason": "Grounded in DOC-SEC-003 clause SEC-I01 defining Priority 1 through Priority 4 security incident severity levels.",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-003_SEC-I01",
+          "quote": "Security incidents are triaged into Priority 1 (Critical), Priority 2 (Major), Priority 3 (Moderate), and Priority 4 (Minor) according to system impact."
+        }
+      ]
     },
     {
       "question_id": "SEC-005",
       "department": "Information Security",
-      "question": "When an employee handles customer financial data marked Restricted, what access request approvals are required and what encryption standard applies?",
+      "question": "What principle governs user account access provisioning, and what encryption standard is mandatory for information assets classified as Confidential?",
       "role": "security",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -730,13 +1007,23 @@
         "DOC-SEC-002_SEC-A01"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document query linking Data Classification handling controls with Access Requests approval workflows.",
-      "evidence_reason": "Clause SEC-D02 mandates AES-256 encryption and SEC-A01 requires formal manager and data custodian approval."
+      "difficulty_reason": "Cross-document synthesis between Data Classification (Confidential tier encryption) and Access Requests (least privilege principle).",
+      "evidence_reason": "Grounded in DOC-SEC-001 clause SEC-D02 (AES-256 encryption) and DOC-SEC-002 clause SEC-A01 (least privilege principle).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-001_SEC-D02",
+          "quote": "Data classified as Confidential requires mandatory AES-256 encryption at rest and in transit."
+        },
+        {
+          "chunk_id": "DOC-SEC-002_SEC-A01",
+          "quote": "User accounts are provisioned solely with access permissions necessary to fulfill designated job responsibilities following the principle of least privilege."
+        }
+      ]
     },
     {
       "question_id": "SEC-006",
       "department": "Information Security",
-      "question": "What multi-factor authentication requirements must staff fulfill when logging in remotely, and what emergency offboarding step revokes credentials immediately?",
+      "question": "What deployment restriction applies to personnel assigned code development duties, and within what timeframe following incident closure must a post-incident report be published to the CISO?",
       "role": "employee",
       "query_date": "2026-06-30",
       "difficulty": "hard",
@@ -747,13 +1034,23 @@
         "DOC-SEC-003_SEC-I03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Cross-document synthesis between Remote MFA enforcement and emergency security incident containment measures.",
-      "evidence_reason": "Clause SEC-A03 enforces hardware/app MFA and SEC-I03 details immediate token revocation upon incident detection."
+      "difficulty_reason": "Cross-document synthesis combining developer separation of duties in Access Requests with formal incident reporting SLAs in Incident Reporting.",
+      "evidence_reason": "Grounded in DOC-SEC-002 clause SEC-A03 (prohibition on production deployment permissions without break-glass waiver) and DOC-SEC-003 clause SEC-I03 (72 hours post-incident report).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-002_SEC-A03",
+          "quote": "Personnel assigned code development duties may not hold administrative deployment permissions on production databases without a temporary break-glass waiver."
+        },
+        {
+          "chunk_id": "DOC-SEC-003_SEC-I03",
+          "quote": "A comprehensive post-incident analysis and remediation report must be published to the Chief Information Security Officer within 72 hours of incident closure."
+        }
+      ]
     },
     {
       "question_id": "SEC-007",
       "department": "Information Security",
-      "question": "What classification severity determines a Major Incident, and within what timeframe must the incident response team produce a root cause analysis report?",
+      "question": "Within what SLA must Priority 1 critical security incidents be contained, and within how many hours of incident closure must the remediation report be published to the CISO?",
       "role": "security",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -764,13 +1061,23 @@
         "DOC-SEC-003_SEC-I03"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Requires multi-clause synthesis of incident severity classification tiers and post-incident forensic reporting SLAs.",
-      "evidence_reason": "Clauses SEC-I02 and SEC-I03 define Severity-1 criteria and mandate delivering a comprehensive post-mortem within 5 days."
+      "difficulty_reason": "Multi-clause synthesis within Incident Reporting requiring role security to synthesize containment response timelines with post-mortem documentation deadlines.",
+      "evidence_reason": "Grounded in DOC-SEC-003 clauses SEC-I02 (containment within 1 hour) and SEC-I03 (post-mortem report to CISO within 72 hours).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-003_SEC-I02",
+          "quote": "Priority 1 critical incidents involving confirmed system compromise must be responded to and contained within 1 hour of alert generation."
+        },
+        {
+          "chunk_id": "DOC-SEC-003_SEC-I03",
+          "quote": "A comprehensive post-incident analysis and remediation report must be published to the Chief Information Security Officer within 72 hours of incident closure."
+        }
+      ]
     },
     {
       "question_id": "SEC-008",
       "department": "Information Security",
-      "question": "What statutory retention duration applies to employee payroll ledgers, and what standard must be followed when sanitizing decommissioned server drives?",
+      "question": "How many years must employee payroll and financial ledger records be preserved, and what standard governs the sanitization of decommissioned storage drives?",
       "role": "security",
       "query_date": "2026-03-15",
       "difficulty": "hard",
@@ -781,13 +1088,23 @@
         "DOC-SEC-004_SEC-R02"
       ],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Accessible only to Security and Auditors; covers DOC-SEC-004 on historical date 2026-03-15; combines 7-year payroll retention with NIST SP 800-88.",
-      "evidence_reason": "Clause SEC-R01 mandates 7-year payroll retention and SEC-R02 requires NIST SP 800-88 sanitization or degaussing."
+      "difficulty_reason": "Multi-clause synthesis within Data Retention requiring role security to retrieve statutory retention schedules alongside hardware sanitization protocols.",
+      "evidence_reason": "Grounded in DOC-SEC-004 clauses SEC-R01 (seven calendar years retention) and SEC-R02 (NIST SP 800-88 purge or physical degaussing).",
+      "gold_evidence": [
+        {
+          "chunk_id": "DOC-SEC-004_SEC-R01",
+          "quote": "Employee payroll and financial ledger records must be preserved for seven calendar years."
+        },
+        {
+          "chunk_id": "DOC-SEC-004_SEC-R02",
+          "quote": "Decommissioned storage drives must be purged in compliance with NIST SP 800-88 standards or physically degaussed before disposal."
+        }
+      ]
     },
     {
       "question_id": "SEC-009",
       "department": "Information Security",
-      "question": "What internal cryptographic procedures and key escrow controls govern cryptographic sanitization under NIST SP 800-88?",
+      "question": "What standards and physical methods must be used when sanitizing decommissioned storage drives before disposal?",
       "role": "finance",
       "query_date": "2026-11-22",
       "difficulty": "hard",
@@ -797,8 +1114,9 @@
       "restricted_target_chunk_ids": [
         "DOC-SEC-004_SEC-R02"
       ],
-      "difficulty_reason": "Permission diagnostic involving non-employee role; finance staff are forbidden from accessing DOC-SEC-004 (security/auditor only).",
-      "evidence_reason": "DOC-SEC-004 is restricted strictly to Information Security and Audit teams; Finance personnel cannot access sanitization standards."
+      "difficulty_reason": "Diagnostic test of non-employee role restriction; role finance is strictly forbidden from accessing Data Retention (DOC-SEC-004).",
+      "evidence_reason": "DOC-SEC-004 is restricted to security and auditor; finance queries must be completely filtered out prior to scoring.",
+      "gold_evidence": []
     },
     {
       "question_id": "SEC-010",
@@ -811,8 +1129,9 @@
       "answerability": false,
       "gold_chunk_ids": [],
       "restricted_target_chunk_ids": [],
-      "difficulty_reason": "Unsupported diagnostic query targeting unmentioned consumer IoT connections.",
-      "evidence_reason": "Asterline security policies require managed assets and do not provide an approval pathway for personal smart home IoT gadgets."
+      "difficulty_reason": "Diagnostic test of retrieval refusal; query asks for non-existent personal smart-home device connectivity permissions.",
+      "evidence_reason": "Asterline security policies require managed assets and do not provide an approval pathway for personal smart home IoT gadgets.",
+      "gold_evidence": []
     }
   ]
 }

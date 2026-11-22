@@ -34,7 +34,10 @@ from rulelens.config import (
 from rulelens.dataset import ROLES
 from rulelens.qdrant_store import (
     POINT_NAMESPACE,
+    REQUIRED_PAYLOAD_INDEXES,
+    check_payload_indexes,
     ensure_collection,
+    ensure_payload_indexes,
     get_point_id,
     get_qdrant_client,
     main,
@@ -658,3 +661,129 @@ def test_cli_missing_credentials_fails_cleanly(monkeypatch):
     with pytest.raises(SystemExit) as exc2:
         main(["verify"])
     assert exc2.value.code != 0
+
+
+# ==============================================================================
+# 7. Payload Indexes & Sync Safety Validations
+# ==============================================================================
+
+
+def test_ensure_payload_indexes_reuses_valid_server_index():
+    """ensure_payload_indexes must reuse valid existing indexes without recreation."""
+    mock_client = MagicMock(spec=QdrantClient)
+    mock_client._client = MagicMock()  # Not QdrantLocal, simulates server client
+    mock_col = MagicMock()
+    mock_col.payload_schema = {
+        "allowed_roles": MagicMock(data_type=models.PayloadSchemaType.KEYWORD),
+        "corpus_fingerprint": MagicMock(data_type=models.PayloadSchemaType.KEYWORD),
+        "effective_from_rfc3339": MagicMock(data_type=models.PayloadSchemaType.DATETIME),
+        "effective_to_rfc3339": MagicMock(data_type=models.PayloadSchemaType.DATETIME),
+    }
+    mock_client.get_collection.return_value = mock_col
+
+    ensure_payload_indexes(mock_client, "test_collection")
+    mock_client.create_payload_index.assert_not_called()
+
+    # check_payload_indexes must also verify cleanly
+    check_res = check_payload_indexes(mock_client, "test_collection")
+    assert check_res["status"] == "verified"
+    assert len(check_res["indexes"]) == 4
+
+
+def test_ensure_payload_indexes_creates_missing_index():
+    """ensure_payload_indexes must create missing payload indexes with correct schema."""
+    mock_client = MagicMock(spec=QdrantClient)
+    mock_client._client = MagicMock()
+
+    mock_col_initial = MagicMock()
+    mock_col_initial.payload_schema = {}
+
+    mock_col_verified = MagicMock()
+    mock_col_verified.payload_schema = {
+        "allowed_roles": MagicMock(data_type=models.PayloadSchemaType.KEYWORD),
+        "corpus_fingerprint": MagicMock(data_type=models.PayloadSchemaType.KEYWORD),
+        "effective_from_rfc3339": MagicMock(data_type=models.PayloadSchemaType.DATETIME),
+        "effective_to_rfc3339": MagicMock(data_type=models.PayloadSchemaType.DATETIME),
+    }
+    mock_client.get_collection.side_effect = [mock_col_initial, mock_col_verified]
+
+    ensure_payload_indexes(mock_client, "test_collection")
+    assert mock_client.create_payload_index.call_count == 4
+    created_fields = [call.kwargs.get("field_name") for call in mock_client.create_payload_index.call_args_list]
+    assert set(created_fields) == {"allowed_roles", "corpus_fingerprint", "effective_from_rfc3339", "effective_to_rfc3339"}
+
+
+def test_ensure_payload_indexes_rejects_wrong_type():
+    """ensure_payload_indexes must raise ValueError if an index has an incompatible data type."""
+    mock_client = MagicMock(spec=QdrantClient)
+    mock_client._client = MagicMock()
+    mock_col = MagicMock()
+    mock_col.payload_schema = {
+        "allowed_roles": MagicMock(data_type=models.PayloadSchemaType.INTEGER),
+    }
+    mock_client.get_collection.return_value = mock_col
+
+    with pytest.raises(ValueError, match="wrong type"):
+        ensure_payload_indexes(mock_client, "test_collection")
+
+
+def test_ensure_payload_indexes_propagates_creation_error():
+    """ensure_payload_indexes must propagate unexpected creation errors as RuntimeError."""
+    mock_client = MagicMock(spec=QdrantClient)
+    mock_client._client = MagicMock()
+    mock_col = MagicMock()
+    mock_col.payload_schema = {}
+    mock_client.get_collection.return_value = mock_col
+    mock_client.create_payload_index.side_effect = RuntimeError("Qdrant connection dropped")
+
+    with pytest.raises(RuntimeError, match="Failed to create payload index"):
+        ensure_payload_indexes(mock_client, "test_collection")
+
+
+def test_sync_corpus_validates_embedding_count(repo_root: Path):
+    """sync_corpus must raise ValueError if embedding vector count does not match chunk count."""
+    client = QdrantClient(":memory:")
+    col_name = "test_embed_count_col"
+
+    class UnderproducingEmbedder:
+        def embed_texts(self, texts: List[str]) -> List[List[float]]:
+            return [[0.1] * 384] * (len(texts) - 1)
+
+    with pytest.raises(ValueError, match="Vector count must exactly match chunk count"):
+        sync_corpus(
+            client=client,
+            base_dir=repo_root,
+            collection_name=col_name,
+            embedder=UnderproducingEmbedder(),
+            batch_size=32,
+        )
+
+    class OverproducingEmbedder:
+        def embed_texts(self, texts: List[str]) -> List[List[float]]:
+            return [[0.1] * 384] * (len(texts) + 2)
+
+    with pytest.raises(ValueError, match="Vector count must exactly match chunk count"):
+        sync_corpus(
+            client=client,
+            base_dir=repo_root,
+            collection_name=col_name,
+            embedder=OverproducingEmbedder(),
+            batch_size=32,
+        )
+
+
+def test_sync_corpus_rejects_invalid_batch_size(repo_root: Path):
+    """sync_corpus must raise ValueError when batch_size is non-positive."""
+    client = QdrantClient(":memory:")
+    col_name = "test_batch_size_col"
+    fake_embedder = BGEEmbedder(model_instance=FakeSentenceTransformerModel(dimension=384))
+
+    for invalid_batch in [0, -1, -100]:
+        with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+            sync_corpus(
+                client=client,
+                base_dir=repo_root,
+                collection_name=col_name,
+                embedder=fake_embedder,
+                batch_size=invalid_batch,
+            )

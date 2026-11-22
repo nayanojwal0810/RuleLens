@@ -417,6 +417,7 @@ def test_validate_evaluation_dataset_rejects_mutations(repo_root: Path):
         if q.get("answerability") and q["query_date"] < "2026-07-01":
             q["query_date"] = "2026-08-01"
             q["gold_chunk_ids"] = ["DOC-TRV-002_TRV-C01"]
+            q["gold_evidence"] = [{"chunk_id": "DOC-TRV-002_TRV-C01", "quote": "This revised policy establishes updated corporate travel guidelines"}]
             q["role"] = "employee"
     with pytest.raises(ValueError, match="historical answerable questions"):
         validate_evaluation_dataset(bad_hist, base_dir=repo_root)
@@ -428,3 +429,130 @@ def test_cli_validate_command(repo_root: Path):
     with pytest.raises(SystemExit) as exc:
         main(["validate", "--questions", dev_path])
     assert exc.value.code == 0
+
+
+# ==============================================================================
+# 5. Gold Evidence Validation & Audit Regression Tests
+# ==============================================================================
+
+
+def test_gold_evidence_canonical_dataset_valid(repo_root: Path):
+    """The canonical dev_questions.json must have valid gold_evidence for all 50 questions."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+
+    # Must pass complete validation
+    stats = validate_evaluation_dataset(data, base_dir=repo_root)
+    assert stats["total_questions"] == 50
+    assert stats["answerable_count"] == 40
+    assert stats["restricted_count"] == 5
+    assert stats["unsupported_count"] == 5
+
+    questions = data["questions"]
+    for q in questions:
+        assert "gold_evidence" in q
+        evidence = q["gold_evidence"]
+        if q["answerability"]:
+            assert len(evidence) > 0, f"Question {q['question_id']} has empty gold_evidence"
+            ev_chunk_ids = {item["chunk_id"] for item in evidence}
+            assert ev_chunk_ids == set(q["gold_chunk_ids"]), f"Evidence chunks mismatch for {q['question_id']}"
+            for item in evidence:
+                assert item["quote"].strip(), f"Empty quote in {q['question_id']}"
+        else:
+            assert len(evidence) == 0, f"Diagnostic question {q['question_id']} must have empty gold_evidence"
+
+
+def test_gold_evidence_missing_field_raises_error(repo_root: Path):
+    """validate_evaluation_dataset must fail if gold_evidence field is missing."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+
+    del data["questions"][0]["gold_evidence"]
+    with pytest.raises(ValueError, match="missing required fields"):
+        validate_evaluation_dataset(data, base_dir=repo_root)
+
+
+def test_gold_evidence_invented_quote_raises_error(repo_root: Path):
+    """validate_evaluation_dataset must fail if a quote is not an exact verbatim substring of the chunk."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+
+    # Inject an invented quote
+    data["questions"][0]["gold_evidence"][0]["quote"] = "This is a completely fabricated policy sentence that never existed."
+    with pytest.raises(ValueError, match="is not an exact substring"):
+        validate_evaluation_dataset(data, base_dir=repo_root)
+
+
+def test_gold_evidence_quote_assigned_to_wrong_chunk_raises_error(repo_root: Path):
+    """validate_evaluation_dataset must fail if a quote is assigned to a chunk that does not contain it."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+
+    # Swap chunk_id to another valid chunk where this quote does not appear
+    q0 = data["questions"][0]
+    valid_quote = q0["gold_evidence"][0]["quote"]
+    q0["gold_evidence"][0]["chunk_id"] = "DOC-SEC-001_SEC-D01"
+    q0["gold_chunk_ids"] = ["DOC-SEC-001_SEC-D01"]
+
+    with pytest.raises(ValueError, match="is not an exact substring"):
+        validate_evaluation_dataset(data, base_dir=repo_root)
+
+
+def test_gold_evidence_missing_quote_for_chunk_raises_error(repo_root: Path):
+    """validate_evaluation_dataset must fail if an answerable multi-clause question omits a quote for a gold chunk."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+
+    # Find a multi-clause question with 2 gold chunks
+    mc_q = next(q for q in data["questions"] if len(q.get("gold_chunk_ids", [])) >= 2)
+    mc_q["gold_evidence"] = [mc_q["gold_evidence"][0]]  # Only provide quote for first chunk
+
+    with pytest.raises(ValueError, match="have no supporting quotes in gold_evidence"):
+        validate_evaluation_dataset(data, base_dir=repo_root)
+
+
+def test_gold_evidence_diagnostic_with_quote_raises_error(repo_root: Path):
+    """validate_evaluation_dataset must fail if a diagnostic question provides non-empty gold_evidence."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+
+    # Find a diagnostic question
+    diag_q = next(q for q in data["questions"] if not q.get("answerability"))
+    diag_q["gold_evidence"] = [{"chunk_id": "DOC-TRV-001_TRV-C01", "quote": "dummy"}]
+
+    with pytest.raises(ValueError, match="must have empty gold_evidence list"):
+        validate_evaluation_dataset(data, base_dir=repo_root)
+
+
+def test_canonical_audit_regression_targets(repo_root: Path):
+    """Verify the 5 canonical regression targets from the evidence audit."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    data = json.loads(dev_path.read_text(encoding="utf-8"))
+    q_by_id = {q["question_id"]: q for q in data["questions"]}
+
+    # 1. TRV-001: meal allowance cap is in TRV-C03 (not TRV-C01)
+    trv001 = q_by_id["TRV-001"]
+    assert trv001["gold_chunk_ids"] == ["DOC-TRV-002_TRV-C03"]
+    assert "capped at INR 2,000 per diem" in trv001["gold_evidence"][0]["quote"]
+    assert "TRV-C03" in trv001["gold_chunk_ids"][0]
+
+    # 2. FIN-006: foreign currency conversion uses RBI reference rate
+    fin006 = q_by_id["FIN-006"]
+    assert fin006["gold_chunk_ids"] == ["DOC-FIN-002_FIN-R02"]
+    assert "Reserve Bank of India reference rate" in fin006["gold_evidence"][0]["quote"]
+
+    # 3. PPO-003: core working hours are 10:00 AM to 4:00 PM local time
+    ppo003 = q_by_id["PPO-003"]
+    assert ppo003["gold_chunk_ids"] == ["DOC-PPO-002_PPO-R03"]
+    assert "10:00 AM and 4:00 PM local time" in ppo003["gold_evidence"][0]["quote"]
+
+    # 4. PRC-005: inspection warranty clause is PRC-P03 (30-day inspection warranty)
+    prc005 = q_by_id["PRC-005"]
+    assert "DOC-PRC-001_PRC-P03" in prc005["gold_chunk_ids"]
+    assert "minimum 30-day inspection warranty" in [e["quote"] for e in prc005["gold_evidence"] if e["chunk_id"] == "DOC-PRC-001_PRC-P03"][0]
+
+    # 5. SEC-004: incident severity levels are Priority 1 through Priority 4
+    sec004 = q_by_id["SEC-004"]
+    assert sec004["gold_chunk_ids"] == ["DOC-SEC-003_SEC-I01"]
+    assert "Priority 1 (Critical)" in sec004["gold_evidence"][0]["quote"]
+    assert "Priority 4 (Minor)" in sec004["gold_evidence"][0]["quote"]

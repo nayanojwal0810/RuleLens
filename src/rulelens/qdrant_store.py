@@ -105,6 +105,54 @@ def check_payload_indexes(
     return {"status": "verified", "indexes": verified_indexes}
 
 
+def ensure_payload_indexes(client: QdrantClient, collection_name: str) -> None:
+    """Ensure required payload indexes exist on a server collection with correct types.
+
+    1. Inspects existing payload_schema.
+    2. If an index exists with the correct type, keeps it.
+    3. If an index exists with the wrong type, raises ValueError.
+    4. If an index is missing, creates it.
+    5. Propagates unexpected creation errors clearly.
+    6. Verifies all required indexes after creation.
+    """
+    if is_in_memory_or_local_client(client):
+        return
+
+    col_info = client.get_collection(collection_name)
+    schema = getattr(col_info, "payload_schema", {}) or {}
+
+    for field_name, expected_type in REQUIRED_PAYLOAD_INDEXES:
+        expected_str = expected_type.value if hasattr(expected_type, "value") else str(expected_type).lower()
+        if field_name in schema:
+            field_info = schema[field_name]
+            dtype = getattr(field_info, "data_type", None)
+            if dtype is None and isinstance(field_info, dict):
+                dtype = field_info.get("data_type")
+            actual_str = dtype.value if hasattr(dtype, "value") else str(dtype).lower()
+            if actual_str.lower() != expected_str.lower():
+                raise ValueError(
+                    f"Collection '{collection_name}' has index on '{field_name}' with wrong type '{actual_str}'; "
+                    f"expected '{expected_str}'."
+                )
+            # Valid index already exists; keep it
+            continue
+
+        # Missing index: create it
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=expected_type,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to create payload index on '{field_name}' in collection '{collection_name}': {exc}"
+            ) from exc
+
+    # Final verification of required payload indexes
+    check_payload_indexes(client, collection_name)
+
+
 def get_point_id(chunk_id: str) -> str:
     """Generate a deterministic UUIDv5 string point ID from a chunk ID."""
     return str(uuid.uuid5(POINT_NAMESPACE, chunk_id))
@@ -226,15 +274,7 @@ def ensure_collection(
         ),
     )
 
-    # Create payload indexes for server-side filtering
-    for field_name, schema_type in REQUIRED_PAYLOAD_INDEXES:
-        try:
-            client.create_payload_index(collection_name, field_name, schema_type)
-        except Exception as exc:
-            if not is_in_memory_or_local_client(client):
-                raise RuntimeError(
-                    f"Failed to create payload index on '{field_name}' in collection '{collection_name}': {exc}"
-                ) from exc
+    ensure_payload_indexes(client, collection_name)
 
 
 def build_qdrant_filter(
@@ -391,6 +431,9 @@ def sync_corpus(
     validates existing collection compatibility across all existing points,
     uploads points idempotently, and runs full verification.
     """
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+
     base = Path(base_dir) if base_dir else Path.cwd()
 
     # 1. Validate corpus integrity before any cloud upload
@@ -424,14 +467,8 @@ def sync_corpus(
                 f"Existing collection '{collection_name}' has distance metric {distance}; expected Cosine."
             )
 
-        # For real server: ensure/create missing indexes
-        if not is_in_memory_or_local_client(client):
-            for field_name, schema_type in REQUIRED_PAYLOAD_INDEXES:
-                try:
-                    client.create_payload_index(collection_name, field_name, schema_type)
-                except Exception:
-                    pass
-            check_payload_indexes(client, collection_name)
+        # For real server: ensure/create missing indexes with strict type check
+        ensure_payload_indexes(client, collection_name)
 
         # Validate EVERY existing point before ANY upsert!
         existing_cids = validate_existing_collection_before_sync(
@@ -451,6 +488,12 @@ def sync_corpus(
         active_embedder = embedder or BGEEmbedder()
         texts_to_embed = [c["text"] for c in chunks_to_upsert]
         vectors = active_embedder.embed_texts(texts_to_embed)
+
+        if len(vectors) != len(chunks_to_upsert):
+            raise ValueError(
+                f"Generated {len(vectors)} embeddings for {len(chunks_to_upsert)} chunks to upload. "
+                "Vector count must exactly match chunk count."
+            )
 
         points: List[models.PointStruct] = []
         for chunk, vector in zip(chunks_to_upsert, vectors):
