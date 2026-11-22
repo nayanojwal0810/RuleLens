@@ -29,6 +29,7 @@ from rulelens.llm import (
     AnswerStatus,
     CitationValidationError,
     GroqClientWrapper,
+    ProviderTelemetrySnapshot,
     SanitizedProviderError,
     build_evidence_fingerprint,
     validate_citations_and_rules,
@@ -48,7 +49,7 @@ from rulelens.rules import (
 )
 
 
-def _safe_int(val: Any, default: int = 1) -> int:
+def _safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
     if isinstance(val, bool):
         return default
     if isinstance(val, (int, float)):
@@ -87,16 +88,21 @@ class GenerationResult:
     corpus_fingerprint: str
     evidence_fingerprint: Dict[str, Any]
     latency_ms: float
-    provider_calls_attempted: int = 0
+    provider_calls_attempted: Optional[int] = 0
     provider_latency_ms: Optional[float] = None
     token_usage: Optional[int] = None
+    schema_valid: Optional[bool] = None
+    has_incomplete_tokens: bool = False
     error_category: Optional[str] = None
     error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        d["provider_calls_attempted"] = _safe_int(self.provider_calls_attempted, default=0)
+        d["provider_calls_attempted"] = _safe_int(self.provider_calls_attempted, default=None)
         d["provider_latency_ms"] = _safe_float(self.provider_latency_ms)
+        d["token_usage"] = _safe_int(self.token_usage, default=None)
+        d["schema_valid"] = self.schema_valid if isinstance(self.schema_valid, bool) else None
+        d["has_incomplete_tokens"] = bool(self.has_incomplete_tokens) if isinstance(self.has_incomplete_tokens, bool) else False
         return d
 
 
@@ -554,18 +560,40 @@ def answer_question(
         )
 
     # Step G: Deterministic rule resolution
-    extracted_conds = extract_conditions_from_query(cleaned_question)
-    rule_results: List[RuleEvaluationResult] = []
-    applicable_rule_ids: Set[str] = set()
-
-    chunk_dicts = [c.to_dict() for c in authorized_chunks]
-    rule_results = resolve_rules_for_evidence(
-        authorized_chunks=chunk_dicts,
-        role=role,
-        query_date=validated_date,
-        base_dir=base_dir,
-        extracted_conditions=extracted_conds,
-    )
+    try:
+        extracted_conds = extract_conditions_from_query(cleaned_question)
+        chunk_dicts = [c.to_dict() for c in authorized_chunks]
+        rule_results = resolve_rules_for_evidence(
+            authorized_chunks=chunk_dicts,
+            role=role,
+            query_date=validated_date,
+            base_dir=base_dir,
+            extracted_conditions=extracted_conds,
+        )
+    except Exception as exc:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The policy verification system encountered an operational error loading policy rules.",
+            status="operational_error",
+            reason="Structured rule loading or evaluation failed.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+            token_usage=None,
+            schema_valid=None,
+            has_incomplete_tokens=False,
+            error_category="rule_loading_error",
+            error="Structured rule resolution failed due to an infrastructure error.",
+        )
 
     # If any rule condition input has an invalid unit, type error, or ambiguous condition, fail safely with insufficient
     rule_errors = [r for r in rule_results if r.is_error]
@@ -588,6 +616,9 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=0,
             provider_latency_ms=None,
+            token_usage=None,
+            schema_valid=None,
+            has_incomplete_tokens=False,
             error_category=err.error_type,
             error=err.explanation,
         )
@@ -596,13 +627,73 @@ def answer_question(
     applicable_rule_ids = {r.rule.rule_id for r in rule_results if r.passed and not r.is_error}
 
     # Step H: Call Groq LLM
-    active_llm = llm_client or GroqClientWrapper()
+    try:
+        active_llm = llm_client or GroqClientWrapper()
+    except (ValueError, SanitizedProviderError) as client_err:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        safe_msg = getattr(client_err, "safe_message", str(client_err))
+        safe_msg = re.sub(r"gsk_[a-zA-Z0-9_-]+", "[REDACTED_API_KEY]", safe_msg)
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The generation service is unavailable due to an authentication or configuration error.",
+            status="operational_error",
+            reason="LLM client initialization failed.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+            token_usage=None,
+            schema_valid=None,
+            has_incomplete_tokens=False,
+            error_category="authentication_error",
+            error=safe_msg,
+        )
+    except Exception:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The generation service is temporarily unavailable. Please retry your query shortly.",
+            status="operational_error",
+            reason="LLM client initialization failed.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+            token_usage=None,
+            schema_valid=None,
+            has_incomplete_tokens=False,
+            error_category="service_unavailable",
+            error="Generation service encountered an unhandled provider error.",
+        )
+
     baseline_telemetry = None
     if hasattr(active_llm, "get_telemetry_snapshot"):
-        baseline_telemetry = active_llm.get_telemetry_snapshot()
+        try:
+            snap = active_llm.get_telemetry_snapshot()
+            if isinstance(snap, ProviderTelemetrySnapshot):
+                baseline_telemetry = snap
+        except Exception:
+            baseline_telemetry = None
 
-    provider_calls = 1
+    provider_calls: Optional[int] = None
     provider_lat: Optional[float] = None
+    toks_used: Optional[int] = None
+    has_inc_toks: bool = False
+    schema_valid_status: Optional[bool] = None
 
     try:
         model_resp, llm_meta = active_llm.generate_answer(
@@ -612,27 +703,34 @@ def answer_question(
             query_date=date_str,
             applicable_rule_facts=rule_results,
         )
-        if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+        schema_valid_status = True
+        if baseline_telemetry is not None:
             delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
             provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+            toks_used = _safe_int(getattr(delta, "known_total_tokens", None), default=None)
+            has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
+        elif isinstance(llm_meta, dict):
+            provider_calls = _safe_int(llm_meta.get("calls_made"), default=None)
+            provider_lat = _safe_float(llm_meta.get("latency_ms"))
+            toks_used = _safe_int(llm_meta.get("total_tokens"), default=None)
+            has_inc_toks = False
         else:
-            telemetry = llm_meta.get("telemetry") if isinstance(llm_meta, dict) else None
-            provider_calls = _safe_int(
-                getattr(telemetry, "provider_requests_attempted", None) or (llm_meta.get("calls_made", 1) if isinstance(llm_meta, dict) else 1),
-                default=1,
-            )
-            provider_lat = _safe_float(
-                getattr(telemetry, "provider_request_latency_ms", None) or (llm_meta.get("latency_ms") if isinstance(llm_meta, dict) else None)
-            )
-    except SanitizedProviderError as prov_err:
-        if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
-            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
-            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
-        else:
-            provider_calls = 1
+            provider_calls = None
             provider_lat = None
+            toks_used = None
+            has_inc_toks = False
+    except SanitizedProviderError as prov_err:
+        schema_valid_status = False if prov_err.category == "invalid_generation" else None
+        if baseline_telemetry is not None:
+            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
+            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
+            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+            has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
+        else:
+            provider_calls = None
+            provider_lat = None
+            has_inc_toks = False
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -650,17 +748,23 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=provider_calls,
             provider_latency_ms=provider_lat,
+            token_usage=None,
+            schema_valid=schema_valid_status,
+            has_incomplete_tokens=has_inc_toks,
             error_category=prov_err.category,
             error=prov_err.safe_message,
         )
     except Exception:
-        if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+        schema_valid_status = None
+        if baseline_telemetry is not None:
             delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
             provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+            has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
         else:
-            provider_calls = 1
+            provider_calls = None
             provider_lat = None
+            has_inc_toks = False
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -678,6 +782,9 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=provider_calls,
             provider_latency_ms=provider_lat,
+            token_usage=None,
+            schema_valid=schema_valid_status,
+            has_incomplete_tokens=has_inc_toks,
             error_category="service_unavailable",
             error="Generation service encountered an unhandled provider error.",
         )
@@ -709,6 +816,9 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=provider_calls,
             provider_latency_ms=provider_lat,
+            token_usage=toks_used,
+            schema_valid=True,
+            has_incomplete_tokens=has_inc_toks,
             error_category=cit_err.category,
             error=cit_err.safe_message,
         )
@@ -730,6 +840,9 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=provider_calls,
             provider_latency_ms=provider_lat,
+            token_usage=toks_used,
+            schema_valid=True,
+            has_incomplete_tokens=has_inc_toks,
             error_category="invalid_citation",
             error="Citation validation failed.",
         )
@@ -752,7 +865,9 @@ def answer_question(
         latency_ms=round(total_latency, 2),
         provider_calls_attempted=provider_calls,
         provider_latency_ms=provider_lat,
-        token_usage=llm_meta.get("total_tokens"),
+        token_usage=toks_used,
+        schema_valid=True,
+        has_incomplete_tokens=has_inc_toks,
     )
 
 
@@ -787,7 +902,9 @@ def main():
             qdrant_client=q_client,
         )
     except Exception as exc:
-        print(f"Operational error: {exc}", file=sys.stderr)
+        sanitized = re.sub(r"gsk_[a-zA-Z0-9_-]+", "[REDACTED_API_KEY]", str(exc))
+        sanitized = re.sub(r"Bearer\s+[^\s]+", "Bearer [REDACTED]", sanitized)
+        print(f"Operational error: {sanitized}", file=sys.stderr)
         sys.exit(1)
 
     print("\n" + "=" * 60)
@@ -806,7 +923,9 @@ def main():
     if result.token_usage:
         print(f"Tokens:     {result.token_usage}")
     if result.error:
-        print(f"Error [{result.error_category}]: {result.error}")
+        sanitized_err = re.sub(r"gsk_[a-zA-Z0-9_-]+", "[REDACTED_API_KEY]", result.error)
+        sanitized_err = re.sub(r"Bearer\s+[^\s]+", "Bearer [REDACTED]", sanitized_err)
+        print(f"Error [{result.error_category}]: {sanitized_err}")
     print("=" * 60 + "\n")
 
     if result.status == "operational_error":

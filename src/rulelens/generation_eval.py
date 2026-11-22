@@ -26,6 +26,7 @@ from rulelens.llm import (
     AnswerStatus,
     CitationValidationError,
     GroqClientWrapper,
+    ProviderTelemetrySnapshot,
     SanitizedProviderError,
     build_evidence_fingerprint,
     validate_citations_and_rules,
@@ -171,12 +172,32 @@ def evaluate_single_question(
         total_lat = (time.perf_counter() - start_time) * 1000.0
 
         is_restricted_expected = bool(restr_targets)
-        # Score refusal based on whether it correctly refused and matched expected refusal type
-        refusal_correct = False
-        if is_restricted_expected:
-            refusal_correct = (app_result.status == AnswerStatus.RESTRICTED.value)
+        expected_refusal_type = "restricted" if is_restricted_expected else "insufficient"
+        refusal_correct = (app_result.status == expected_refusal_type)
+
+        provider_err = False
+        other_op_err = False
+        cit_val_failure = False
+        evidence_val_failure = False
+
+        if app_result.status == "operational_error":
+            if app_result.error_category == "invalid_citation":
+                cit_val_failure = True
+            elif (
+                app_result.error_category in ("rate_limited", "authentication_error", "timeout", "invalid_generation")
+                or (app_result.provider_calls_attempted is not None and app_result.provider_calls_attempted > 0)
+            ):
+                provider_err = True
+            elif app_result.error_category == "evidence_integrity_error":
+                evidence_val_failure = True
+            else:
+                other_op_err = True
+
+        citation_expected = (app_result.status == "answered" or cit_val_failure)
+        if citation_expected:
+            citation_valid = (len(app_result.citations) > 0 and not cit_val_failure)
         else:
-            refusal_correct = (app_result.status == AnswerStatus.INSUFFICIENT.value)
+            citation_valid = (len(app_result.citations) == 0)
 
         return {
             "question_id": qid,
@@ -194,18 +215,22 @@ def evaluate_single_question(
             "citations": app_result.citations,
             "referenced_rule_ids": app_result.referenced_rule_ids,
             "reason": app_result.reason,
-            "schema_valid": None,  # Deterministic refusal: not a Groq schema response
-            "citation_valid": len(app_result.citations) == 0,
+            "schema_valid": app_result.schema_valid,
+            "citation_valid": citation_valid,
+            "citation_expected": citation_expected,
+            "expected_refusal_type": expected_refusal_type,
             "refusal_correct": refusal_correct,
-            "provider_error": app_result.status == "operational_error",
-            "evidence_validation_failure": False,
-            "citation_validation_failure": False,
-            "provider_calls_attempted": 0,
+            "provider_error": provider_err,
+            "evidence_validation_failure": evidence_val_failure,
+            "citation_validation_failure": cit_val_failure,
+            "other_operational_failure": other_op_err,
+            "provider_calls_attempted": app_result.provider_calls_attempted,
             "role_violations": 0,
             "version_violations": 0,
             "latency_ms": round(total_lat, 2),
-            "provider_latency_ms": None,
-            "token_usage": None,
+            "provider_latency_ms": app_result.provider_latency_ms,
+            "token_usage": app_result.token_usage,
+            "has_incomplete_tokens": getattr(app_result, "has_incomplete_tokens", False),
             "factual_correctness": "not_reviewed",
             "error_category": app_result.error_category,
             "gold_quotes": [e.get("quote", "") for e in expected_evidence],
@@ -305,16 +330,20 @@ def evaluate_single_question(
                 ),
                 "schema_valid": None,
                 "citation_valid": False,
+                "citation_expected": False,
+                "expected_refusal_type": None,
                 "refusal_correct": False,
                 "provider_error": False,
                 "evidence_validation_failure": True,
                 "citation_validation_failure": False,
+                "other_operational_failure": False,
                 "provider_calls_attempted": 0,
                 "role_violations": role_violations,
                 "version_violations": version_violations,
                 "latency_ms": round(total_lat, 2),
                 "provider_latency_ms": None,
                 "token_usage": None,
+                "has_incomplete_tokens": False,
                 "factual_correctness": "not_reviewed",
                 "error_category": "evidence_validation_failure",
                 "gold_quotes": [e.get("quote", "") for e in expected_evidence],
@@ -352,16 +381,20 @@ def evaluate_single_question(
                 "reason": f"Rule evaluation error: {rule_errors[0].explanation}",
                 "schema_valid": None,
                 "citation_valid": False,
+                "citation_expected": False,
+                "expected_refusal_type": None,
                 "refusal_correct": False,
                 "provider_error": False,
                 "evidence_validation_failure": False,
                 "citation_validation_failure": False,
+                "other_operational_failure": False,
                 "provider_calls_attempted": 0,
                 "role_violations": 0,
                 "version_violations": 0,
                 "latency_ms": round(total_lat, 2),
                 "provider_latency_ms": None,
                 "token_usage": None,
+                "has_incomplete_tokens": False,
                 "factual_correctness": "not_reviewed",
                 "error_category": rule_errors[0].error_type,
                 "gold_quotes": [e.get("quote", "") for e in expected_evidence],
@@ -381,13 +414,20 @@ def evaluate_single_question(
         error_msg = None
         error_cat = None
         provider_lat = None
-        provider_calls = 1
+        provider_calls = None
         provider_err = False
         cit_val_failure = False
+        other_op_err = False
+        has_inc_toks = False
 
         baseline_telemetry = None
         if hasattr(active_llm, "get_telemetry_snapshot"):
-            baseline_telemetry = active_llm.get_telemetry_snapshot()
+            try:
+                snap = active_llm.get_telemetry_snapshot()
+                if isinstance(snap, ProviderTelemetrySnapshot):
+                    baseline_telemetry = snap
+            except Exception:
+                baseline_telemetry = None
 
         try:
             model_resp, llm_meta = active_llm.generate_answer(
@@ -397,15 +437,22 @@ def evaluate_single_question(
                 query_date=query_date_str,
                 applicable_rule_facts=rule_results,
             )
-            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+            if baseline_telemetry is not None:
                 delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
                 provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
-                token_usage = _safe_int(getattr(delta, "known_total_tokens", None), default=0) if getattr(delta, "known_total_tokens", None) is not None else None
+                token_usage = _safe_int(getattr(delta, "known_total_tokens", None), default=None)
+                has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
+            elif isinstance(llm_meta, dict):
+                provider_calls = _safe_int(llm_meta.get("calls_made"), default=None)
+                provider_lat = _safe_float(llm_meta.get("latency_ms"))
+                token_usage = _safe_int(llm_meta.get("total_tokens"), default=None)
+                has_inc_toks = False
             else:
-                provider_calls = _safe_int(llm_meta.get("calls_made", 1), default=1) if isinstance(llm_meta, dict) else 1
-                provider_lat = _safe_float(llm_meta.get("latency_ms")) if isinstance(llm_meta, dict) else None
-                token_usage = _safe_int(llm_meta.get("total_tokens")) if (isinstance(llm_meta, dict) and llm_meta.get("total_tokens") is not None) else None
+                provider_calls = None
+                provider_lat = None
+                token_usage = None
+                has_inc_toks = False
 
             schema_valid = True
             gen_answer = model_resp.answer
@@ -421,38 +468,44 @@ def evaluate_single_question(
             )
             gen_citations = val_cids
             gen_rules = val_rules
-            citation_valid = True
+            citation_valid = (len(gen_citations) > 0) if gen_status == "answered" else (len(gen_citations) == 0)
 
         except CitationValidationError as cit_err:
-            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+            if baseline_telemetry is not None:
                 delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
                 provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+                has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
             error_msg = cit_err.safe_message
             error_cat = cit_err.category
             gen_status = "operational_error"
+            schema_valid = True
             citation_valid = False
             cit_val_failure = True
         except SanitizedProviderError as prov_err:
-            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+            if baseline_telemetry is not None:
                 delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
                 provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+                has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
             error_msg = prov_err.safe_message
             error_cat = prov_err.category
             gen_status = "operational_error"
+            schema_valid = False if prov_err.category == "invalid_generation" else None
             provider_err = True
         except Exception:
-            if baseline_telemetry and hasattr(active_llm, "get_telemetry_snapshot"):
+            if baseline_telemetry is not None:
                 delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", 1), default=1)
+                provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
                 provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
+                has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
             error_msg = "Unhandled operational error during evaluation generation."
             error_cat = "service_unavailable"
             gen_status = "operational_error"
             provider_err = True
 
         total_lat = (time.perf_counter() - start_time) * 1000.0
+        citation_expected = (gen_status == "answered" or cit_val_failure)
 
         return {
             "question_id": qid,
@@ -472,16 +525,20 @@ def evaluate_single_question(
             "reason": gen_reason,
             "schema_valid": schema_valid,
             "citation_valid": citation_valid,
+            "citation_expected": citation_expected,
+            "expected_refusal_type": None,
             "refusal_correct": False,
             "provider_error": provider_err,
             "evidence_validation_failure": False,
             "citation_validation_failure": cit_val_failure,
+            "other_operational_failure": other_op_err,
             "provider_calls_attempted": provider_calls,
             "role_violations": 0,
             "version_violations": 0,
             "latency_ms": round(total_lat, 2),
             "provider_latency_ms": round(provider_lat, 2) if provider_lat is not None else None,
             "token_usage": token_usage,
+            "has_incomplete_tokens": has_inc_toks,
             "factual_correctness": "not_reviewed",
             "error_category": error_cat,
             "gold_quotes": [e.get("quote", "") for e in expected_evidence],
@@ -500,6 +557,31 @@ def evaluate_single_question(
             qdrant_client=qdrant_client,
         )
         total_lat = (time.perf_counter() - start_time) * 1000.0
+
+        provider_err = False
+        other_op_err = False
+        cit_val_failure = False
+        evidence_val_failure = False
+
+        if app_result.status == "operational_error":
+            if app_result.error_category == "invalid_citation":
+                cit_val_failure = True
+            elif (
+                app_result.error_category in ("rate_limited", "authentication_error", "timeout", "invalid_generation")
+                or (app_result.provider_calls_attempted is not None and app_result.provider_calls_attempted > 0)
+            ):
+                provider_err = True
+            elif app_result.error_category == "evidence_integrity_error":
+                evidence_val_failure = True
+            else:
+                other_op_err = True
+
+        citation_expected = (app_result.status == "answered" or cit_val_failure)
+        if citation_expected:
+            citation_valid = (len(app_result.citations) > 0 and not cit_val_failure)
+        else:
+            citation_valid = (len(app_result.citations) == 0)
+
         return {
             "question_id": qid,
             "department": question_data.get("department"),
@@ -516,18 +598,22 @@ def evaluate_single_question(
             "citations": app_result.citations,
             "referenced_rule_ids": app_result.referenced_rule_ids,
             "reason": app_result.reason,
-            "schema_valid": app_result.status in ("answered", "insufficient", "restricted") and app_result.token_usage is not None,
-            "citation_valid": len(app_result.citations) > 0 and app_result.status == "answered",
+            "schema_valid": app_result.schema_valid,
+            "citation_valid": citation_valid,
+            "citation_expected": citation_expected,
+            "expected_refusal_type": None,
             "refusal_correct": False,
-            "provider_error": app_result.status == "operational_error",
-            "evidence_validation_failure": False,
-            "citation_validation_failure": False,
+            "provider_error": provider_err,
+            "evidence_validation_failure": evidence_val_failure,
+            "citation_validation_failure": cit_val_failure,
+            "other_operational_failure": other_op_err,
             "provider_calls_attempted": app_result.provider_calls_attempted,
             "role_violations": 0,
             "version_violations": 0,
             "latency_ms": round(total_lat, 2),
             "provider_latency_ms": app_result.provider_latency_ms,
             "token_usage": app_result.token_usage,
+            "has_incomplete_tokens": getattr(app_result, "has_incomplete_tokens", False),
             "factual_correctness": "not_reviewed",
             "error_category": app_result.error_category,
             "gold_quotes": [e.get("quote", "") for e in expected_evidence],
@@ -562,6 +648,8 @@ def run_generation_evaluation(
     """
     base = Path(base_dir) if base_dir else Path.cwd()
 
+    if isinstance(max_questions, bool) or (max_questions is not None and not isinstance(max_questions, int)):
+        raise ValueError(f"max_questions must be an integer between 1 and 50 inclusive, got {max_questions!r}.")
     if max_questions is not None and (max_questions < 1 or max_questions > 50):
         raise ValueError(f"max_questions must be an integer between 1 and 50 inclusive, got {max_questions}.")
 
@@ -577,11 +665,18 @@ def run_generation_evaluation(
     all_questions = data["questions"]
     q_map = {q["question_id"]: q for q in all_questions}
 
-    target_ids = list(subset_ids) if subset_ids is not None else DEV_SUBSET_QUESTION_IDS
+    if subset_ids is not None:
+        unknown_ids = [qid for qid in subset_ids if qid not in q_map]
+        if unknown_ids:
+            raise ValueError(f"Unknown question IDs requested in subset: {unknown_ids}")
+        target_ids = list(subset_ids)
+    else:
+        target_ids = list(DEV_SUBSET_QUESTION_IDS)
+
     if max_questions is not None:
         target_ids = target_ids[:max_questions]
 
-    selected_questions = [q_map[qid] for qid in target_ids if qid in q_map]
+    selected_questions = [q_map[qid] for qid in target_ids]
     if not selected_questions:
         raise ValueError("No matching questions found in dataset to evaluate.")
 
@@ -631,37 +726,68 @@ def run_generation_evaluation(
 
     ans_results = [r for r in per_q_results if r["answerability"]]
     diag_results = [r for r in per_q_results if not r["answerability"]]
-    restr_results = [r for r in diag_results if r["question_id"].endswith("-009")]
-    unsupp_results = [r for r in diag_results if r["question_id"].endswith("-010")]
+    restr_results = [r for r in diag_results if r.get("expected_refusal_type") == "restricted"]
+    unsupp_results = [r for r in diag_results if r.get("expected_refusal_type") == "insufficient"]
 
     successful_answers = sum(
         1 for r in ans_results
-        if r["status"] == "answered" and not r["provider_error"] and r["schema_valid"] and r["citation_valid"]
+        if r["status"] == "answered"
+        and not r.get("provider_error", False)
+        and r.get("schema_valid") is True
+        and r.get("citation_valid", False)
     )
     refusals = sum(1 for r in per_q_results if r["status"] in ("insufficient", "restricted"))
     provider_errors = sum(1 for r in per_q_results if r.get("provider_error", False))
     evidence_val_failures = sum(1 for r in per_q_results if r.get("evidence_validation_failure", False))
     citation_val_failures = sum(1 for r in per_q_results if r.get("citation_validation_failure", False))
+    other_operational_failures = sum(1 for r in per_q_results if r.get("other_operational_failure", False))
 
-    generations_attempted = sum(1 for r in per_q_results if _safe_int(r.get("provider_calls_attempted", 0), default=0) > 0)
+    total_op_val_failures = (
+        provider_errors + evidence_val_failures + citation_val_failures + other_operational_failures
+    )
+
+    if stopped_early or completed_questions < planned_questions:
+        eval_state = "partial"
+    elif total_op_val_failures > 0:
+        eval_state = "completed_with_errors"
+    else:
+        eval_state = "completed"
+
+    generations_attempted = sum(
+        1 for r in per_q_results
+        if r.get("provider_calls_attempted") is None or r["provider_calls_attempted"] > 0
+    )
     schema_valid_generations = sum(
         1 for r in per_q_results
-        if _safe_int(r.get("provider_calls_attempted", 0), default=0) > 0 and r.get("schema_valid") is True and not r.get("provider_error", False)
+        if r.get("schema_valid") is True and not r.get("provider_error", False)
     )
+
+    citation_expected_count = sum(1 for r in per_q_results if r.get("citation_expected", False))
     citation_valid_generations = sum(
-        1 for r in ans_results
-        if r.get("citation_valid", False) and not r.get("provider_error", False)
+        1 for r in per_q_results
+        if r.get("citation_expected", False) and r.get("citation_valid", False) and not r.get("provider_error", False)
     )
 
-    restr_success = sum(1 for r in restr_results if r["refusal_correct"])
-    unsupp_success = sum(1 for r in unsupp_results if r["refusal_correct"])
+    restr_success = sum(1 for r in restr_results if r.get("refusal_correct", False))
+    unsupp_success = sum(1 for r in unsupp_results if r.get("refusal_correct", False))
     incorrect_refusals = (
-        sum(1 for r in ans_results if r["status"] in ("insufficient", "restricted")) +
-        sum(1 for r in diag_results if not r["refusal_correct"] and r["status"] in ("insufficient", "restricted"))
+        sum(1 for r in ans_results if r["status"] in ("insufficient", "restricted"))
+        + sum(1 for r in diag_results if not r.get("refusal_correct", False) and r["status"] in ("insufficient", "restricted"))
     )
+    incorrect_answers = sum(1 for r in diag_results if r["status"] == "answered")
 
-    actual_provider_requests = sum(_safe_int(r.get("provider_calls_attempted", 0), default=0) for r in per_q_results)
-    known_tokens = sum(_safe_int(r.get("token_usage", 0), default=0) for r in per_q_results if r.get("token_usage") is not None)
+    known_requests_list = [r["provider_calls_attempted"] for r in per_q_results if r.get("provider_calls_attempted") is not None]
+    has_unknown_provider_requests = any(
+        r.get("provider_calls_attempted") is None
+        for r in per_q_results
+        if r.get("status") == "answered" or r.get("provider_error", False)
+    )
+    actual_provider_requests = sum(known_requests_list)
+
+    known_tokens = sum(r["token_usage"] for r in per_q_results if r.get("token_usage") is not None)
+    known_tokens_incomplete = any(r.get("has_incomplete_tokens", False) for r in per_q_results) or (
+        hasattr(active_llm, "get_telemetry_snapshot") and active_llm.get_telemetry_snapshot().has_incomplete_tokens
+    )
 
     e2e_latencies = [r["latency_ms"] for r in per_q_results]
     provider_latencies = [
@@ -677,7 +803,7 @@ def run_generation_evaluation(
     summary = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "model": GENERATION_MODEL,
-        "evaluation_state": "partial" if stopped_early else "completed",
+        "evaluation_state": eval_state,
         "stop_reason": stop_reason,
         "retrieval_backend": dense_backend,
         "planned_questions": planned_questions,
@@ -688,17 +814,22 @@ def run_generation_evaluation(
         "restricted_refusal_successes": restr_success,
         "unsupported_refusal_successes": unsupp_success,
         "incorrect_refusals": incorrect_refusals,
+        "incorrect_answers": incorrect_answers,
         "provider_errors": provider_errors,
         "provider_failures": provider_errors,
         "evidence_validation_failures": evidence_val_failures,
         "citation_validation_failures": citation_val_failures,
+        "other_operational_failures": other_operational_failures,
         "generations_attempted": generations_attempted,
         "schema_valid_generations": schema_valid_generations,
+        "citation_expected_count": citation_expected_count,
         "citation_valid_generations": citation_valid_generations,
         "generation_calls": actual_provider_requests,
         "actual_provider_requests": actual_provider_requests,
+        "has_unknown_provider_requests": has_unknown_provider_requests,
         "tokens_used": known_tokens,
         "known_tokens_used": known_tokens,
+        "known_tokens_incomplete": known_tokens_incomplete,
         "median_e2e_latency_ms": round(median_e2e, 2),
         "median_provider_latency_ms": round(median_prov, 2),
         "median_diagnostic_latency_ms": round(median_diag, 2),
@@ -725,9 +856,19 @@ def generate_summary_markdown(summary: Dict[str, Any]) -> str:
     completed = summary["completed_questions"]
     ans_count = sum(1 for r in summary["per_question_results"] if r.get("answerability"))
     diag_count = completed - ans_count
-    restr_count = sum(1 for r in summary["per_question_results"] if r["question_id"].endswith("-009"))
-    unsupp_count = sum(1 for r in summary["per_question_results"] if r["question_id"].endswith("-010"))
+    restr_count = sum(1 for r in summary["per_question_results"] if r.get("expected_refusal_type") == "restricted" or (r.get("answerability") is False and r["question_id"].endswith("-009")))
+    unsupp_count = sum(1 for r in summary["per_question_results"] if r.get("expected_refusal_type") == "insufficient" or (r.get("answerability") is False and r["question_id"].endswith("-010")))
     generations_att = summary.get("generations_attempted", completed)
+    cit_denom = summary.get("citation_expected_count", ans_count)
+
+    token_str = str(summary.get("known_tokens_used", summary.get("tokens_used", 0)))
+    if summary.get("known_tokens_incomplete"):
+        token_str += " (incomplete)"
+
+    prov_reqs = summary.get("actual_provider_requests", summary.get("generation_calls", 0))
+    prov_reqs_str = str(prov_reqs)
+    if summary.get("has_unknown_provider_requests"):
+        prov_reqs_str += " (some requests unknown)"
 
     lines = [
         "# RuleLens — Stage E Development Answer Generation Summary",
@@ -747,17 +888,19 @@ def generate_summary_markdown(summary: Dict[str, Any]) -> str:
         "| Metric | Result | Target |",
         "|---|:---:|:---:|",
         f"| **Schema Validity (Groq)** | {format_rate(summary['schema_valid_generations'], generations_att)} | 100% |",
-        f"| **Citation Validity (Answerable)** | {format_rate(summary['citation_valid_generations'], ans_count)} | 100% |",
+        f"| **Citation Validity (Answerable)** | {format_rate(summary['citation_valid_generations'], cit_denom)} | 100% |",
         f"| **Restricted Refusal Success** | {format_rate(summary['restricted_refusal_successes'], restr_count)} | 100% |",
         f"| **Unsupported Refusal Success** | {format_rate(summary['unsupported_refusal_successes'], unsupp_count)} | 100% |",
-        f"| **Provider Errors** | {summary['provider_errors']} | 0 |",
+        f"| **Provider Failures** | {summary.get('provider_failures', summary.get('provider_errors', 0))} | 0 |",
         f"| **Evidence Validation Failures** | {summary.get('evidence_validation_failures', 0)} | 0 |",
         f"| **Citation Validation Failures** | {summary.get('citation_validation_failures', 0)} | 0 |",
-        f"| **Provider Requests Attempted** | {summary.get('generation_calls', 0)} | Monitored |",
+        f"| **Other Operational Failures** | {summary.get('other_operational_failures', 0)} | 0 |",
+        f"| **Incorrect Refusals** | {summary.get('incorrect_refusals', 0)} | 0 |",
+        f"| **Provider Requests Attempted** | {prov_reqs_str} | Monitored |",
         f"| **Median E2E Latency** | {summary['median_e2e_latency_ms']} ms | < 2500 ms |",
         f"| **Median Provider Latency** | {summary['median_provider_latency_ms']} ms | < 2000 ms |",
         f"| **Median Diagnostic Latency** | {summary['median_diagnostic_latency_ms']} ms | < 50 ms |",
-        f"| **Total Tokens Consumed** | {summary['tokens_used']} | Monitored |",
+        f"| **Total Tokens Consumed** | {token_str} | Monitored |",
         "",
         "## 3. Per-Question Results Sample",
         "",

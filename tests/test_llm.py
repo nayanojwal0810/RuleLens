@@ -643,3 +643,70 @@ def test_telemetry_snapshot_repair_attempts():
     assert snap.provider_requests_succeeded == 2
     assert snap.known_total_tokens == 100
     assert meta["repair_attempted"] is True
+
+
+def test_consecutive_questions_have_independent_token_completeness_tracking(sample_chunks: List[Dict[str, Any]]):
+    """Test 10: Missing tokens on question 1 does not mark independently measured question 2 as incomplete."""
+    target_chunk = next(c for c in sample_chunks if c["chunk_id"] == "DOC-TRV-002_TRV-C03")
+    mock_raw_client = MagicMock()
+
+    # Call 1: Incomplete tokens (usage.total_tokens is None)
+    mock_choice1 = MagicMock()
+    mock_choice1.message.content = json.dumps({
+        "answer": "First answer.",
+        "status": "answered",
+        "citations": ["DOC-TRV-002_TRV-C03"],
+        "referenced_rule_ids": [],
+        "reason": "Direct citation.",
+    })
+    mock_resp1 = MagicMock()
+    mock_resp1.choices = [mock_choice1]
+    mock_resp1.usage = None  # Missing token usage
+
+    # Call 2: Complete tokens (usage.total_tokens is 85)
+    mock_choice2 = MagicMock()
+    mock_choice2.message.content = json.dumps({
+        "answer": "Second answer.",
+        "status": "answered",
+        "citations": ["DOC-TRV-002_TRV-C03"],
+        "referenced_rule_ids": [],
+        "reason": "Direct citation.",
+    })
+    mock_resp2 = MagicMock()
+    mock_resp2.choices = [mock_choice2]
+    mock_usage2 = MagicMock()
+    mock_usage2.total_tokens = 85
+    mock_resp2.usage = mock_usage2
+
+    mock_raw_client.chat.completions.create.side_effect = [mock_resp1, mock_resp2]
+
+    wrapper = GroqClientWrapper(client=mock_raw_client)
+
+    # Question 1: should record incomplete tokens
+    snap0 = wrapper.get_telemetry_snapshot()
+    wrapper.generate_answer(
+        question="Question 1?",
+        role="employee",
+        evidence_chunks=[target_chunk],
+        query_date="2026-11-22",
+    )
+    snap1 = wrapper.get_telemetry_snapshot()
+    delta1 = snap1.delta(snap0)
+
+    assert delta1.provider_requests_attempted == 1
+    assert delta1.has_incomplete_tokens is True
+
+    # Question 2: measured independently from snap1
+    wrapper.generate_answer(
+        question="Question 2?",
+        role="employee",
+        evidence_chunks=[target_chunk],
+        query_date="2026-11-22",
+    )
+    snap2 = wrapper.get_telemetry_snapshot()
+    delta2 = snap2.delta(snap1)
+
+    assert delta2.provider_requests_attempted == 1
+    assert delta2.known_total_tokens == 85
+    # Question 2 interval MUST NOT be marked as incomplete because of question 1!
+    assert delta2.has_incomplete_tokens is False

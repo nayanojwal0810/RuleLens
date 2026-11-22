@@ -598,3 +598,39 @@ def test_answer_question_retrieval_failure_returns_operational_error(mock_retrie
     assert result.error_category == "service_unavailable"
     assert result.provider_calls_attempted == 0
     mock_llm.generate_answer.assert_not_called()
+
+
+def test_missing_credentials_and_rule_loading_errors_return_sanitized(mock_retriever, sample_retrieval_result, monkeypatch):
+    """Test 9: Missing credentials and rule-loading errors return sanitized operational_error without exposing secrets or paths."""
+    mock_retriever.search.return_value = [sample_retrieval_result]
+
+    # Subtest A: Missing / invalid API credentials during client initialization
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with patch("rulelens.answering.GroqClientWrapper", side_effect=ValueError("GROQ_API_KEY is not set or empty: gsk_secret1234567890")):
+        res_auth = answer_question(
+            question="What is the meal allowance?",
+            role="employee",
+            query_date="2026-11-22",
+            retriever=mock_retriever,
+            llm_client=None,
+        )
+        assert res_auth.status == "operational_error"
+        assert res_auth.error_category in ("authentication_error", "service_unavailable")
+        assert "gsk_" not in str(res_auth.error)
+        assert "gsk_" not in str(res_auth.answer)
+        assert res_auth.provider_calls_attempted == 0
+
+    # Subtest B: Unexpected rule-loading infrastructure error
+    with patch("rulelens.answering.resolve_rules_for_evidence", side_effect=RuntimeError("Corrupt CSV at /var/secrets/rules/private_rules.csv")):
+        res_rule = answer_question(
+            question="What is the meal allowance?",
+            role="employee",
+            query_date="2026-11-22",
+            retriever=mock_retriever,
+            llm_client=MagicMock(),
+        )
+        assert res_rule.status == "operational_error"
+        assert res_rule.error_category == "rule_loading_error"
+        assert "/var/secrets" not in str(res_rule.error)
+        assert "/var/secrets" not in str(res_rule.answer)
+        assert res_rule.provider_calls_attempted == 0

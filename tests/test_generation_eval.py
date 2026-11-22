@@ -27,7 +27,7 @@ from rulelens.generation_eval import (
     run_generation_evaluation,
 )
 from rulelens.llm import AnswerResponse, AnswerStatus, GroqClientWrapper
-from rulelens.retrieval import HybridRetriever, load_validated_corpus
+from rulelens.retrieval import HybridRetriever, RetrievalResult, load_validated_corpus
 
 
 @pytest.fixture(autouse=True)
@@ -540,12 +540,12 @@ def test_adversarial_gold_quote_mismatch_fails_closed(mock_retriever):
     mock_llm.generate_answer.assert_not_called()
 
 
-def test_run_generation_evaluation_rejects_invalid_max_questions(repo_root: Path):
-    """run_generation_evaluation rejects max_questions < 1 or > 50 with ValueError."""
+def test_invalid_max_questions_rejected(repo_root: Path):
+    """Test 8: Invalid max_questions values (booleans, floats, out of range) are rejected with ValueError."""
     dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
-    for invalid_val in (0, 51, -1, 100):
+    for invalid_val in (True, False, 3.5, 0, 51, -1, 100):
         with pytest.raises(ValueError, match="max_questions must be an integer between 1 and 50"):
             run_generation_evaluation(
                 dataset_path=dataset_path,
@@ -553,3 +553,262 @@ def test_run_generation_evaluation_rejects_invalid_max_questions(repo_root: Path
                 max_questions=invalid_val,
                 llm_client=mock_llm,
             )
+
+
+# Backward compatibility alias
+test_run_generation_evaluation_rejects_invalid_max_questions = test_invalid_max_questions_rejected
+
+
+def test_unknown_subset_id_rejected(repo_root: Path):
+    """Test 7: Unknown question ID in subset_ids is rejected with ValueError."""
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    with pytest.raises(ValueError, match="Unknown question IDs requested in subset"):
+        run_generation_evaluation(
+            dataset_path=dataset_path,
+            base_dir=repo_root,
+            subset_ids=["NONEXISTENT-999"],
+            llm_client=mock_llm,
+        )
+
+
+def test_diagnostic_calls_groq_reports_actual_provider_requests(dev_dataset: Dict[str, Any], mock_retriever):
+    """Test 1: A diagnostic question that calls Groq reports its actual provider requests (not hardcoded zero)."""
+    q_diag = next(q for q in dev_dataset["questions"] if not q["answerability"]).copy()
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    from rulelens.answering import GenerationResult
+    from rulelens.config import GENERATION_MODEL
+
+    mock_app_result = GenerationResult(
+        question="Diagnostic question requiring model resolution.",
+        role="employee",
+        query_date="2026-11-22",
+        answer="The corporate policies do not support this expense.",
+        status="insufficient",
+        reason="Model concluded evidence is insufficient.",
+        citations=[],
+        citation_metadata=[],
+        referenced_rule_ids=[],
+        model=GENERATION_MODEL,
+        corpus_fingerprint="4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3",
+        evidence_fingerprint={},
+        latency_ms=250.0,
+        provider_calls_attempted=2,
+        provider_latency_ms=150.0,
+        token_usage=90,
+        schema_valid=True,
+        has_incomplete_tokens=False,
+    )
+
+    with patch("rulelens.generation_eval.answer_question", return_value=mock_app_result):
+        res = evaluate_single_question(
+            question_data=q_diag,
+            retriever=mock_retriever,
+            llm_client=mock_llm,
+        )
+        assert res["provider_calls_attempted"] == 2
+        assert res["token_usage"] == 90
+        assert res["provider_latency_ms"] == 150.0
+        assert res["schema_valid"] is True
+
+
+def test_deterministic_refusal_reports_zero_requests(dev_dataset: Dict[str, Any], mock_retriever):
+    """Test 2: A deterministic refusal reports zero provider calls and null latency/tokens."""
+    q_restr = next(q for q in dev_dataset["questions"] if q["question_id"] == "TRV-009")
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    res = evaluate_single_question(
+        question_data=q_restr,
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+    assert res["status"] == "restricted"
+    assert res["refusal_correct"] is True
+    assert res["provider_calls_attempted"] == 0
+    assert res["provider_latency_ms"] is None
+    assert res["token_usage"] is None
+    assert res["schema_valid"] is None
+    assert res["provider_error"] is False
+    assert res["other_operational_failure"] is False
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_diagnostic_provider_failure_counted_as_provider_failure(repo_root: Path, dev_dataset: Dict[str, Any], mock_retriever):
+    """Test 3: A diagnostic question encountering a provider failure is recorded as provider_error and counted."""
+    q_diag = next(q for q in dev_dataset["questions"] if not q["answerability"]).copy()
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+
+    from rulelens.answering import GenerationResult
+    from rulelens.config import GENERATION_MODEL
+
+    mock_app_result = GenerationResult(
+        question="Diagnostic question requiring model resolution.",
+        role="employee",
+        query_date="2026-11-22",
+        answer="Rate limit HTTP 429.",
+        status="operational_error",
+        reason="Rate limit exceeded",
+        citations=[],
+        citation_metadata=[],
+        referenced_rule_ids=[],
+        model=GENERATION_MODEL,
+        corpus_fingerprint="4f2485c2ea0a10148532e154f308554f44c27ae8b0fbdd7d174dff83f6dab9b3",
+        evidence_fingerprint={},
+        latency_ms=100.0,
+        provider_calls_attempted=1,
+        provider_latency_ms=50.0,
+        token_usage=None,
+        schema_valid=False,
+        has_incomplete_tokens=False,
+        error_category="rate_limited",
+        error="Rate limit HTTP 429",
+    )
+
+    with patch("rulelens.generation_eval.answer_question", return_value=mock_app_result):
+        res = evaluate_single_question(
+            question_data=q_diag,
+            retriever=mock_retriever,
+            llm_client=mock_llm,
+        )
+        assert res["status"] == "operational_error"
+        assert res["provider_error"] is True
+        assert res["other_operational_failure"] is False
+        assert res["provider_calls_attempted"] == 1
+        assert res["error_category"] == "rate_limited"
+
+        with patch("rulelens.generation_eval.evaluate_single_question", return_value=res):
+            summary = run_generation_evaluation(
+                dataset_path=dataset_path,
+                base_dir=repo_root,
+                subset_ids=[q_diag["question_id"]],
+                llm_client=mock_llm,
+                retriever=mock_retriever,
+            )
+            assert summary["provider_failures"] == 1
+            assert summary["provider_errors"] == 1
+            assert summary["other_operational_failures"] == 0
+
+
+def test_local_retrieval_failure_not_counted_as_provider_failure(dev_dataset: Dict[str, Any], mock_retriever):
+    """Test 4: Local retrieval failure is not counted as provider failure (other_operational_failure=True, provider_error=False)."""
+    q_diag = next(q for q in dev_dataset["questions"] if not q["answerability"] and not q.get("restricted_target_chunk_ids"))
+    mock_retriever.search.side_effect = RuntimeError("Local index I/O error")
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    res = evaluate_single_question(
+        question_data=q_diag,
+        retriever=mock_retriever,
+        llm_client=mock_llm,
+    )
+    assert res["status"] == "operational_error"
+    assert res["provider_error"] is False
+    assert res["other_operational_failure"] is True
+    assert res["provider_calls_attempted"] == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_completed_run_containing_errors_labeled_completed_with_errors(repo_root: Path, mock_retriever):
+    """Test 5: A completed evaluation run containing at least one operational or validation failure is labeled completed_with_errors."""
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    def mock_eval(question_data, **kwargs):
+        qid = question_data["question_id"]
+        if qid == "TRV-001":
+            return {
+                "question_id": qid,
+                "answerability": True,
+                "status": "operational_error",
+                "provider_error": False,
+                "other_operational_failure": True,
+                "evidence_validation_failure": False,
+                "citation_validation_failure": False,
+                "refusal_correct": False,
+                "schema_valid": None,
+                "citation_valid": False,
+                "citation_expected": False,
+                "provider_calls_attempted": 0,
+                "latency_ms": 10.0,
+                "provider_latency_ms": None,
+                "token_usage": None,
+                "answer": "Error",
+                "citations": [],
+                "referenced_rule_ids": [],
+            }
+        return {
+            "question_id": qid,
+            "answerability": True,
+            "status": "answered",
+            "provider_error": False,
+            "other_operational_failure": False,
+            "evidence_validation_failure": False,
+            "citation_validation_failure": False,
+            "refusal_correct": False,
+            "schema_valid": True,
+            "citation_valid": True,
+            "citation_expected": True,
+            "provider_calls_attempted": 1,
+            "latency_ms": 100.0,
+            "provider_latency_ms": 80.0,
+            "token_usage": 50,
+            "answer": "Answer",
+            "citations": ["DOC-TRV-002_TRV-C03"],
+            "referenced_rule_ids": [],
+        }
+
+    with patch("rulelens.generation_eval.evaluate_single_question", side_effect=mock_eval):
+        summary = run_generation_evaluation(
+            dataset_path=dataset_path,
+            base_dir=repo_root,
+            max_questions=3,
+            llm_client=mock_llm,
+            retriever=mock_retriever,
+        )
+        assert summary["completed_questions"] == 3
+        assert summary["planned_questions"] == 3
+        assert summary["other_operational_failures"] == 1
+        assert summary["evaluation_state"] == "completed_with_errors"
+
+
+def test_http_429_stops_run_and_marks_partial(repo_root: Path, mock_retriever):
+    """Test 6: HTTP 429 stops the evaluation run early and marks it partial."""
+    dataset_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    with patch("rulelens.generation_eval.evaluate_single_question") as mock_eval:
+        mock_eval.return_value = {
+            "question_id": "TRV-001",
+            "answerability": True,
+            "status": "operational_error",
+            "provider_error": True,
+            "other_operational_failure": False,
+            "evidence_validation_failure": False,
+            "citation_validation_failure": False,
+            "error_category": "rate_limited",
+            "error": "Rate limit exceeded (HTTP 429)",
+            "latency_ms": 50.0,
+            "provider_latency_ms": None,
+            "token_usage": None,
+            "schema_valid": False,
+            "citation_valid": False,
+            "citation_expected": False,
+            "refusal_correct": False,
+            "provider_calls_attempted": 1,
+        }
+
+        summary = run_generation_evaluation(
+            dataset_path=dataset_path,
+            base_dir=repo_root,
+            max_questions=5,
+            llm_client=mock_llm,
+            retriever=mock_retriever,
+        )
+
+        assert mock_eval.call_count == 1
+        assert summary["completed_questions"] == 1
+        assert summary["planned_questions"] == 5
+        assert summary["evaluation_state"] == "partial"
+        assert "Rate limit" in summary["stop_reason"]

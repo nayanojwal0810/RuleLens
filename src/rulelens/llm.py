@@ -106,6 +106,7 @@ class ProviderTelemetrySnapshot:
     provider_request_latency_ms: float = 0.0
     known_total_tokens: Optional[int] = None
     has_incomplete_tokens: bool = False
+    incomplete_token_requests: int = 0
 
     def delta(self, baseline: ProviderTelemetrySnapshot) -> ProviderTelemetrySnapshot:
         """Compute the difference between this snapshot and a previous baseline."""
@@ -115,7 +116,10 @@ class ProviderTelemetrySnapshot:
         elif self.known_total_tokens is not None:
             diff_tokens = self.known_total_tokens
 
-        incomplete = self.has_incomplete_tokens or baseline.has_incomplete_tokens
+        # A delta is incomplete ONLY if incomplete requests occurred during this interval
+        interval_incomplete_count = max(0, self.incomplete_token_requests - baseline.incomplete_token_requests)
+        interval_incomplete = interval_incomplete_count > 0
+
         return ProviderTelemetrySnapshot(
             provider_requests_attempted=self.provider_requests_attempted - baseline.provider_requests_attempted,
             provider_requests_succeeded=self.provider_requests_succeeded - baseline.provider_requests_succeeded,
@@ -123,7 +127,8 @@ class ProviderTelemetrySnapshot:
                 max(0.0, self.provider_request_latency_ms - baseline.provider_request_latency_ms), 2
             ),
             known_total_tokens=diff_tokens,
-            has_incomplete_tokens=incomplete,
+            has_incomplete_tokens=interval_incomplete,
+            incomplete_token_requests=interval_incomplete_count,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -133,6 +138,7 @@ class ProviderTelemetrySnapshot:
             "provider_request_latency_ms": self.provider_request_latency_ms,
             "known_total_tokens": self.known_total_tokens,
             "has_incomplete_tokens": self.has_incomplete_tokens,
+            "incomplete_token_requests": self.incomplete_token_requests,
         }
 
 
@@ -346,6 +352,7 @@ class GroqClientWrapper:
         self._request_latency_ms: float = 0.0
         self._known_total_tokens: Optional[int] = None
         self._has_incomplete_tokens: bool = False
+        self._incomplete_token_requests: int = 0
 
         if client is not None:
             self._client = client
@@ -371,6 +378,7 @@ class GroqClientWrapper:
             provider_request_latency_ms=round(self._request_latency_ms, 2),
             known_total_tokens=self._known_total_tokens,
             has_incomplete_tokens=self._has_incomplete_tokens,
+            incomplete_token_requests=self._incomplete_token_requests,
         )
 
     def reset_telemetry(self) -> None:
@@ -380,6 +388,7 @@ class GroqClientWrapper:
         self._request_latency_ms = 0.0
         self._known_total_tokens = None
         self._has_incomplete_tokens = False
+        self._incomplete_token_requests = 0
 
     def generate_answer(
         self,
@@ -506,6 +515,7 @@ class GroqClientWrapper:
                 self._known_total_tokens = (self._known_total_tokens or 0) + total_tokens
             else:
                 self._has_incomplete_tokens = True
+                self._incomplete_token_requests += 1
 
             return {"content": content, "total_tokens": total_tokens, "latency_ms": req_duration_ms}
 
