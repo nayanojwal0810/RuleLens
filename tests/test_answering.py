@@ -35,7 +35,7 @@ from rulelens.llm import (
     GroqClientWrapper,
     SanitizedProviderError,
 )
-from rulelens.retrieval import RetrievalResult, load_validated_corpus
+from rulelens.retrieval import HybridRetriever, RetrievalResult, load_validated_corpus
 
 
 @pytest.fixture(autouse=True)
@@ -780,18 +780,14 @@ def test_all_five_restricted_diagnostics_refuse_correctly(repo_root: Path, canon
         mock_llm.generate_answer.assert_not_called()
 
 
-def test_all_five_unsupported_diagnostics_refuse_as_insufficient(repo_root: Path, canonical_corpus, canonical_chunks_by_id):
-    """All 5 unsupported diagnostic queries from dev_questions.json produce safe status 'insufficient' without hallucinations."""
+def test_all_five_unsupported_diagnostics_refuse_as_insufficient(repo_root: Path):
+    """All 5 unsupported diagnostic queries from dev_questions.json produce safe status 'insufficient' with real BM25 retrieval."""
     dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
     dev_questions = json.loads(dev_path.read_text(encoding="utf-8"))["questions"]
     q_lookup = {q["question_id"]: q for q in dev_questions}
     unsupported_ids = ["TRV-010", "FIN-010", "PPO-010", "PRC-010", "SEC-010"]
 
-    retriever = MagicMock()
-    retriever.chunks = canonical_corpus
-    retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
-    retriever.search.return_value = []
+    real_retriever = HybridRetriever(base_dir=repo_root)
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
     for qid in unsupported_ids:
@@ -800,13 +796,52 @@ def test_all_five_unsupported_diagnostics_refuse_as_insufficient(repo_root: Path
             question=item["question"],
             role=item["role"],
             query_date=item["query_date"],
-            retriever=retriever,
+            retriever=real_retriever,
+            mode="bm25",
             llm_client=mock_llm,
         )
         assert res.status == "insufficient", f"Expected insufficient for {qid}: {item['question']}"
         assert res.citations == []
         assert res.provider_calls_attempted == 0
         mock_llm.generate_answer.assert_not_called()
+
+
+def test_adversarial_spa_treatment_not_approved_by_travel_threshold(canonical_corpus, canonical_chunks_by_id):
+    """Adversarial query about personal spa treatment (INR 50,000) using actual Travel Policy v2 clause must NOT approve."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04 = RetrievalResult(
+        chunk_id=c["chunk_id"],
+        text=c["text"],
+        doc_id=c["doc_id"],
+        clause_id=c["clause_id"],
+        title=c["title"],
+        department=c["department"],
+        version=c["version"],
+        source_file=c["source_file"],
+        source_page=int(c["source_page"]),
+        effective_from=c["effective_from"],
+        effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.search.return_value = [c04]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    res = answer_question(
+        question="Can employees expense personal spa treatments costing INR 50,000 during business trips?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert "approved" not in res.answer.lower() or "not contain sufficient evidence" in res.answer.lower()
+    assert res.citations == []
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
 
 
 def test_deterministic_booking_notice_query_bypasses_groq_with_none_schema(canonical_corpus, canonical_chunks_by_id):

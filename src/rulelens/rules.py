@@ -696,6 +696,86 @@ def _format_canonical_decision_answer(
         return f"The policy rule ({rule.rule_id}) establishes the outcome '{outcome}' for {field} {rule.operator} {thresh} {rule.unit}."
 
 
+_DECISION_BENIGN_TERMS: Set[str] = {
+    # Functional / grammatical terms
+    "what", "is", "are", "was", "were", "can", "could", "does", "do", "did", "may", "might",
+    "a", "an", "the", "of", "for", "under", "in", "on", "at", "by", "with", "about", "within",
+    "after", "before", "to", "from", "than", "into", "through", "during", "and", "or", "as", "if",
+    "not", "no", "per", "via", "without", "this", "that", "these", "those", "who", "whom", "which",
+    # Currency and units
+    "inr", "rs", "rupee", "rupees", "usd", "eur", "gbp", "dollar", "dollars", "euro", "euros", "pound", "pounds",
+    "day", "days", "month", "months", "hour", "hours", "mbps",
+    # Decision / permission framing
+    "approve", "approval", "approved", "permits", "permit", "permitted", "permission", "permissible",
+    "allows", "allow", "allowed", "allowable", "requires", "require", "required", "requirement",
+    "standard", "additional", "compliant", "compliance", "meet", "meets", "meeting", "suffice",
+    "sufficient", "enough", "exceed", "exceeds", "exceeding", "eligible", "eligibility", "status",
+    # Corporate roles and entities
+    "director", "manager", "lead", "employee", "employees", "role", "roles", "policy", "corporate",
+    "company", "asterline", "group", "threshold", "limit", "limits", "amount", "expense", "expenses",
+    "spend", "spending", "claim", "claims", "reimbursement", "reimburse", "cost", "costing", "price", "direct",
+    "functional", "department", "reporting",
+    # Canonical condition field domain vocabulary
+    "booking", "notice", "advance", "departure", "flight", "receipt", "tax", "invoice", "itemized",
+    "incidental", "payment", "confirmation", "attached", "quote", "quotes", "single", "competitive",
+    "three", "two", "multiple", "supplier", "purchase", "order", "po", "emergency", "card", "credit",
+    "monthly", "sick", "illness", "leave", "medical", "certificate", "self", "remote", "setup", "work",
+    "internet", "speed", "tuition", "annual", "grant", "committee", "contract", "vendor", "agreement",
+    "duration", "signoff", "legal", "procurement", "board", "data", "classification", "tier",
+    "confidential", "restricted", "encryption", "tokenized", "hsm", "aes", "privileged", "access",
+    "review", "recertification", "suspension", "automatic", "cycle", "interval", "incident", "severity",
+    "priority", "response", "time", "window", "sla", "breach", "escalation", "late", "exception", "exceptions",
+    # Document tags
+    "doc", "trv", "fin", "ppo", "prc", "sec",
+    "c04", "b02", "r03", "p02", "e01", "a02", "i02", "v1", "v2", "v3",
+    # Broad travel qualifiers
+    "travel", "trip", "trips", "business", "personal",
+}
+
+_RULE_FIELD_SUBJECT_TERMS: Dict[str, Set[str]] = {
+    "expense_amount": {"travel", "trip", "trv", "lodging", "hotel", "meal", "per diem", "policy v1", "policy v2", "travel policy"},
+    "advance_booking_days": {"booking", "book", "flight", "departure", "advance", "notice"},
+    "receipt_amount": {"receipt", "invoice", "incidental", "itemized"},
+    "order_amount": {"quote", "supplier", "purchase", "order", "po", "procurement"},
+    "emergency_purchase_amount": {"emergency", "purchase", "procurement"},
+    "monthly_spend": {"card", "corporate card", "credit card", "monthly spend"},
+    "consecutive_sick_days": {"sick", "illness", "leave", "medical", "certificate"},
+    "internet_speed_mbps": {"internet", "speed", "remote", "connection", "mbps"},
+    "annual_tuition_claim": {"tuition", "course", "education", "degree", "grant"},
+    "contract_duration_months": {"contract", "vendor", "agreement", "duration"},
+    "privileged_role_review_interval_days": {"privileged", "access", "review", "recertification", "suspension"},
+    "incident_severity_p1_response_hours": {"incident", "severity", "p1", "priority 1", "response", "sla"},
+    "data_classification_tier": {"classification", "tier", "confidential", "restricted", "encryption"},
+    "submission_delay_days": {"submit", "submission", "delay", "deadline"},
+}
+
+
+def _find_unsupported_query_terms(query: str, chunk_dict: Union[Dict[str, Any], Any]) -> List[str]:
+    """Find query terms that introduce unsupported requirements not covered by chunk text, title, or benign framing."""
+    if isinstance(chunk_dict, dict):
+        c_text = (
+            (chunk_dict.get("text") or "") + " " +
+            (chunk_dict.get("title") or "") + " " +
+            (chunk_dict.get("department") or "")
+        ).lower()
+    else:
+        c_text = (
+            (getattr(chunk_dict, "text", "") or "") + " " +
+            (getattr(chunk_dict, "title", "") or "") + " " +
+            (getattr(chunk_dict, "department", "") or "")
+        ).lower()
+
+    words = re.findall(r"\b[a-zA-Z]{3,}\b", query.lower())
+    unsupported = []
+    for w in words:
+        if w in _DECISION_BENIGN_TERMS:
+            continue
+        stem = w.rstrip("s")
+        if not re.search(r"\b" + re.escape(stem), c_text):
+            unsupported.append(w)
+    return unsupported
+
+
 def evaluate_authoritative_rule_decision(
     question: str,
     authorized_chunks: Sequence[Dict[str, Any]],
@@ -708,8 +788,10 @@ def evaluate_authoritative_rule_decision(
     1. Query asks for a concrete policy decision (e.g., approval, permission, compliance).
     2. Exactly one unambiguous condition is extracted.
     3. Exactly one active, authorized rule condition passes for this condition.
-    4. The passing rule's chunk is present in authorized evidence.
-    5. Query is not an open-ended definition question or multi-clause question.
+    4. Query aligns with the matched rule's policy subject.
+    5. The passing rule's chunk is present in authorized evidence.
+    6. Query contains no additional unsupported requirements not present in evidence.
+    7. Query is not an open-ended definition question or multi-clause question.
     """
     if not question or not question.strip():
         return AuthoritativeDecision(is_authoritative=False)
@@ -759,9 +841,25 @@ def evaluate_authoritative_rule_decision(
     passing_result = passing_rules[0]
     rule = passing_result.rule
 
-    # Verify rule's linked chunk is present in authorized chunks
-    auth_cids = {c["chunk_id"] for c in authorized_chunks}
-    if rule.chunk_id not in auth_cids:
+    # 1. Subject match verification: Question must be about the matched rule's policy subject
+    subject_terms = _RULE_FIELD_SUBJECT_TERMS.get(cond_field)
+    if subject_terms and not any(st in q_lower for st in subject_terms):
+        return AuthoritativeDecision(is_authoritative=False)
+
+    # 2. Verify rule's linked chunk is present in authorized chunks
+    rule_chunk = None
+    for c in authorized_chunks:
+        cid = c.get("chunk_id") if isinstance(c, dict) else getattr(c, "chunk_id", None)
+        if cid == rule.chunk_id:
+            rule_chunk = c
+            break
+
+    if not rule_chunk:
+        return AuthoritativeDecision(is_authoritative=False)
+
+    # 3. Unsupported requirements check: Question must not contain additional unsupported entities
+    unsupported_terms = _find_unsupported_query_terms(question, rule_chunk)
+    if unsupported_terms:
         return AuthoritativeDecision(is_authoritative=False)
 
     answer_text = _format_canonical_decision_answer(rule, cond_val, cond_unit)
