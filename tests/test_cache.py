@@ -1448,3 +1448,542 @@ def test_adversarial_15_missing_citation_metadata(canonical_chunks_by_id, mock_e
     )
     assert res.hit is False
     assert res.rejection_reason == "incomplete_citation_metadata"
+
+
+# ==============================================================================
+# Pass 1 Final Review: Incomplete Rule Records & Fact-Equivalence Regressions
+# ==============================================================================
+
+
+def test_adversarial_16_missing_cached_rule_outcome_rejected_incomplete_rule_record(
+    canonical_chunks_by_id, mock_embedder
+):
+    """Cached referenced rule ID missing associated cached outcome is rejected as incomplete_rule_record."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    q = "What is the policy regarding travel reimbursement approvals?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Travel reimbursement approvals require director approval exceeding INR 50,000.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C04"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C04": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C04": chunk.get("version", "2.0")},
+        "referenced_rule_ids": ["R-TRV-003"],
+        "rule_outcomes": {},  # Missing cached outcome for R-TRV-003!
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "incomplete_rule_record"
+
+
+def test_adversarial_17_rule_outcome_mismatch_rejected(canonical_chunks_by_id, mock_embedder):
+    """Candidate with mismatched rule outcome is rejected with rule_outcome_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    q = "Can an expense of INR 50,000 be approved under Travel Policy v2?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Expenses of INR 50,000 follow standard approval.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {"expense_amount": {"value": "50000", "unit": "inr", "comparison": "exact"}},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C04"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C04": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C04": chunk.get("version", "2.0")},
+        "referenced_rule_ids": ["R-TRV-003"],
+        "rule_outcomes": {"R-TRV-003": "additional_approval"},  # Cached outcome says additional_approval, but rule gives standard_approval!
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    mock_rule = RuleRecord(
+        rule_id="R-TRV-003", doc_id="DOC-TRV-002", clause_id="TRV-C04", chunk_id="DOC-TRV-002_TRV-C04",
+        condition_field="expense_amount", operator="<=", threshold_value=50000, unit="INR",
+        outcome="standard_approval", effective_from="2026-07-01", effective_to="2099-12-31",
+    )
+    mock_eval = RuleEvaluationResult(
+        rule=mock_rule, passed=True, input_value=Decimal("50000"), input_unit="INR",
+        outcome="standard_approval", explanation="Satisfied",
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[{"field": "expense_amount", "value": Decimal("50000"), "unit": "INR", "comparison": "exact"}],
+        rule_results=[mock_eval],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "rule_outcome_mismatch"
+
+
+def test_adversarial_18_rule_condition_input_mismatch_rejected(canonical_chunks_by_id, mock_embedder):
+    """Inconsistent rule input condition value is rejected with rule_condition_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    q = "Can an expense of INR 50,000 be approved under Travel Policy v2?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Expenses of INR 50,000 follow standard approval.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {"expense_amount": {"value": "50000", "unit": "inr", "comparison": "exact"}},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C04"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C04": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C04": chunk.get("version", "2.0")},
+        "referenced_rule_ids": ["R-TRV-003"],
+        "rule_outcomes": {"R-TRV-003": "standard_approval"},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    mock_rule = RuleRecord(
+        rule_id="R-TRV-003", doc_id="DOC-TRV-002", clause_id="TRV-C04", chunk_id="DOC-TRV-002_TRV-C04",
+        condition_field="expense_amount", operator="<=", threshold_value=50000, unit="INR",
+        outcome="standard_approval", effective_from="2026-07-01", effective_to="2099-12-31",
+    )
+    # Evaluated with 40,000 instead of 50,000
+    mock_eval = RuleEvaluationResult(
+        rule=mock_rule, passed=True, input_value=Decimal("40000"), input_unit="INR",
+        outcome="standard_approval", explanation="Satisfied",
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[{"field": "expense_amount", "value": Decimal("50000"), "unit": "INR", "comparison": "exact"}],
+        rule_results=[mock_eval],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "rule_condition_mismatch"
+
+
+def test_fact_equivalence_meal_vs_hotel_high_similarity_rejected(canonical_chunks_by_id, mock_embedder):
+    """Daily meal allowance vs nightly hotel lodging with similarity >= 0.99 must reject with fact_target_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C03"]
+
+    seed_q = "What is the maximum daily meal allowance under Travel Policy v2?"
+    query_q = "What is the maximum nightly hotel lodging allowance under Travel Policy v2?"
+
+    # Force identical vector (similarity = 1.0) so vector similarity is NOT the rejection reason
+    vec = mock_embedder.embed_query(query_q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": seed_q,
+        "normalized_question": normalize_question(seed_q),
+        "answer": "The maximum daily meal allowance is INR 2,500 under Travel Policy v2.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(seed_q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C03"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C03": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C03": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=query_q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.similarity >= 0.99
+    assert res.hit is False
+    assert res.rejection_reason == "fact_target_mismatch"
+
+
+def test_fact_equivalence_submission_vs_review_sla_high_similarity_rejected(
+    canonical_chunks_by_id, mock_embedder
+):
+    """Employee claim submission deadline vs manager review SLA (similarity >= 0.99) rejected with fact_target_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-FIN-001_FIN-C02"]
+
+    seed_q = "How many business days do employees have to submit expense claims after incurring an expense?"
+    query_q = "How many business days do managers have to review and approve submitted expense claims?"
+
+    vec = mock_embedder.embed_query(query_q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": seed_q,
+        "normalized_question": normalize_question(seed_q),
+        "answer": "Employees must submit expense claims within 30 calendar days.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(seed_q),
+        "cited_chunk_ids": ["DOC-FIN-001_FIN-C02"],
+        "cited_chunk_hashes": {"DOC-FIN-001_FIN-C02": chunk_hash},
+        "cited_policy_versions": {"DOC-FIN-001_FIN-C02": chunk.get("version", "1.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=query_q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.similarity >= 0.99
+    assert res.hit is False
+    assert res.rejection_reason == "fact_target_mismatch"
+
+
+def test_fact_equivalence_encryption_vs_transfer_high_similarity_rejected(
+    canonical_chunks_by_id, mock_embedder
+):
+    """Encryption at rest vs document transfer restrictions rejected with fact_target_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-SEC-001_SEC-D02"]
+
+    seed_q = "What encryption standard is mandatory for Confidential tier data at rest?"
+    query_q = "What security measures are required when transferring Confidential documents outside corporate networks?"
+
+    vec = mock_embedder.embed_query(query_q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": seed_q,
+        "normalized_question": normalize_question(seed_q),
+        "answer": "AES-256 encryption is mandatory for Confidential tier data at rest.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(seed_q),
+        "cited_chunk_ids": ["DOC-SEC-001_SEC-D02"],
+        "cited_chunk_hashes": {"DOC-SEC-001_SEC-D02": chunk_hash},
+        "cited_policy_versions": {"DOC-SEC-001_SEC-D02": chunk.get("version", "1.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=query_q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.similarity >= 0.99
+    assert res.hit is False
+    assert res.rejection_reason == "fact_target_mismatch"
+
+
+def test_fact_equivalence_sick_leave_vs_vacation_high_similarity_rejected(
+    canonical_chunks_by_id, mock_embedder
+):
+    """Sick leave certification vs vacation leave accrual rejected with fact_target_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-PPO-001_PPO-L01"]
+
+    seed_q = "How many paid annual vacation leave days do employees accrue per calendar year?"
+    query_q = "How many consecutive sick leave days require a medical certificate?"
+
+    vec = mock_embedder.embed_query(query_q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": seed_q,
+        "normalized_question": normalize_question(seed_q),
+        "answer": "Employees accrue 1.75 vacation days per month (21 days per year).",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(seed_q),
+        "cited_chunk_ids": ["DOC-PPO-001_PPO-L01"],
+        "cited_chunk_hashes": {"DOC-PPO-001_PPO-L01": chunk_hash},
+        "cited_policy_versions": {"DOC-PPO-001_PPO-L01": chunk.get("version", "1.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=query_q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.similarity >= 0.99
+    assert res.hit is False
+    assert res.rejection_reason == "fact_target_mismatch"
+
+
+def test_fact_equivalence_valid_exact_question_hit(canonical_chunks_by_id, mock_embedder):
+    """Valid exact question hit produces hit=True and verified citations."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C03"]
+    q = "What is the maximum daily meal allowance for domestic travel under Travel Policy v2?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "The maximum daily meal allowance for domestic travel is INR 2,500 under Travel Policy v2.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C03"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C03": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C03": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is True
+    assert res.rejection_reason is None
+    assert res.record is not None
+    assert "maximum daily meal allowance" in res.record.answer
+
+
+def test_fact_equivalence_valid_demonstrated_paraphrase_hit(canonical_chunks_by_id, mock_embedder):
+    """Demonstrated meaning-preserving paraphrase of the same policy fact produces hit=True."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C03"]
+
+    seed_q = "What is the maximum daily meal allowance for domestic travel under Travel Policy v2?"
+    para_q = "Under Travel Policy v2, what is the maximum per diem meal allowance for domestic travel?"
+
+    vec = mock_embedder.embed_query(para_q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": seed_q,
+        "normalized_question": normalize_question(seed_q),
+        "answer": "The maximum daily meal allowance for domestic travel is INR 2,500 under Travel Policy v2.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(seed_q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C03"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C03": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C03": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=para_q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is True
+    assert res.rejection_reason is None
+    assert res.record is not None
+    assert "maximum daily meal allowance" in res.record.answer

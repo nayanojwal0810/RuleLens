@@ -75,6 +75,17 @@ class ConditionExtractionResult:
 
 
 @dataclass(frozen=True)
+class NumericalBoundaryAnalysis:
+    """Outcome of analyzing a numerical query condition against active structured rules."""
+
+    status: str  # "single_outcome", "crossing_outcomes", "cannot_evaluate"
+    satisfying_rule: Optional[RuleRecord] = None
+    outcome: Optional[str] = None
+    intersecting_rules: List[RuleRecord] = None
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class AuthoritativeDecision:
     """Represents a deterministic, authoritative rule decision."""
 
@@ -333,6 +344,26 @@ def resolve_rules_for_evidence(
             if field:
                 cond_map[field] = cond
 
+    # Dynamically analyze numerical boundaries against active, authorized rules for this query date
+    active_authorized_rules = [
+        r for r in all_rules
+        if r.chunk_id in authorized_cids and is_rule_active(r, q_date)
+    ]
+    for field, cond_entry in cond_map.items():
+        if not cond_entry.get("is_ambiguous", False) and cond_entry.get("value") is not None:
+            field_rules = [r for r in active_authorized_rules if r.condition_field == field]
+            if field_rules:
+                b_res = analyze_numerical_boundary(
+                    active_rules=field_rules,
+                    comparison=cond_entry.get("comparison", "exact"),
+                    value=cond_entry.get("value"),
+                    unit=cond_entry.get("unit"),
+                    min_value=cond_entry.get("min_value"),
+                    max_value=cond_entry.get("max_value"),
+                )
+                if b_res.status == "crossing_outcomes":
+                    cond_entry["is_boundary_crossing"] = True
+
     results: List[RuleEvaluationResult] = []
 
     for rule in all_rules:
@@ -498,23 +529,6 @@ _HOURS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_CANONICAL_THRESHOLDS: Dict[str, Set[Decimal]] = {
-    "expense_amount": {Decimal("40000"), Decimal("50000")},
-    "receipt_amount": {Decimal("1000")},
-    "order_amount": {Decimal("150000")},
-    "emergency_purchase_amount": {Decimal("300000")},
-    "monthly_spend": {Decimal("100000")},
-    "annual_tuition_claim": {Decimal("200000")},
-    "advance_booking_days": {Decimal("14")},
-    "submission_delay_days": {Decimal("30")},
-    "consecutive_sick_days": {Decimal("3")},
-    "contract_duration_months": {Decimal("12")},
-    "privileged_role_review_interval_days": {Decimal("90")},
-    "incident_severity_p1_response_hours": {Decimal("1")},
-    "internet_speed_mbps": {Decimal("50")},
-}
-
-
 def _detect_comparison_operator(query: str, match_start: int, match_end: int) -> str:
     """Detect directional comparison modifiers in the vicinity of a numerical match."""
     q_lower = query.lower()
@@ -550,38 +564,200 @@ def _detect_comparison_operator(query: str, match_start: int, match_end: int) ->
     return "exact"
 
 
-def _is_boundary_crossing_condition(
-    field: str,
-    comp: str,
-    val: Any,
-    min_val: Optional[Any] = None,
-    max_val: Optional[Any] = None,
+def does_condition_intersect_rule(
+    rule: Union[RuleRecord, Dict[str, Any]],
+    comparison: str,
+    value: Any,
+    unit: Optional[str] = None,
+    min_value: Optional[Any] = None,
+    max_value: Optional[Any] = None,
 ) -> bool:
-    """Determine whether a numerical condition spans across canonical policy thresholds."""
-    thresholds = _CANONICAL_THRESHOLDS.get(field)
-    if not thresholds:
+    """Determine whether a query condition range/value intersects a rule's condition set."""
+    rule_unit = rule.unit if isinstance(rule, RuleRecord) else rule["unit"]
+    rule_op = rule.operator if isinstance(rule, RuleRecord) else rule["operator"]
+    threshold = rule.threshold_value if isinstance(rule, RuleRecord) else rule["threshold_value"]
+
+    if unit is not None and rule_unit is not None:
+        if unit.strip().lower() != rule_unit.strip().lower():
+            return False
+
+    comp = (comparison or "exact").strip().lower()
+
+    if rule_op == "==":
+        if comp == "exact":
+            if isinstance(threshold, str):
+                return str(value).strip().lower() == threshold.strip().lower()
+            return value == threshold
+        elif comp == "range":
+            c_min = min_value if min_value is not None else (value[0] if isinstance(value, (list, tuple)) else value)
+            c_max = max_value if max_value is not None else (value[1] if isinstance(value, (list, tuple)) else value)
+            try:
+                d_min = Decimal(str(c_min).strip().replace(",", ""))
+                d_max = Decimal(str(c_max).strip().replace(",", ""))
+                t_dec = Decimal(str(threshold).strip().replace(",", ""))
+                if d_min > d_max:
+                    d_min, d_max = d_max, d_min
+                return d_min <= t_dec <= d_max
+            except (InvalidOperation, ValueError, TypeError):
+                return False
         return False
-    if comp == "greater_than_or_equal":
-        try:
-            d_val = Decimal(str(val).replace(",", ""))
-            if d_val in thresholds:
-                return True
-        except (InvalidOperation, ValueError, TypeError):
-            pass
-    elif comp == "range":
-        try:
-            c_min = min_val if min_val is not None else (val[0] if isinstance(val, (list, tuple)) else val)
-            c_max = max_val if max_val is not None else (val[1] if isinstance(val, (list, tuple)) else val)
-            d_min = Decimal(str(c_min).replace(",", ""))
-            d_max = Decimal(str(c_max).replace(",", ""))
+
+    try:
+        clean_thresh = str(threshold).strip().replace(",", "")
+        t_dec = Decimal(clean_thresh)
+        if comp == "range":
+            c_min = min_value if min_value is not None else (value[0] if isinstance(value, (list, tuple)) else value)
+            c_max = max_value if max_value is not None else (value[1] if isinstance(value, (list, tuple)) else value)
+            d_min = Decimal(str(c_min).strip().replace(",", ""))
+            d_max = Decimal(str(c_max).strip().replace(",", ""))
             if d_min > d_max:
                 d_min, d_max = d_max, d_min
-            for t in thresholds:
-                if d_min <= t <= d_max:
-                    return True
-        except (InvalidOperation, ValueError, TypeError):
-            pass
+        else:
+            clean_val = str(value).strip().replace(",", "")
+            d_val = Decimal(clean_val)
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+    # Check intersection based on rule operator
+    if rule_op == "<=":
+        if comp == "exact":
+            return d_val <= t_dec
+        elif comp in ("less_than", "less_than_or_equal"):
+            return True
+        elif comp == "greater_than":
+            return d_val < t_dec
+        elif comp == "greater_than_or_equal":
+            return d_val <= t_dec
+        elif comp == "range":
+            return d_min <= t_dec
+
+    elif rule_op == "<":
+        if comp == "exact":
+            return d_val < t_dec
+        elif comp in ("less_than", "less_than_or_equal"):
+            return True
+        elif comp in ("greater_than", "greater_than_or_equal"):
+            return d_val < t_dec
+        elif comp == "range":
+            return d_min < t_dec
+
+    elif rule_op == ">":
+        if comp == "exact":
+            return d_val > t_dec
+        elif comp in ("greater_than", "greater_than_or_equal"):
+            return True
+        elif comp in ("less_than", "less_than_or_equal"):
+            return d_val > t_dec
+        elif comp == "range":
+            return d_max > t_dec
+
+    elif rule_op == ">=":
+        if comp == "exact":
+            return d_val >= t_dec
+        elif comp in ("greater_than", "greater_than_or_equal"):
+            return True
+        elif comp == "less_than":
+            return d_val > t_dec
+        elif comp == "less_than_or_equal":
+            return d_val >= t_dec
+        elif comp == "range":
+            return d_max >= t_dec
+
     return False
+
+
+def analyze_numerical_boundary(
+    active_rules: Sequence[Union[RuleRecord, Dict[str, Any]]],
+    comparison: str,
+    value: Any,
+    unit: Optional[str] = None,
+    min_value: Optional[Any] = None,
+    max_value: Optional[Any] = None,
+) -> NumericalBoundaryAnalysis:
+    """Determine whether the requested set of values fits completely within one rule outcome,
+    crosses two or more outcomes, or cannot be evaluated safely.
+
+    Uses active, authorized structured rules dynamically for the requested policy date.
+    Uses exact Decimal arithmetic.
+    """
+    if not active_rules:
+        return NumericalBoundaryAnalysis(
+            status="cannot_evaluate",
+            reason="No active rules provided for numerical boundary evaluation.",
+        )
+
+    # 1. Check unit compatibility across active rules
+    if unit is not None:
+        for r in active_rules:
+            r_unit = r.unit if isinstance(r, RuleRecord) else r["unit"]
+            if r_unit and unit.strip().lower() != r_unit.strip().lower():
+                return NumericalBoundaryAnalysis(
+                    status="cannot_evaluate",
+                    reason=f"Incompatible unit '{unit}' for rule. Expected '{r_unit}'.",
+                )
+
+    # 2. Check rule intersection (which outcomes does the condition intersect?)
+    intersecting = []
+    for r in active_rules:
+        if does_condition_intersect_rule(r, comparison, value, unit, min_value, max_value):
+            intersecting.append(r)
+
+    intersecting_outcomes = {r.outcome if isinstance(r, RuleRecord) else r["outcome"] for r in intersecting}
+
+    # 3. Check complete satisfaction (which rule outcome completely contains all query values?)
+    satisfying = []
+    for r in active_rules:
+        try:
+            if evaluate_rule_condition(r, value, unit, comparison, min_value, max_value):
+                satisfying.append(r)
+        except (ValueError, TypeError):
+            pass
+
+    # If condition intersects rules with multiple different outcomes:
+    if len(intersecting_outcomes) > 1:
+        return NumericalBoundaryAnalysis(
+            status="crossing_outcomes",
+            intersecting_rules=intersecting,
+            reason=f"Condition crosses multiple policy rule outcomes: {sorted(intersecting_outcomes)}.",
+        )
+
+    # If condition fits completely within one rule outcome:
+    if len(satisfying) == 1 and len(intersecting_outcomes) <= 1:
+        chosen_rule = satisfying[0]
+        chosen_outcome = chosen_rule.outcome if isinstance(chosen_rule, RuleRecord) else chosen_rule["outcome"]
+        return NumericalBoundaryAnalysis(
+            status="single_outcome",
+            satisfying_rule=chosen_rule if isinstance(chosen_rule, RuleRecord) else None,
+            outcome=chosen_outcome,
+            intersecting_rules=intersecting,
+            reason=f"Condition fits completely within rule outcome '{chosen_outcome}'.",
+        )
+
+    if len(satisfying) > 1:
+        # Multiple satisfying rules with the same outcome is fine if unanimous
+        outcomes = {r.outcome if isinstance(r, RuleRecord) else r["outcome"] for r in satisfying}
+        if len(outcomes) == 1:
+            chosen_rule = satisfying[0]
+            chosen_outcome = list(outcomes)[0]
+            return NumericalBoundaryAnalysis(
+                status="single_outcome",
+                satisfying_rule=chosen_rule if isinstance(chosen_rule, RuleRecord) else None,
+                outcome=chosen_outcome,
+                intersecting_rules=intersecting,
+                reason=f"Condition uniformly satisfies outcome '{chosen_outcome}'.",
+            )
+        return NumericalBoundaryAnalysis(
+            status="crossing_outcomes",
+            intersecting_rules=satisfying,
+            reason=f"Condition crosses multiple rule outcomes: {sorted(outcomes)}.",
+        )
+
+    # If no rule completely satisfies the condition:
+    return NumericalBoundaryAnalysis(
+        status="cannot_evaluate",
+        intersecting_rules=intersecting,
+        reason="Condition does not fit completely within any single active rule outcome.",
+    )
 
 
 def _determine_currency_field(query_lower: str, span_lower: str) -> Optional[str]:
@@ -696,7 +872,6 @@ def extract_conditions_from_query(
 
         field = _determine_currency_field(q_lower, span)
         if field:
-            is_bc = _is_boundary_crossing_condition(field, "range", (min_val, max_val), min_val, max_val)
             raw_candidates.append({
                 "field": field,
                 "value": (min_val, max_val),
@@ -704,7 +879,7 @@ def extract_conditions_from_query(
                 "comparison": "range",
                 "min_value": min_val,
                 "max_value": max_val,
-                "is_boundary_crossing": is_bc,
+                "is_boundary_crossing": False,
             })
             covered_spans.append((match.start(), match.end()))
 
@@ -728,7 +903,6 @@ def extract_conditions_from_query(
             field = "privileged_role_review_interval_days"
 
         if field:
-            is_bc = _is_boundary_crossing_condition(field, "range", (min_d, max_d), min_d, max_d)
             raw_candidates.append({
                 "field": field,
                 "value": (min_d, max_d),
@@ -736,7 +910,7 @@ def extract_conditions_from_query(
                 "comparison": "range",
                 "min_value": min_d,
                 "max_value": max_d,
-                "is_boundary_crossing": is_bc,
+                "is_boundary_crossing": False,
             })
             covered_spans.append((match.start(), match.end()))
 
@@ -786,7 +960,6 @@ def extract_conditions_from_query(
             field = _determine_currency_field(q_lower, span)
             if field:
                 comp = _detect_comparison_operator(query, match.start(), match.end())
-                is_bc = _is_boundary_crossing_condition(field, comp, val)
                 raw_candidates.append({
                     "field": field,
                     "value": val,
@@ -794,7 +967,7 @@ def extract_conditions_from_query(
                     "comparison": comp,
                     "min_value": None,
                     "max_value": None,
-                    "is_boundary_crossing": is_bc,
+                    "is_boundary_crossing": False,
                 })
 
     # Check for days
@@ -817,7 +990,6 @@ def extract_conditions_from_query(
 
         if field:
             comp = _detect_comparison_operator(query, match.start(), match.end())
-            is_bc = _is_boundary_crossing_condition(field, comp, val)
             raw_candidates.append({
                 "field": field,
                 "value": val,
@@ -825,7 +997,7 @@ def extract_conditions_from_query(
                 "comparison": comp,
                 "min_value": None,
                 "max_value": None,
-                "is_boundary_crossing": is_bc,
+                "is_boundary_crossing": False,
             })
 
     # Check for months
@@ -836,7 +1008,6 @@ def extract_conditions_from_query(
             continue
         if any(k in q_lower for k in ("contract", "duration", "agreement")):
             comp = _detect_comparison_operator(query, match.start(), match.end())
-            is_bc = _is_boundary_crossing_condition("contract_duration_months", comp, val)
             raw_candidates.append({
                 "field": "contract_duration_months",
                 "value": val,
@@ -844,7 +1015,7 @@ def extract_conditions_from_query(
                 "comparison": comp,
                 "min_value": None,
                 "max_value": None,
-                "is_boundary_crossing": is_bc,
+                "is_boundary_crossing": False,
             })
 
     # Check for mbps
@@ -854,7 +1025,6 @@ def extract_conditions_from_query(
         except ValueError:
             continue
         comp = _detect_comparison_operator(query, match.start(), match.end())
-        is_bc = _is_boundary_crossing_condition("internet_speed_mbps", comp, val)
         raw_candidates.append({
             "field": "internet_speed_mbps",
             "value": val,
@@ -862,7 +1032,7 @@ def extract_conditions_from_query(
             "comparison": comp,
             "min_value": None,
             "max_value": None,
-            "is_boundary_crossing": is_bc,
+            "is_boundary_crossing": False,
         })
 
     # Check for hours
@@ -873,7 +1043,6 @@ def extract_conditions_from_query(
             continue
         if any(k in q_lower for k in ("incident", "p1", "severity", "sla")):
             comp = _detect_comparison_operator(query, match.start(), match.end())
-            is_bc = _is_boundary_crossing_condition("incident_severity_p1_response_hours", comp, val)
             raw_candidates.append({
                 "field": "incident_severity_p1_response_hours",
                 "value": val,
@@ -881,7 +1050,7 @@ def extract_conditions_from_query(
                 "comparison": comp,
                 "min_value": None,
                 "max_value": None,
-                "is_boundary_crossing": is_bc,
+                "is_boundary_crossing": False,
             })
 
     # Filter to relevant fields if specified
@@ -1078,6 +1247,7 @@ def _format_canonical_decision_answer(
 _DECISION_BENIGN_TERMS: Set[str] = {
     # Functional / grammatical terms
     "what", "is", "are", "was", "were", "can", "could", "does", "do", "did", "may", "might",
+    "have", "has", "had",
     "a", "an", "the", "of", "for", "under", "in", "on", "at", "by", "with", "about", "within",
     "after", "before", "to", "from", "than", "into", "through", "during", "and", "or", "as", "if",
     "not", "no", "per", "via", "without", "this", "that", "these", "those", "who", "whom", "which",
@@ -1101,7 +1271,7 @@ _DECISION_BENIGN_TERMS: Set[str] = {
     "incidental", "payment", "confirmation", "attached", "quote", "quotes", "single", "competitive",
     "three", "two", "multiple", "supplier", "purchase", "order", "po", "emergency", "card", "credit",
     "monthly", "sick", "illness", "leave", "medical", "certificate", "self", "remote", "setup", "work",
-    "internet", "speed", "tuition", "annual", "grant", "committee", "contract", "vendor", "agreement",
+    "internet", "speed", "tuition", "assistance", "annual", "grant", "committee", "contract", "vendor", "agreement",
     "duration", "signoff", "legal", "procurement", "board", "data", "classification", "tier",
     "confidential", "restricted", "encryption", "tokenized", "hsm", "aes", "privileged", "access",
     "review", "recertification", "suspension", "automatic", "cycle", "interval", "incident", "severity",
@@ -1122,7 +1292,7 @@ _RULE_FIELD_SUBJECT_TERMS: Dict[str, Set[str]] = {
     "monthly_spend": {"card", "corporate card", "credit card", "monthly spend"},
     "consecutive_sick_days": {"sick", "illness", "leave", "medical", "certificate"},
     "internet_speed_mbps": {"internet", "speed", "remote", "connection", "mbps"},
-    "annual_tuition_claim": {"tuition", "course", "education", "degree", "grant"},
+    "annual_tuition_claim": {"tuition", "course", "education", "degree", "grant", "assistance"},
     "contract_duration_months": {"contract", "vendor", "agreement", "duration"},
     "privileged_role_review_interval_days": {"privileged", "access", "review", "recertification", "suspension"},
     "incident_severity_p1_response_hours": {"incident", "severity", "p1", "priority 1", "response", "sla"},
@@ -1218,10 +1388,26 @@ def evaluate_authoritative_rule_decision(
     ]
     passing_rules = [r for r in evaluated_for_field if r.passed]
 
-    # Check for boundary-crossing conditions (e.g. at least threshold, or range crossing threshold)
-    if target_cond.get("is_boundary_crossing") or (
-        cond_comp in ("greater_than_or_equal", "range") and len(evaluated_for_field) > 0 and len(passing_rules) == 0
-    ):
+    # Evaluate boundary crossing dynamically against active authorized rules for this field
+    active_field_rules = [r.rule for r in evaluated_for_field]
+    if active_field_rules:
+        boundary_analysis = analyze_numerical_boundary(
+            active_rules=active_field_rules,
+            comparison=cond_comp,
+            value=cond_val,
+            unit=cond_unit,
+            min_value=target_cond.get("min_value"),
+            max_value=target_cond.get("max_value"),
+        )
+        if boundary_analysis.status == "crossing_outcomes" or target_cond.get("is_boundary_crossing"):
+            return AuthoritativeDecision(
+                is_authoritative=False,
+                is_boundary_crossing=True,
+                reason="Numerical condition crosses policy rule boundaries or has conflicting outcomes.",
+            )
+        if boundary_analysis.status != "single_outcome":
+            return AuthoritativeDecision(is_authoritative=False)
+    elif target_cond.get("is_boundary_crossing"):
         return AuthoritativeDecision(
             is_authoritative=False,
             is_boundary_crossing=True,

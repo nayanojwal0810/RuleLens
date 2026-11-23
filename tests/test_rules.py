@@ -778,8 +778,8 @@ def test_section_2_5_05_at_least_threshold_boundary_crossing(repo_root: Path):
     q = "Can a direct manager approve travel expenses of at least INR 50,000 under Travel Policy v2?"
     conds = extract_conditions_from_query(q)
     assert conds[0]["comparison"] == "greater_than_or_equal"
-    assert conds[0]["is_boundary_crossing"] is True
     rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is True
     dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
     assert dec.is_authoritative is False
     assert dec.is_boundary_crossing is True
@@ -805,8 +805,8 @@ def test_section_2_5_07_range_crossing_threshold(repo_root: Path):
     q = "Can a direct manager approve travel expenses between INR 40,000 and 60,000 under Travel Policy v2?"
     conds = extract_conditions_from_query(q)
     assert conds[0]["comparison"] == "range"
-    assert conds[0]["is_boundary_crossing"] is True
     rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is True
     dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
     assert dec.is_authoritative is False
     assert dec.is_boundary_crossing is True
@@ -881,4 +881,249 @@ def test_section_2_5_12_unsupported_expense_eligibility(repo_root: Path):
     dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
     assert dec.is_authoritative is False
     assert dec.unsupported_terms == ["personal"]
+
+
+# ==============================================================================
+# 10. Pass 1 Final Review: Numerical Boundary Regression Tests
+# ==============================================================================
+
+
+def test_boundary_travel_v2_more_than_40k_crosses_50k_boundary(repo_root: Path):
+    """Travel Policy v2: More than INR 40,000 crosses the 50,000 boundary."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "Can a direct manager approve travel expenses of more than INR 40,000 under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    assert conds[0]["comparison"] == "greater_than"
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is True
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is False
+    assert dec.is_boundary_crossing is True
+
+
+def test_boundary_travel_v2_up_to_60k_crosses_50k_boundary(repo_root: Path):
+    """Travel Policy v2: Up to INR 60,000 crosses the 50,000 boundary."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "Can a direct manager approve travel expenses up to INR 60,000 under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    assert conds[0]["comparison"] == "less_than_or_equal"
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is True
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is False
+    assert dec.is_boundary_crossing is True
+
+
+def test_boundary_travel_v2_at_least_45k_crosses_50k_boundary(repo_root: Path):
+    """Travel Policy v2: At least INR 45,000 crosses the 50,000 boundary."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "Can a direct manager approve travel expenses of at least INR 45,000 under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    assert conds[0]["comparison"] == "greater_than_or_equal"
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is True
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is False
+    assert dec.is_boundary_crossing is True
+
+
+def test_boundary_travel_v2_between_40k_and_50k_stays_within_standard(repo_root: Path):
+    """Travel Policy v2: Between INR 40,000 and 50,000 stays within standard approval."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "Can a direct manager approve travel expenses between INR 40,000 and 50,000 under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    assert conds[0]["comparison"] == "range"
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is False
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is True
+    assert dec.outcome == "standard_approval"
+    assert dec.rule_id == "R-TRV-003"
+
+
+def test_boundary_travel_v2_exceeding_50k_additional_approval(repo_root: Path):
+    """Travel Policy v2: Exceeding INR 50,000 -> additional approval."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "Can a direct manager approve travel expenses exceeding INR 50,000 under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    assert conds[0]["comparison"] == "greater_than"
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is False
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is True
+    assert dec.outcome == "additional_approval"
+    assert dec.rule_id == "R-TRV-004"
+
+
+def test_boundary_travel_v2_up_to_50k_standard_approval(repo_root: Path):
+    """Travel Policy v2: Up to INR 50,000 -> standard approval."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "Can a direct manager approve travel expenses up to INR 50,000 under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    assert conds[0]["comparison"] == "less_than_or_equal"
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    assert conds[0]["is_boundary_crossing"] is False
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is True
+    assert dec.outcome == "standard_approval"
+    assert dec.rule_id == "R-TRV-003"
+
+
+def test_boundary_travel_v1_historical_evaluations(repo_root: Path):
+    """Historical Travel Policy v1: boundary is dynamically 40,000 from active rules."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-001_TRV-C04", "doc_id": "DOC-TRV-001", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 40,000 follow standard approval by direct reporting manager."}]
+
+    # Up to 40k -> standard approval
+    q1 = "Can a direct manager approve travel expenses up to INR 40,000 under Travel Policy v1?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-06-01", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "standard_approval"
+    assert d1.rule_id == "R-TRV-001"
+
+    # Exceeding 40k -> additional approval
+    q2 = "Can a direct manager approve travel expenses exceeding INR 40,000 under Travel Policy v1?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-06-01", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "additional_approval"
+    assert d2.rule_id == "R-TRV-002"
+
+    # More than 35k -> crosses 40k boundary
+    q3 = "Can a direct manager approve travel expenses of more than INR 35,000 under Travel Policy v1?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-06-01", repo_root, c3)
+    assert c3[0]["is_boundary_crossing"] is True
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is False
+    assert d3.is_boundary_crossing is True
+
+    # Up to 45k -> crosses 40k boundary
+    q4 = "Can a direct manager approve travel expenses up to INR 45,000 under Travel Policy v1?"
+    c4 = extract_conditions_from_query(q4)
+    r4 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-06-01", repo_root, c4)
+    assert c4[0]["is_boundary_crossing"] is True
+    d4 = evaluate_authoritative_rule_decision(q4, mock_chunks, r4, c4)
+    assert d4.is_authoritative is False
+    assert d4.is_boundary_crossing is True
+
+
+def test_boundary_corporate_card_monthly_spend_at_200k(repo_root: Path):
+    """Corporate card monthly spend: boundary is dynamically 200,000 from DOC-FIN-003."""
+    mock_chunks = [{"chunk_id": "DOC-FIN-003_FIN-K02", "doc_id": "DOC-FIN-003", "clause_id": "FIN-K02", "text": "Monthly corporate credit card spend up to INR 200,000 is within standard card limit."}]
+
+    # Exact 200,000 -> within_standard_card_limit
+    q1 = "Can an employee spend INR 200,000 on corporate credit card?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "within_standard_card_limit"
+    assert d1.rule_id == "R-FIN-005"
+
+    # Exact 200,001 -> card_limit_escalation_required
+    q2 = "Can an employee spend INR 200,001 on corporate credit card?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "card_limit_escalation_required"
+    assert d2.rule_id == "R-FIN-006"
+
+    # Up to 200,000 -> within_standard_card_limit
+    q3 = "Can an employee have monthly card spending up to INR 200,000?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is True
+    assert d3.outcome == "within_standard_card_limit"
+    assert d3.rule_id == "R-FIN-005"
+
+    # Exceeding 200,000 -> card_limit_escalation_required
+    q4 = "Can an employee have monthly card spending exceeding INR 200,000?"
+    c4 = extract_conditions_from_query(q4)
+    r4 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c4)
+    d4 = evaluate_authoritative_rule_decision(q4, mock_chunks, r4, c4)
+    assert d4.is_authoritative is True
+    assert d4.outcome == "card_limit_escalation_required"
+    assert d4.rule_id == "R-FIN-006"
+
+    # More than 150,000 -> crosses 200k boundary
+    q5 = "Can an employee have monthly card spending of more than INR 150,000?"
+    c5 = extract_conditions_from_query(q5)
+    r5 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c5)
+    assert c5[0]["is_boundary_crossing"] is True
+    d5 = evaluate_authoritative_rule_decision(q5, mock_chunks, r5, c5)
+    assert d5.is_authoritative is False
+    assert d5.is_boundary_crossing is True
+
+    # Up to 250,000 -> crosses 200k boundary
+    q6 = "Can an employee have monthly card spending up to INR 250,000?"
+    c6 = extract_conditions_from_query(q6)
+    r6 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c6)
+    assert c6[0]["is_boundary_crossing"] is True
+    d6 = evaluate_authoritative_rule_decision(q6, mock_chunks, r6, c6)
+    assert d6.is_authoritative is False
+    assert d6.is_boundary_crossing is True
+
+
+def test_boundary_tuition_claim_at_75k(repo_root: Path):
+    """Tuition claims: boundary is dynamically 75,000 from DOC-PPO-003."""
+    mock_chunks = [{"chunk_id": "DOC-PPO-003_PPO-B02", "doc_id": "DOC-PPO-003", "clause_id": "PPO-B02", "text": "Annual tuition reimbursement up to INR 75,000 follows standard grant."}]
+
+    # Exact 75,000 -> standard_tuition_grant
+    q1 = "Can an employee claim tuition assistance of INR 75,000?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "standard_tuition_grant"
+    assert d1.rule_id == "R-PPO-005"
+
+    # Exact 75,001 -> committee_review_required
+    q2 = "Can an employee claim tuition assistance of INR 75,001?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "committee_review_required"
+    assert d2.rule_id == "R-PPO-006"
+
+    # Up to 75,000 -> standard_tuition_grant
+    q3 = "Can an employee claim tuition assistance up to INR 75,000?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is True
+    assert d3.outcome == "standard_tuition_grant"
+    assert d3.rule_id == "R-PPO-005"
+
+    # Exceeding 75,000 -> committee_review_required
+    q4 = "Can an employee claim tuition assistance exceeding INR 75,000?"
+    c4 = extract_conditions_from_query(q4)
+    r4 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c4)
+    d4 = evaluate_authoritative_rule_decision(q4, mock_chunks, r4, c4)
+    assert d4.is_authoritative is True
+    assert d4.outcome == "committee_review_required"
+    assert d4.rule_id == "R-PPO-006"
+
+    # More than 50,000 -> crosses 75k boundary
+    q5 = "Can an employee claim tuition assistance of more than INR 50,000?"
+    c5 = extract_conditions_from_query(q5)
+    r5 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c5)
+    assert c5[0]["is_boundary_crossing"] is True
+    d5 = evaluate_authoritative_rule_decision(q5, mock_chunks, r5, c5)
+    assert d5.is_authoritative is False
+    assert d5.is_boundary_crossing is True
+
+    # Up to 100,000 -> crosses 75k boundary
+    q6 = "Can an employee claim tuition assistance up to INR 100,000?"
+    c6 = extract_conditions_from_query(q6)
+    r6 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c6)
+    assert c6[0]["is_boundary_crossing"] is True
+    d6 = evaluate_authoritative_rule_decision(q6, mock_chunks, r6, c6)
+    assert d6.is_authoritative is False
+    assert d6.is_boundary_crossing is True
 

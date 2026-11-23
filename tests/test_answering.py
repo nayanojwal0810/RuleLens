@@ -1161,6 +1161,166 @@ def test_integration_range_crossing_boundary_safe_insufficient_refusal(mock_retr
     mock_llm.generate_answer.assert_not_called()
 
 
+def test_integration_travel_v2_more_than_40k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """More than INR 40,000 crosses 50,000 boundary; must refuse safely with insufficient and 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses of more than INR 40,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_travel_v2_up_to_60k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """Up to INR 60,000 crosses 50,000 boundary; must refuse safely with insufficient and 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses up to INR 60,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_travel_v2_between_40k_and_50k_deterministic_approval(mock_retriever, canonical_chunks_by_id):
+    """Between INR 40,000 and 50,000 stays within standard approval; deterministically answered with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses between INR 40,000 and 50,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "Standard manager approval is permitted" in res.answer
+    assert res.referenced_rule_ids == ["R-TRV-003"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_corporate_card_spend_at_200k_deterministic(mock_retriever, canonical_chunks_by_id):
+    """Monthly card spending up to INR 200,000 is answered deterministically with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-FIN-003_FIN-K02"]
+    fin_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [fin_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee have monthly card spending up to INR 200,000?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "within the standard corporate credit card limit" in res.answer
+    assert res.referenced_rule_ids == ["R-FIN-005"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_corporate_card_more_than_150k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """Monthly card spending of more than INR 150,000 crosses 200,000 boundary; refuses safely with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-FIN-003_FIN-K02"]
+    fin_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [fin_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee have monthly card spending of more than INR 150,000?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_tuition_claim_up_to_75k_deterministic(mock_retriever, canonical_chunks_by_id):
+    """Tuition claim up to INR 75,000 is answered deterministically with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-PPO-003_PPO-B02"]
+    ppo_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [ppo_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee claim tuition assistance up to INR 75,000?"
+    res = answer_question(
+        question=q, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "standard tuition grant" in res.answer
+    assert res.referenced_rule_ids == ["R-PPO-005"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_tuition_claim_up_to_100k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """Tuition claim up to INR 100,000 crosses 75,000 boundary; refuses safely with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-PPO-003_PPO-B02"]
+    ppo_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [ppo_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee claim tuition assistance up to INR 100,000?"
+    res = answer_question(
+        question=q, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
 def test_integration_up_to_threshold_deterministic_standard_approval(mock_retriever, canonical_chunks_by_id):
     """Up to INR 50,000 deterministically triggers standard approval with 0 Groq calls."""
     c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
@@ -1245,6 +1405,166 @@ def test_integration_personal_travel_unsupported_term_safe_refusal(mock_retrieve
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
     q = "Can employees spend INR 50,000 on personal travel?"
+    res = answer_question(
+        question=q, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_travel_v2_more_than_40k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """More than INR 40,000 crosses 50,000 boundary; must refuse safely with insufficient and 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses of more than INR 40,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_travel_v2_up_to_60k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """Up to INR 60,000 crosses 50,000 boundary; must refuse safely with insufficient and 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses up to INR 60,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_travel_v2_between_40k_and_50k_deterministic_approval(mock_retriever, canonical_chunks_by_id):
+    """Between INR 40,000 and 50,000 stays within standard approval; deterministically answered with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses between INR 40,000 and 50,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "Standard manager approval is permitted" in res.answer
+    assert res.referenced_rule_ids == ["R-TRV-003"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_corporate_card_spend_at_200k_deterministic(mock_retriever, canonical_chunks_by_id):
+    """Monthly card spending up to INR 200,000 is answered deterministically with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-FIN-003_FIN-K02"]
+    fin_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [fin_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee have monthly card spending up to INR 200,000?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "within the standard corporate credit card limit" in res.answer
+    assert res.referenced_rule_ids == ["R-FIN-005"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_corporate_card_more_than_150k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """Monthly card spending of more than INR 150,000 crosses 200,000 boundary; refuses safely with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-FIN-003_FIN-K02"]
+    fin_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [fin_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee have monthly card spending of more than INR 150,000?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_tuition_claim_up_to_75k_deterministic(mock_retriever, canonical_chunks_by_id):
+    """Tuition claim up to INR 75,000 is answered deterministically with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-PPO-003_PPO-B02"]
+    ppo_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [ppo_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee claim tuition assistance up to INR 75,000?"
+    res = answer_question(
+        question=q, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "standard tuition grant" in res.answer
+    assert res.referenced_rule_ids == ["R-PPO-005"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_tuition_claim_up_to_100k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """Tuition claim up to INR 100,000 crosses 75,000 boundary; refuses safely with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-PPO-003_PPO-B02"]
+    ppo_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [ppo_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can an employee claim tuition assistance up to INR 100,000?"
     res = answer_question(
         question=q, role="employee", query_date="2026-11-22",
         retriever=mock_retriever, llm_client=mock_llm,

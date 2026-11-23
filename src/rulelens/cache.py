@@ -473,17 +473,50 @@ def validate_cache_candidate(
         return False, "policy_subject_mismatch"
 
     # 11. Structured rule validation
+    # For every cached referenced rule ID:
+    # - Require an associated cached outcome.
+    # - Require the same current applicable rule.
+    # - Verify its current outcome and relevant inputs.
+    # - Reject missing or inconsistent information.
+    # Reject incomplete records rather than assuming missing metadata is acceptable.
+    if candidate.referenced_rule_ids:
+        if not candidate.rule_outcomes or not isinstance(candidate.rule_outcomes, dict):
+            return False, "incomplete_rule_record"
+        if set(candidate.referenced_rule_ids) != set(candidate.rule_outcomes.keys()):
+            return False, "incomplete_rule_record"
+    elif candidate.rule_outcomes:
+        return False, "incomplete_rule_record"
+
     active_rules = {r.rule.rule_id: r for r in rule_results if not r.is_error}
     for rule_id in (candidate.referenced_rule_ids or []):
+        cached_outcome = candidate.rule_outcomes.get(rule_id)
+        if not cached_outcome or not str(cached_outcome).strip():
+            return False, "incomplete_rule_record"
+
         if rule_id not in active_rules:
             return False, "missing_referenced_rule"
+
         rule_res = active_rules[rule_id]
         if not rule_res.passed:
             return False, "rule_outcome_mismatch"
-        if candidate.rule_outcomes and rule_id in candidate.rule_outcomes:
-            expected_outcome = candidate.rule_outcomes[rule_id]
-            if rule_res.outcome != expected_outcome:
-                return False, "rule_outcome_mismatch"
+
+        if rule_res.outcome != cached_outcome or rule_res.rule.outcome != cached_outcome:
+            return False, "rule_outcome_mismatch"
+
+        # Verify relevant condition inputs against the query condition signature
+        cond_field = rule_res.rule.condition_field
+        if cond_field in query_cond_sig:
+            q_cond = query_cond_sig[cond_field]
+            if rule_res.input_value is not None:
+                q_val_str = str(q_cond.get("value")).replace(",", "").strip()
+                in_val_str = str(rule_res.input_value).replace(",", "").strip()
+                if q_val_str != in_val_str:
+                    return False, "rule_condition_mismatch"
+            if rule_res.input_unit and q_cond.get("unit"):
+                if rule_res.input_unit.lower() != q_cond["unit"].lower():
+                    return False, "rule_condition_mismatch"
+        elif rule_res.input_value is not None:
+            return False, "rule_condition_mismatch"
 
     # 12. Verify cited evidence is authorized in current retrieval set
     authorized_cids = {
