@@ -709,6 +709,29 @@ def answer_question(
             has_incomplete_tokens=False,
         )
 
+    # Step G.1b: Boundary-crossing condition safeguard
+    # For conditions crossing multiple rule outcomes (e.g. at least threshold, or range crossing threshold),
+    # refuse safely with insufficient without sending ambiguous condition to Groq for an unsupported approval.
+    if authoritative_dec.is_boundary_crossing or any(c.get("is_boundary_crossing") for c in extracted_conds):
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The provided corporate policies establish different approval requirements across the specified condition range; an unconditional decision cannot be determined.",
+            status=AnswerStatus.INSUFFICIENT.value,
+            reason="Numerical condition crosses policy approval boundaries.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+        )
+
     # Step G.2: If the query introduced unsupported terms for a numerical approval/decision rule,
     # the approval threshold cannot establish whether that expense category or purpose is eligible.
     # Refuse safely without sending unsupported evidence to Groq for an affirmative decision.
@@ -809,6 +832,11 @@ def answer_question(
             if cache_lookup_res.hit and cache_lookup_res.record:
                 total_latency = (time.perf_counter() - start_total_time) * 1000.0
                 rec = cache_lookup_res.record
+                verified_meta = [
+                    build_citation_metadata(canonical_chunks[cid])
+                    for cid in rec.cited_chunk_ids
+                    if cid in canonical_chunks
+                ] or rec.citation_metadata
                 return GenerationResult(
                     question=cleaned_question,
                     role=role,
@@ -817,7 +845,7 @@ def answer_question(
                     status=AnswerStatus.ANSWERED.value,
                     reason=f"Reused verified answer from semantic cache (entry {rec.entry_id}, similarity {cache_lookup_res.similarity:.4f}).",
                     citations=rec.cited_chunk_ids,
-                    citation_metadata=rec.citation_metadata,
+                    citation_metadata=verified_meta,
                     referenced_rule_ids=rec.referenced_rule_ids,
                     model=rec.model,
                     corpus_fingerprint=corpus_fp,

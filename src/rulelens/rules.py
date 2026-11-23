@@ -86,6 +86,7 @@ class AuthoritativeDecision:
     outcome: Optional[str] = None
     reason: Optional[str] = None
     unsupported_terms: Optional[List[str]] = None
+    is_boundary_crossing: bool = False
 
 
 # Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
@@ -160,16 +161,30 @@ def evaluate_rule_condition(
     rule: Union[RuleRecord, Dict[str, Any]],
     value: Any,
     unit: Optional[str] = None,
+    comparison: str = "exact",
+    min_value: Optional[Any] = None,
+    max_value: Optional[Any] = None,
 ) -> bool:
-    """Evaluate whether an input value satisfies a rule's condition using exact numeric comparisons.
+    """Evaluate whether an input condition satisfies a rule using exact Decimal comparisons.
+
+    Supports directional comparisons and boundary checks:
+    - exact: value == / <= / >= / < / > threshold
+    - greater_than: values > value uniformly satisfy rule
+    - greater_than_or_equal: values >= value uniformly satisfy rule
+    - less_than: values < value uniformly satisfy rule
+    - less_than_or_equal: values <= value uniformly satisfy rule
+    - range: all values in [min_value, max_value] uniformly satisfy rule
 
     Args:
         rule: RuleRecord or dict.
         value: Input value to test.
         unit: Optional unit for comparison.
+        comparison: Comparison modifier string.
+        min_value: Minimum value for range comparison.
+        max_value: Maximum value for range comparison.
 
     Returns:
-        True if the condition is satisfied, False otherwise.
+        True if the condition uniformly satisfies the rule, False otherwise.
 
     Raises:
         TypeError: If value type is incompatible with operator or threshold.
@@ -186,33 +201,89 @@ def evaluate_rule_condition(
                 f"Incompatible unit '{unit}' for rule '{getattr(rule, 'rule_id', '')}'. Expected '{rule_unit}'."
             )
 
-    # Operator evaluation
+    comp = (comparison or "exact").strip().lower()
+
+    # Operator evaluation for categorical equality
     if rule_op == "==":
+        if comp != "exact":
+            return False
         if isinstance(threshold, str):
             return str(value).strip().lower() == threshold.strip().lower()
         return value == threshold
 
     # Exact decimal numeric comparisons: <, <=, >, >=
     try:
-        clean_val_str = str(value).strip().replace(",", "")
         clean_thresh_str = str(threshold).strip().replace(",", "")
-        numeric_val = Decimal(clean_val_str)
         numeric_threshold = Decimal(clean_thresh_str)
+
+        if comp == "range":
+            c_min = min_value if min_value is not None else (value[0] if isinstance(value, (list, tuple)) else value)
+            c_max = max_value if max_value is not None else (value[1] if isinstance(value, (list, tuple)) else value)
+            numeric_min = Decimal(str(c_min).strip().replace(",", ""))
+            numeric_max = Decimal(str(c_max).strip().replace(",", ""))
+            if numeric_min > numeric_max:
+                numeric_min, numeric_max = numeric_max, numeric_min
+        else:
+            clean_val_str = str(value).strip().replace(",", "")
+            numeric_val = Decimal(clean_val_str)
     except (InvalidOperation, ValueError, TypeError) as exc:
         raise TypeError(
             f"Cannot evaluate operator '{rule_op}' with non-numeric value '{value}' and threshold '{threshold}'."
         ) from exc
 
-    if rule_op == "<":
-        return numeric_val < numeric_threshold
-    elif rule_op == "<=":
-        return numeric_val <= numeric_threshold
-    elif rule_op == ">":
-        return numeric_val > numeric_threshold
-    elif rule_op == ">=":
-        return numeric_val >= numeric_threshold
-    else:
-        raise ValueError(f"Unsupported rule operator: '{rule_op}'.")
+    # Range condition evaluation
+    if comp == "range":
+        if rule_op == "<=":
+            return numeric_max <= numeric_threshold
+        elif rule_op == "<":
+            return numeric_max < numeric_threshold
+        elif rule_op == ">=":
+            return numeric_min >= numeric_threshold
+        elif rule_op == ">":
+            return numeric_min > numeric_threshold
+        return False
+
+    # Exact value comparison
+    if comp == "exact":
+        if rule_op == "<":
+            return numeric_val < numeric_threshold
+        elif rule_op == "<=":
+            return numeric_val <= numeric_threshold
+        elif rule_op == ">":
+            return numeric_val > numeric_threshold
+        elif rule_op == ">=":
+            return numeric_val >= numeric_threshold
+        return False
+
+    # Directional comparison: greater_than (values strictly > numeric_val)
+    if comp == "greater_than":
+        if rule_op in (">", ">="):
+            return numeric_val >= numeric_threshold
+        return False
+
+    # Directional comparison: greater_than_or_equal (values >= numeric_val)
+    if comp == "greater_than_or_equal":
+        if rule_op == ">=":
+            return numeric_val >= numeric_threshold
+        elif rule_op == ">":
+            return numeric_val > numeric_threshold
+        return False
+
+    # Directional comparison: less_than (values strictly < numeric_val)
+    if comp == "less_than":
+        if rule_op in ("<=", "<"):
+            return numeric_val <= numeric_threshold
+        return False
+
+    # Directional comparison: less_than_or_equal (values <= numeric_val)
+    if comp == "less_than_or_equal":
+        if rule_op == "<=":
+            return numeric_val <= numeric_threshold
+        elif rule_op == "<":
+            return numeric_val < numeric_threshold
+        return False
+
+    raise ValueError(f"Unsupported rule comparison modifier: '{comp}'.")
 
 
 def resolve_rules_for_evidence(
@@ -249,7 +320,7 @@ def resolve_rules_for_evidence(
     authorized_cids = {c["chunk_id"] for c in authorized_chunks}
 
     # Map conditions by field for evaluation
-    cond_map: Dict[str, Tuple[Any, Optional[str], bool, Optional[str]]] = {}
+    cond_map: Dict[str, Dict[str, Any]] = {}
     has_ambiguity = False
     ambiguity_reason = None
     if extracted_conditions:
@@ -260,7 +331,7 @@ def resolve_rules_for_evidence(
                 has_ambiguity = True
                 ambiguity_reason = cond.get("error", "Ambiguous or conflicting condition inputs detected")
             if field:
-                cond_map[field] = (cond.get("value"), cond.get("unit"), is_ambig, cond.get("error"))
+                cond_map[field] = cond
 
     results: List[RuleEvaluationResult] = []
 
@@ -275,8 +346,9 @@ def resolve_rules_for_evidence(
 
         # 3. Check for condition evaluation or ambiguity
         if rule.condition_field in cond_map:
-            cond_entry = cond_map.get(rule.condition_field)
-            val, unit, is_ambig, ambig_err = cond_entry
+            cond_entry = cond_map[rule.condition_field]
+            is_ambig = bool(cond_entry.get("is_ambiguous", False))
+            ambig_err = cond_entry.get("error")
             if is_ambig:
                 # Ambiguous input condition
                 explanation = (
@@ -297,13 +369,21 @@ def resolve_rules_for_evidence(
                 )
                 continue
 
-            val, unit, _, _ = cond_entry
+            val = cond_entry.get("value")
+            unit = cond_entry.get("unit")
+            comp = cond_entry.get("comparison", "exact")
+            min_val = cond_entry.get("min_value")
+            max_val = cond_entry.get("max_value")
+
             try:
-                passed = evaluate_rule_condition(rule, val, unit)
+                passed = evaluate_rule_condition(
+                    rule, val, unit, comparison=comp, min_value=min_val, max_value=max_val
+                )
+                comp_desc = f" ({comp})" if comp != "exact" else ""
                 if passed:
                     explanation = (
                         f"Rule {rule.rule_id} condition satisfied: {rule.condition_field} {rule.operator} "
-                        f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit} -> outcome: {rule.outcome}"
+                        f"{rule.threshold_value} {rule.unit} for input {val}{comp_desc} {unit or rule.unit} -> outcome: {rule.outcome}"
                     )
                     results.append(
                         RuleEvaluationResult(
@@ -321,7 +401,7 @@ def resolve_rules_for_evidence(
                     # Valid comparison evaluating to False (normal unsatisfied rule)
                     explanation = (
                         f"Rule {rule.rule_id} condition NOT satisfied: {rule.condition_field} {rule.operator} "
-                        f"{rule.threshold_value} {rule.unit} for input {val} {unit or rule.unit}."
+                        f"{rule.threshold_value} {rule.unit} for input {val}{comp_desc} {unit or rule.unit}."
                     )
                     results.append(
                         RuleEvaluationResult(
@@ -393,8 +473,16 @@ _CURRENCY_PATTERN = re.compile(
     r"(?P<prefix>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?P<suffix>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)?",
     re.IGNORECASE,
 )
+_RANGE_CURRENCY_PATTERN = re.compile(
+    r"\b(?:between|from)\s+(?:(?P<pre1>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)\s*)?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?:(?P<suf1>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)\s*)?(?:and|to)\s+(?:(?P<pre2>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)\s*)?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?:(?P<suf2>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?))?\b",
+    re.IGNORECASE,
+)
 _DAYS_PATTERN = re.compile(
     r"\b([0-9]+)\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
+    re.IGNORECASE,
+)
+_RANGE_DAYS_PATTERN = re.compile(
+    r"\b(?:between|from)\s+([0-9]+)\s+(?:and|to)\s+([0-9]+)\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
     re.IGNORECASE,
 )
 _MONTHS_PATTERN = re.compile(
@@ -409,6 +497,91 @@ _HOURS_PATTERN = re.compile(
     r"\b([0-9]+)\s*hours?\b",
     re.IGNORECASE,
 )
+
+_CANONICAL_THRESHOLDS: Dict[str, Set[Decimal]] = {
+    "expense_amount": {Decimal("40000"), Decimal("50000")},
+    "receipt_amount": {Decimal("1000")},
+    "order_amount": {Decimal("150000")},
+    "emergency_purchase_amount": {Decimal("300000")},
+    "monthly_spend": {Decimal("100000")},
+    "annual_tuition_claim": {Decimal("200000")},
+    "advance_booking_days": {Decimal("14")},
+    "submission_delay_days": {Decimal("30")},
+    "consecutive_sick_days": {Decimal("3")},
+    "contract_duration_months": {Decimal("12")},
+    "privileged_role_review_interval_days": {Decimal("90")},
+    "incident_severity_p1_response_hours": {Decimal("1")},
+    "internet_speed_mbps": {Decimal("50")},
+}
+
+
+def _detect_comparison_operator(query: str, match_start: int, match_end: int) -> str:
+    """Detect directional comparison modifiers in the vicinity of a numerical match."""
+    q_lower = query.lower()
+    pre_window = q_lower[max(0, match_start - 35) : match_start]
+    post_window = q_lower[match_end : min(len(q_lower), match_end + 25)]
+
+    # Check for negated comparisons first in pre_window
+    if re.search(r"\b(?:not\s+exceed(?:ing|s)?|does\s+not\s+exceed|not\s+more\s+than|not\s+above|not\s+over)\b", pre_window):
+        return "less_than_or_equal"
+    if re.search(r"\b(?:not\s+less\s+than|not\s+below|not\s+under)\b", pre_window):
+        return "greater_than_or_equal"
+
+    # Post-window modifiers: "50,000 or more", "50,000 and above", "50,000 or less"
+    if re.search(r"\b(?:or\s+more|or\s+above|and\s+above|or\s+higher|and\s+higher)\b", post_window):
+        return "greater_than_or_equal"
+    if re.search(r"\b(?:or\s+less|or\s+below|and\s+below|or\s+fewer)\b", post_window):
+        return "less_than_or_equal"
+
+    # Pre-window modifiers
+    if re.search(r"\b(?:at\s+least|minimum(?:\s+of)?|no\s+less\s+than)\b|>=|\bmin\b", pre_window):
+        return "greater_than_or_equal"
+    if re.search(r"\b(?:up\s+to|at\s+most|no\s+more\s+than|maximum(?:\s+of)?)\b|<=|\bmax\b", pre_window):
+        return "less_than_or_equal"
+    if re.search(r"\b(?:exceeding|exceeds|exceed|more\s+than|greater\s+than|above|over|strictly\s+more\s+than|strictly\s+greater\s+than)\b|>", pre_window):
+        return "greater_than"
+    if re.search(r"\b(?:below|less\s+than|fewer\s+than|strictly\s+less\s+than)\b|<", pre_window):
+        return "less_than"
+    if re.search(r"\bunder\b", pre_window) and not re.search(r"\bunder\s+(?:the\s+)?(?:corporate\s+|company\s+|travel\s+|finance\s+|procurement\s+|security\s+)?policy\b", pre_window):
+        return "less_than"
+    if re.search(r"\b(?:exactly|equal\s+to)\b|==", pre_window):
+        return "exact"
+
+    return "exact"
+
+
+def _is_boundary_crossing_condition(
+    field: str,
+    comp: str,
+    val: Any,
+    min_val: Optional[Any] = None,
+    max_val: Optional[Any] = None,
+) -> bool:
+    """Determine whether a numerical condition spans across canonical policy thresholds."""
+    thresholds = _CANONICAL_THRESHOLDS.get(field)
+    if not thresholds:
+        return False
+    if comp == "greater_than_or_equal":
+        try:
+            d_val = Decimal(str(val).replace(",", ""))
+            if d_val in thresholds:
+                return True
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+    elif comp == "range":
+        try:
+            c_min = min_val if min_val is not None else (val[0] if isinstance(val, (list, tuple)) else val)
+            c_max = max_val if max_val is not None else (val[1] if isinstance(val, (list, tuple)) else val)
+            d_min = Decimal(str(c_min).replace(",", ""))
+            d_max = Decimal(str(c_max).replace(",", ""))
+            if d_min > d_max:
+                d_min, d_max = d_max, d_min
+            for t in thresholds:
+                if d_min <= t <= d_max:
+                    return True
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+    return False
 
 
 def _determine_currency_field(query_lower: str, span_lower: str) -> Optional[str]:
@@ -438,21 +611,33 @@ def extract_conditions_from_query(
 ) -> List[Dict[str, Any]]:
     """Conservatively extract typed condition values from a natural language query.
 
-    Only extracts when unambiguous. Rejects ambiguous or conflicting field/value matches
-    across all numerical units (currency, days, months, mbps, hours) and categorical tiers.
+    Distinguishes exact values, directional comparisons (greater_than, greater_than_or_equal,
+    less_than, less_than_or_equal), ranges with two boundaries, and ambiguous/conflicting conditions.
 
     Args:
         query: User question string.
         relevant_fields: Optional set of condition_field names to restrict extraction to.
 
     Returns:
-        List of dicts: [{"field": condition_field, "value": value, "unit": unit, "is_ambiguous": bool}]
+        List of dicts: [
+            {
+                "field": condition_field,
+                "value": value,
+                "unit": unit,
+                "comparison": comp,
+                "min_value": min_val,
+                "max_value": max_val,
+                "is_ambiguous": bool,
+                "is_boundary_crossing": bool,
+            }
+        ]
     """
     if not query or not query.strip():
         return []
 
     q_lower = query.lower()
     raw_candidates: List[Dict[str, Any]] = []
+    covered_spans: List[Tuple[int, int]] = []
 
     # Check for tier values (Information Security)
     has_confidential = "confidential" in q_lower
@@ -460,12 +645,107 @@ def extract_conditions_from_query(
         k in q_lower for k in ("restricted data", "restricted tier", "data classification", "restricted")
     )
     if has_confidential:
-        raw_candidates.append({"field": "data_classification_tier", "value": "Confidential", "unit": "tier"})
+        raw_candidates.append({
+            "field": "data_classification_tier",
+            "value": "Confidential",
+            "unit": "tier",
+            "comparison": "exact",
+            "min_value": None,
+            "max_value": None,
+            "is_boundary_crossing": False,
+        })
     if has_restricted:
-        raw_candidates.append({"field": "data_classification_tier", "value": "Restricted", "unit": "tier"})
+        raw_candidates.append({
+            "field": "data_classification_tier",
+            "value": "Restricted",
+            "unit": "tier",
+            "comparison": "exact",
+            "min_value": None,
+            "max_value": None,
+            "is_boundary_crossing": False,
+        })
 
-    # Check for currency amounts using Decimal precision directly from string
+    # Check for currency ranges: "between INR 40,000 and 60,000" / "from 40000 to 60000 INR"
+    for match in _RANGE_CURRENCY_PATTERN.finditer(query):
+        raw_num1 = match.group(2).replace(",", "")
+        raw_num2 = match.group(5).replace(",", "")
+        try:
+            val1 = Decimal(raw_num1)
+            val2 = Decimal(raw_num2)
+        except (InvalidOperation, ValueError):
+            continue
+
+        min_val = min(val1, val2)
+        max_val = max(val1, val2)
+        span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
+
+        # Determine currency unit
+        p1 = (match.group(1) or "").lower()
+        s1 = (match.group(3) or "").lower()
+        p2 = (match.group(4) or "").lower()
+        s2 = (match.group(6) or "").lower()
+
+        if any(p in ("$", "usd") or s in ("usd", "dollar", "dollars") for p, s in ((p1, s1), (p2, s2))) or any(k in span for k in ("usd", "$", "dollar")):
+            curr_unit = "USD"
+        elif any(p in ("€", "eur") or s in ("eur", "euro", "euros") for p, s in ((p1, s1), (p2, s2))) or any(k in span for k in ("eur", "€", "euro")):
+            curr_unit = "EUR"
+        elif any(p in ("£", "gbp") or s in ("gbp", "pound", "pounds") for p, s in ((p1, s1), (p2, s2))) or any(k in span for k in ("gbp", "£", "pound")):
+            curr_unit = "GBP"
+        else:
+            curr_unit = "INR"
+
+        field = _determine_currency_field(q_lower, span)
+        if field:
+            is_bc = _is_boundary_crossing_condition(field, "range", (min_val, max_val), min_val, max_val)
+            raw_candidates.append({
+                "field": field,
+                "value": (min_val, max_val),
+                "unit": curr_unit,
+                "comparison": "range",
+                "min_value": min_val,
+                "max_value": max_val,
+                "is_boundary_crossing": is_bc,
+            })
+            covered_spans.append((match.start(), match.end()))
+
+    # Check for days ranges: "between 10 and 20 days"
+    for match in _RANGE_DAYS_PATTERN.finditer(query):
+        try:
+            d1 = int(match.group(1))
+            d2 = int(match.group(2))
+        except ValueError:
+            continue
+        min_d = min(d1, d2)
+        max_d = max(d1, d2)
+        field = None
+        if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
+            field = "advance_booking_days"
+        elif any(k in q_lower for k in ("submit", "submission", "delay", "expense claim", "reimbursement")):
+            field = "submission_delay_days"
+        elif any(k in q_lower for k in ("sick", "illness", "medical")):
+            field = "consecutive_sick_days"
+        elif any(k in q_lower for k in ("recertification", "access review", "privileged")):
+            field = "privileged_role_review_interval_days"
+
+        if field:
+            is_bc = _is_boundary_crossing_condition(field, "range", (min_d, max_d), min_d, max_d)
+            raw_candidates.append({
+                "field": field,
+                "value": (min_d, max_d),
+                "unit": "days",
+                "comparison": "range",
+                "min_value": min_d,
+                "max_value": max_d,
+                "is_boundary_crossing": is_bc,
+            })
+            covered_spans.append((match.start(), match.end()))
+
+    # Check for single currency amounts using Decimal precision directly from string
     for match in _CURRENCY_PATTERN.finditer(query):
+        # Skip if within an already-extracted range
+        if any(start <= match.start() < end for start, end in covered_spans):
+            continue
+
         raw_num = match.group(2).replace(",", "")
         try:
             val = Decimal(raw_num)
@@ -505,22 +785,48 @@ def extract_conditions_from_query(
         if has_curr_mark:
             field = _determine_currency_field(q_lower, span)
             if field:
-                raw_candidates.append({"field": field, "value": val, "unit": curr_unit})
+                comp = _detect_comparison_operator(query, match.start(), match.end())
+                is_bc = _is_boundary_crossing_condition(field, comp, val)
+                raw_candidates.append({
+                    "field": field,
+                    "value": val,
+                    "unit": curr_unit,
+                    "comparison": comp,
+                    "min_value": None,
+                    "max_value": None,
+                    "is_boundary_crossing": is_bc,
+                })
 
     # Check for days
     for match in _DAYS_PATTERN.finditer(query):
+        if any(start <= match.start() < end for start, end in covered_spans):
+            continue
         try:
             val = int(match.group(1))
         except ValueError:
             continue
+        field = None
         if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
-            raw_candidates.append({"field": "advance_booking_days", "value": val, "unit": "days"})
+            field = "advance_booking_days"
         elif any(k in q_lower for k in ("submit", "submission", "delay", "expense claim", "reimbursement")):
-            raw_candidates.append({"field": "submission_delay_days", "value": val, "unit": "days"})
+            field = "submission_delay_days"
         elif any(k in q_lower for k in ("sick", "illness", "medical")):
-            raw_candidates.append({"field": "consecutive_sick_days", "value": val, "unit": "days"})
+            field = "consecutive_sick_days"
         elif any(k in q_lower for k in ("recertification", "access review", "privileged")):
-            raw_candidates.append({"field": "privileged_role_review_interval_days", "value": val, "unit": "days"})
+            field = "privileged_role_review_interval_days"
+
+        if field:
+            comp = _detect_comparison_operator(query, match.start(), match.end())
+            is_bc = _is_boundary_crossing_condition(field, comp, val)
+            raw_candidates.append({
+                "field": field,
+                "value": val,
+                "unit": "days",
+                "comparison": comp,
+                "min_value": None,
+                "max_value": None,
+                "is_boundary_crossing": is_bc,
+            })
 
     # Check for months
     for match in _MONTHS_PATTERN.finditer(query):
@@ -529,7 +835,17 @@ def extract_conditions_from_query(
         except ValueError:
             continue
         if any(k in q_lower for k in ("contract", "duration", "agreement")):
-            raw_candidates.append({"field": "contract_duration_months", "value": val, "unit": "months"})
+            comp = _detect_comparison_operator(query, match.start(), match.end())
+            is_bc = _is_boundary_crossing_condition("contract_duration_months", comp, val)
+            raw_candidates.append({
+                "field": "contract_duration_months",
+                "value": val,
+                "unit": "months",
+                "comparison": comp,
+                "min_value": None,
+                "max_value": None,
+                "is_boundary_crossing": is_bc,
+            })
 
     # Check for mbps
     for match in _MBPS_PATTERN.finditer(query):
@@ -537,7 +853,17 @@ def extract_conditions_from_query(
             val = int(match.group(1))
         except ValueError:
             continue
-        raw_candidates.append({"field": "internet_speed_mbps", "value": val, "unit": "mbps"})
+        comp = _detect_comparison_operator(query, match.start(), match.end())
+        is_bc = _is_boundary_crossing_condition("internet_speed_mbps", comp, val)
+        raw_candidates.append({
+            "field": "internet_speed_mbps",
+            "value": val,
+            "unit": "mbps",
+            "comparison": comp,
+            "min_value": None,
+            "max_value": None,
+            "is_boundary_crossing": is_bc,
+        })
 
     # Check for hours
     for match in _HOURS_PATTERN.finditer(query):
@@ -546,7 +872,17 @@ def extract_conditions_from_query(
         except ValueError:
             continue
         if any(k in q_lower for k in ("incident", "p1", "severity", "sla")):
-            raw_candidates.append({"field": "incident_severity_p1_response_hours", "value": val, "unit": "hours"})
+            comp = _detect_comparison_operator(query, match.start(), match.end())
+            is_bc = _is_boundary_crossing_condition("incident_severity_p1_response_hours", comp, val)
+            raw_candidates.append({
+                "field": "incident_severity_p1_response_hours",
+                "value": val,
+                "unit": "hours",
+                "comparison": comp,
+                "min_value": None,
+                "max_value": None,
+                "is_boundary_crossing": is_bc,
+            })
 
     # Filter to relevant fields if specified
     if relevant_fields is not None:
@@ -569,34 +905,48 @@ def extract_conditions_from_query(
                 "field": field,
                 "value": None,
                 "unit": units[0],
+                "comparison": "exact",
+                "min_value": None,
+                "max_value": None,
                 "is_ambiguous": True,
+                "is_boundary_crossing": False,
                 "error": f"Conflicting units [{', '.join(sorted(units))}] detected for condition '{field}'.",
             })
             continue
 
         primary_unit = units[0] if units else ""
 
-        # Check for multiple distinct values
-        vals = [c["value"] for c in c_list]
-        unique_vals = list(dict.fromkeys(vals))
+        # Check for multiple distinct values (unless it's an exact duplicate match)
+        if len(c_list) > 1:
+            vals = [c["value"] for c in c_list]
+            unique_vals = list(dict.fromkeys(vals))
+            comparisons = list(dict.fromkeys(c.get("comparison", "exact") for c in c_list))
+            if len(unique_vals) > 1 or len(comparisons) > 1:
+                vals_str = ", ".join(str(v) for v in sorted(unique_vals, key=lambda x: str(x)))
+                conditions.append({
+                    "field": field,
+                    "value": None,
+                    "unit": primary_unit,
+                    "comparison": "ambiguous",
+                    "min_value": None,
+                    "max_value": None,
+                    "is_ambiguous": True,
+                    "is_boundary_crossing": False,
+                    "error": f"Multiple conflicting values [{vals_str}] detected for condition '{field}'.",
+                })
+                continue
 
-        if len(unique_vals) > 1 or (len(unique_vals) > 1 and has_alternative_connector):
-            vals_str = ", ".join(str(v) for v in sorted(unique_vals, key=lambda x: str(x)))
-            conditions.append({
-                "field": field,
-                "value": None,
-                "unit": primary_unit,
-                "is_ambiguous": True,
-                "error": f"Multiple conflicting values [{vals_str}] detected for condition '{field}'.",
-            })
-        else:
-            # Exactly one unique value: valid (deduplicated)
-            conditions.append({
-                "field": field,
-                "value": unique_vals[0],
-                "unit": primary_unit,
-                "is_ambiguous": False,
-            })
+        chosen = c_list[0]
+        conditions.append({
+            "field": field,
+            "value": chosen["value"],
+            "unit": primary_unit,
+            "comparison": chosen.get("comparison", "exact"),
+            "min_value": chosen.get("min_value"),
+            "max_value": chosen.get("max_value"),
+            "is_ambiguous": False,
+            "is_boundary_crossing": chosen.get("is_boundary_crossing", False),
+        })
 
     return conditions
 
@@ -626,6 +976,7 @@ def _format_canonical_decision_answer(
     rule: RuleRecord,
     cond_val: Any,
     cond_unit: str,
+    comparison: str = "exact",
 ) -> str:
     """Format an authoritative, policy-grounded natural language decision answer from a canonical rule outcome."""
     outcome = rule.outcome
@@ -633,54 +984,81 @@ def _format_canonical_decision_answer(
     thresh = rule.threshold_value
     unit = cond_unit or rule.unit
 
+    comp = (comparison or "exact").lower()
+    if comp == "greater_than":
+        val_phrase = f"exceeding {cond_val} {unit}"
+        days_phrase = f"more than {cond_val} days"
+        months_phrase = f"exceeding {cond_val} months"
+        hours_phrase = f"exceeding {cond_val} hour(s)"
+    elif comp == "less_than":
+        val_phrase = f"below {cond_val} {unit}"
+        days_phrase = f"less than {cond_val} days"
+        months_phrase = f"under {cond_val} months"
+        hours_phrase = f"under {cond_val} hour(s)"
+    elif comp == "less_than_or_equal":
+        val_phrase = f"up to {cond_val} {unit}"
+        days_phrase = f"up to {cond_val} days"
+        months_phrase = f"up to {cond_val} months"
+        hours_phrase = f"within {cond_val} hour(s)"
+    elif comp == "range" and isinstance(cond_val, (list, tuple)):
+        val_phrase = f"between {cond_val[0]} and {cond_val[1]} {unit}"
+        days_phrase = f"between {cond_val[0]} and {cond_val[1]} days"
+        months_phrase = f"between {cond_val[0]} and {cond_val[1]} months"
+        hours_phrase = f"between {cond_val[0]} and {cond_val[1]} hour(s)"
+    else:
+        val_phrase = f"of {cond_val} {unit}"
+        days_phrase = f"with {cond_val} days"
+        months_phrase = f"of {cond_val} months"
+        hours_phrase = f"within {cond_val} hour(s)"
+
     if outcome == "standard_approval":
-        return f"Standard manager approval is permitted. The expense amount of {cond_val} {unit} is within the policy approval limit of {thresh} {rule.unit}."
+        return f"Standard manager approval is permitted. The expense amount {val_phrase} is within the policy approval limit of {thresh} {rule.unit}."
     elif outcome == "additional_approval":
-        return f"Additional approval is required. Standard manager approval is not sufficient for an expense of {cond_val} {unit} as it exceeds the standard limit of {thresh} {rule.unit}."
+        return f"Additional approval is required. Standard manager approval is not sufficient for an expense {val_phrase} as it exceeds the standard limit of {thresh} {rule.unit}."
     elif outcome == "standard_booking":
-        return f"Standard flight booking is permitted as the travel is booked with {cond_val} days advance notice, meeting the {thresh}-day policy requirement."
+        return f"Standard flight booking is permitted as the travel is booked {days_phrase} advance notice, meeting the {thresh}-day policy requirement."
     elif outcome == "expedited_approval_required":
-        return f"Expedited approval is required because the flight is booked with {cond_val} days advance notice, which is less than the required {thresh} days."
+        return f"Expedited approval is required because the flight is booked {days_phrase} advance notice, which is less than the required {thresh} days."
     elif outcome == "vp_approval":
-        return f"Vice President (VP) approval is required for travel exception expenses of {cond_val} {unit} (up to {thresh} {rule.unit})."
+        return f"Vice President (VP) approval is required for travel exception expenses {val_phrase} (up to {thresh} {rule.unit})."
     elif outcome == "cfo_approval":
-        return f"Chief Financial Officer (CFO) approval is required for travel exception expenses of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+        return f"Chief Financial Officer (CFO) approval is required for travel exception expenses {val_phrase} (exceeding {thresh} {rule.unit})."
     elif outcome == "eligible_reimbursement":
-        return f"The expense claim submitted within {cond_val} days is eligible for standard reimbursement (within the {thresh}-day limit)."
+        return f"The expense claim submitted {days_phrase} is eligible for standard reimbursement (within the {thresh}-day limit)."
     elif outcome == "requires_late_exception":
         return f"A late submission exception approval is required for expense claims submitted after {cond_val} days (exceeding the {thresh}-day deadline)."
     elif outcome == "no_receipt_required":
-        return f"Incidental business expenses of {cond_val} {unit} (up to {thresh} {rule.unit}) do not require an itemized tax receipt, provided digital payment confirmation is attached."
+        return f"Incidental business expenses {val_phrase} (up to {thresh} {rule.unit}) do not require an itemized tax receipt, provided digital payment confirmation is attached."
     elif outcome == "itemized_receipt_required":
-        return f"An itemized tax invoice is strictly required for incidental expenses of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+        return f"An itemized tax invoice is strictly required for incidental expenses {val_phrase} (exceeding {thresh} {rule.unit})."
     elif outcome == "within_standard_card_limit":
-        return f"The monthly spend of {cond_val} {unit} is within the standard corporate credit card limit of {thresh} {rule.unit}."
+        return f"The monthly spend {val_phrase} is within the standard corporate credit card limit of {thresh} {rule.unit}."
     elif outcome == "card_limit_escalation_required":
-        return f"Corporate credit card limit escalation approval is required for monthly spend of {cond_val} {unit} exceeding the standard {thresh} {rule.unit} limit."
+        return f"Corporate credit card limit escalation approval is required for monthly spend {val_phrase} exceeding the standard {thresh} {rule.unit} limit."
     elif outcome == "self_certification":
-        return f"Self-certification is permitted for sick leave of {cond_val} consecutive days (up to {thresh} days)."
+        return f"Self-certification is permitted for sick leave {days_phrase} consecutive days (up to {thresh} days)."
     elif outcome == "medical_certificate_required":
-        return f"A formal medical certificate is required for sick leave of {cond_val} consecutive days (exceeding {thresh} days)."
+        return f"A formal medical certificate is required for sick leave {days_phrase} consecutive days (exceeding {thresh} days)."
     elif outcome == "remote_setup_compliant":
-        return f"The internet connection speed of {cond_val} Mbps meets the remote work setup policy minimum of {thresh} {rule.unit}."
+        return f"The internet connection speed {val_phrase} meets the remote work setup policy minimum of {thresh} {rule.unit}."
     elif outcome == "remediation_required":
         return f"Internet speed remediation is required because {cond_val} Mbps does not meet the minimum requirement of {thresh} {rule.unit}."
     elif outcome == "standard_tuition_grant":
-        return f"The tuition claim of {cond_val} {unit} is eligible for a standard tuition grant (within {thresh} {rule.unit})."
+        return f"The tuition claim {val_phrase} is eligible for a standard tuition grant (within {thresh} {rule.unit})."
     elif outcome == "committee_review_required":
-        return f"Tuition reimbursement committee review is required for claims of {cond_val} {unit} exceeding the standard {thresh} {rule.unit} grant."
+        return f"Tuition reimbursement committee review is required for claims {val_phrase} exceeding the standard {thresh} {rule.unit} grant."
     elif outcome == "single_quote_permitted":
-        return f"A single supplier quote is permitted for purchase orders of {cond_val} {unit} (up to {thresh} {rule.unit})."
+        return f"A single supplier quote is permitted for purchase orders {val_phrase} (up to {thresh} {rule.unit})."
     elif outcome == "three_competitive_quotes_required":
-        return f"Three competitive supplier quotes are required for purchase orders of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+        return f"Three competitive supplier quotes are required for purchase orders {val_phrase} (exceeding {thresh} {rule.unit})."
     elif outcome == "department_lead_signoff":
-        return f"Department lead signoff is sufficient for vendor contracts of {cond_val} months duration (up to {thresh} months)."
+        return f"Department lead signoff is sufficient for vendor contracts {months_phrase} duration (up to {thresh} months)."
     elif outcome == "legal_and_procurement_signoff":
-        return f"Both Legal and Procurement signoff are required for vendor contracts of {cond_val} months duration (exceeding {thresh} months)."
+        return f"Both Legal and Procurement signoff are required for vendor contracts {months_phrase} duration (exceeding {thresh} months)."
     elif outcome == "director_emergency_approval":
-        return f"Director emergency approval is permitted for emergency purchases of {cond_val} {unit} (up to {thresh} {rule.unit})."
+        return f"Director emergency approval is permitted for emergency purchases {val_phrase} (up to {thresh} {rule.unit})."
     elif outcome == "board_procurement_committee":
-        return f"Board Procurement Committee approval is required for emergency purchases of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+        return f"Board Procurement Committee approval is required for emergency purchases {val_phrase} (exceeding {thresh} {rule.unit})."
     elif outcome == "aes_256_mandatory":
         return "AES-256 encryption is mandatory for Confidential tier data at rest."
     elif outcome == "hsm_tokenized_encryption":
@@ -703,6 +1081,8 @@ _DECISION_BENIGN_TERMS: Set[str] = {
     "a", "an", "the", "of", "for", "under", "in", "on", "at", "by", "with", "about", "within",
     "after", "before", "to", "from", "than", "into", "through", "during", "and", "or", "as", "if",
     "not", "no", "per", "via", "without", "this", "that", "these", "those", "who", "whom", "which",
+    "below", "above", "over", "between", "least", "most", "strictly", "fewer", "higher", "lower",
+    "more", "less", "greater", "exact", "exactly", "including", "included",
     # Currency and units
     "inr", "rs", "rupee", "rupees", "usd", "eur", "gbp", "dollar", "dollars", "euro", "euros", "pound", "pounds",
     "day", "days", "month", "months", "hour", "hours", "mbps",
@@ -829,6 +1209,7 @@ def evaluate_authoritative_rule_decision(
     cond_field = target_cond["field"]
     cond_val = target_cond["value"]
     cond_unit = target_cond.get("unit", "")
+    cond_comp = target_cond.get("comparison", "exact")
 
     # Find rules evaluated against this condition field with input_value
     evaluated_for_field = [
@@ -836,6 +1217,17 @@ def evaluate_authoritative_rule_decision(
         if not r.is_error and r.input_value is not None and r.rule.condition_field == cond_field
     ]
     passing_rules = [r for r in evaluated_for_field if r.passed]
+
+    # Check for boundary-crossing conditions (e.g. at least threshold, or range crossing threshold)
+    if target_cond.get("is_boundary_crossing") or (
+        cond_comp in ("greater_than_or_equal", "range") and len(evaluated_for_field) > 0 and len(passing_rules) == 0
+    ):
+        return AuthoritativeDecision(
+            is_authoritative=False,
+            is_boundary_crossing=True,
+            reason="Numerical condition crosses policy rule boundaries or has conflicting outcomes.",
+        )
+
     if len(passing_rules) != 1:
         return AuthoritativeDecision(is_authoritative=False)
 
@@ -869,7 +1261,7 @@ def evaluate_authoritative_rule_decision(
             unsupported_terms=unsupported_terms,
         )
 
-    answer_text = _format_canonical_decision_answer(rule, cond_val, cond_unit)
+    answer_text = _format_canonical_decision_answer(rule, cond_val, cond_unit, comparison=cond_comp)
 
     return AuthoritativeDecision(
         is_authoritative=True,

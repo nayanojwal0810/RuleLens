@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from unittest.mock import MagicMock
 
 import pytest
+from decimal import Decimal
 from qdrant_client import QdrantClient, models
 
 from rulelens.answering import answer_question
@@ -41,8 +42,11 @@ from rulelens.cache import (
     CACHE_DEFAULT_SIMILARITY_THRESHOLD,
     CACHE_POINT_NAMESPACE,
     CACHE_SCHEMA_VERSION,
+    EMBEDDING_MODEL,
+    GENERATION_MODEL,
     CacheLookupResult,
     CacheRecord,
+    build_canonical_citation_metadata,
     compute_chunk_content_hash,
     compute_condition_signature,
     compute_question_indicators,
@@ -941,3 +945,506 @@ def test_20_existing_generation_unaffected_when_cache_disabled(repo_root):
     assert res.cache_hit is False
     assert res.cache_entry_id is None
     assert mock_llm.generate_answer.call_count == 1
+
+
+# ==============================================================================
+# 21. Section 5 Mandatory High-Similarity Adversarial Cache Tests
+# ==============================================================================
+
+
+def test_adversarial_01_meal_vs_hotel_same_clause_high_similarity(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 1: Meal allowance vs hotel allowance citing same clause rejected with fact_target_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C03"]
+
+    q_meal = "What is the maximum daily meal allowance under Travel Policy v2?"
+    q_hotel = "What is the maximum nightly hotel allowance under Travel Policy v2?"
+
+    # Candidate point created with EXACT SAME vector as q_hotel query (similarity = 1.0)
+    vec = mock_embedder.embed_query(q_hotel)
+    meal_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q_meal,
+        "normalized_question": normalize_question(q_meal),
+        "answer": "The maximum daily meal allowance is INR 2,000 under Travel Policy v2.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q_meal),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C03"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C03": meal_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C03": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q_hotel,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.similarity >= 0.99
+    assert res.rejection_reason == "fact_target_mismatch"
+
+
+def test_adversarial_02_submission_vs_review_deadline_high_similarity(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 2: Expense submission deadline vs manager review SLA rejected with fact_target_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-FIN-001_FIN-C02"]
+
+    q_sub = "What is the employee deadline for submitting expense reimbursement claims under Finance Policy v1?"
+    q_rev = "What is the manager review turnaround time for approving expense claims under Finance Policy v1?"
+
+    vec = mock_embedder.embed_query(q_rev)
+    sub_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q_sub,
+        "normalized_question": normalize_question(q_sub),
+        "answer": "Employees must submit expense claims within 30 days.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q_sub),
+        "cited_chunk_ids": ["DOC-FIN-001_FIN-C02"],
+        "cited_chunk_hashes": {"DOC-FIN-001_FIN-C02": sub_hash},
+        "cited_policy_versions": {"DOC-FIN-001_FIN-C02": chunk.get("version", "1.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q_rev,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.similarity >= 0.99
+    assert res.rejection_reason == "fact_target_mismatch"
+
+
+def test_adversarial_03_above_vs_up_to_threshold_high_similarity(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 3: Amounts above threshold vs up-to threshold rejected with comparison_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+
+    q_up_to = "Can a direct manager approve travel expenses up to INR 50,000 under Travel Policy v2?"
+    q_above = "Can a direct manager approve travel expenses exceeding INR 50,000 under Travel Policy v2?"
+
+    vec = mock_embedder.embed_query(q_above)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q_up_to,
+        "normalized_question": normalize_question(q_up_to),
+        "answer": "Standard manager approval is permitted up to INR 50,000.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "manager",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {"expense_amount": {"value": "50000", "unit": "inr", "comparison": "less_than_or_equal"}},
+        "indicators": compute_question_indicators(q_up_to),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C04"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C04": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C04": chunk.get("version", "2.0")},
+        "referenced_rule_ids": ["R-TRV-003"],
+        "rule_outcomes": {"R-TRV-003": "standard_approval"},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    extracted_above = [{"field": "expense_amount", "value": Decimal("50000"), "unit": "INR", "comparison": "greater_than"}]
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q_above,
+        role="manager",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=extracted_above,
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.similarity >= 0.99
+    assert res.rejection_reason == "comparison_mismatch"
+
+
+def test_adversarial_09_missing_current_referenced_rule(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 9: Cached entry references a rule not active in current query -> missing_referenced_rule."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    q = "What is the approval limit under Travel Policy v2?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Manager approval limit is INR 50,000.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "manager",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C04"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C04": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C04": chunk.get("version", "2.0")},
+        "referenced_rule_ids": ["R-TRV-003"],  # references R-TRV-003
+        "rule_outcomes": {"R-TRV-003": "standard_approval"},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    # Empty rule_results: rule R-TRV-003 is missing in current applicable rules
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="manager",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],  # No active rules
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "missing_referenced_rule"
+
+
+def test_adversarial_11_missing_cache_schema(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 11: Candidate record missing schema_version is rejected with unsupported_schema_version."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
+    q = "What is the corporate travel policy purpose?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        # schema_version omitted intentionally
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Travel policy purpose is business travel governance.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C01"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C01": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C01": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "unsupported_schema_version"
+
+
+def test_adversarial_12_incorrect_schema_version(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 12: Unsupported schema_version rejected with unsupported_schema_version."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
+    q = "What is the corporate travel policy purpose?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "2.0-incompatible",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Travel policy purpose is business travel governance.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C01"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C01": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C01": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "unsupported_schema_version"
+
+
+def test_adversarial_13_incorrect_generation_model(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 13: Generation model mismatch rejected with generation_model_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
+    q = "What is the corporate travel policy purpose?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Travel policy purpose is business travel governance.",
+        "status": "answered",
+        "model": "claude-3-5-sonnet-20241022",  # incompatible model
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C01"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C01": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C01": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "generation_model_mismatch"
+
+
+def test_adversarial_14_incorrect_embedding_model(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 14: Embedding model mismatch rejected with embedding_model_mismatch."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
+    q = "What is the corporate travel policy purpose?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Travel policy purpose is business travel governance.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": "text-embedding-3-small",  # incompatible embedding model
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C01"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C01": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C01": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [build_canonical_citation_metadata(chunk)],
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "embedding_model_mismatch"
+
+
+def test_adversarial_15_missing_citation_metadata(canonical_chunks_by_id, mock_embedder):
+    """Mandatory 15: Missing or incomplete citation metadata rejected with incomplete_citation_metadata."""
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
+    q = "What is the corporate travel policy purpose?"
+
+    vec = mock_embedder.embed_query(q)
+    chunk_hash = compute_chunk_content_hash(chunk["text"])
+
+    record_payload = {
+        "entry_id": str(uuid.uuid4()),
+        "schema_version": "1.0",
+        "original_question": q,
+        "normalized_question": normalize_question(q),
+        "answer": "Travel policy purpose is business travel governance.",
+        "status": "answered",
+        "model": GENERATION_MODEL,
+        "role": "employee",
+        "query_date": "2026-11-22",
+        "corpus_fingerprint": "fp_test",
+        "embedding_model": EMBEDDING_MODEL,
+        "condition_signature": {},
+        "indicators": compute_question_indicators(q),
+        "cited_chunk_ids": ["DOC-TRV-002_TRV-C01"],
+        "cited_chunk_hashes": {"DOC-TRV-002_TRV-C01": chunk_hash},
+        "cited_policy_versions": {"DOC-TRV-002_TRV-C01": chunk.get("version", "2.0")},
+        "referenced_rule_ids": [],
+        "rule_outcomes": {},
+        "citation_metadata": [],  # Empty citation metadata
+        "created_at": "2026-11-22T00:00:00Z",
+    }
+    client.upsert(
+        collection_name=QDRANT_CACHE_COLLECTION_NAME,
+        points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
+    )
+
+    res = lookup_cache(
+        client=client,
+        embedder=mock_embedder,
+        question=q,
+        role="employee",
+        query_date="2026-11-22",
+        corpus_fingerprint="fp_test",
+        authorized_chunks=[chunk],
+        extracted_conditions=[],
+        rule_results=[],
+        canonical_chunks_by_id=canonical_chunks_by_id,
+        similarity_threshold=0.85,
+    )
+    assert res.hit is False
+    assert res.rejection_reason == "incomplete_citation_metadata"

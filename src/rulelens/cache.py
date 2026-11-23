@@ -72,6 +72,93 @@ def normalize_question(text: str) -> str:
     return cleaned
 
 
+def compute_fact_target_signature(question: str) -> Dict[str, Any]:
+    """Extract fine-grained, explainable fact targets from the question.
+
+    Distinguishes specific policy facts within the same domain or clause:
+    - meal_allowance vs hotel_lodging vs flight_booking
+    - claim_submission_deadline vs manager_review_sla vs payment_cycle
+    - approval_threshold vs expense_eligibility
+    - standard_procurement vs emergency_procurement
+    - data_encryption vs data_transfer_restrictions
+    - business_travel vs personal_travel
+    - vacation_accrual vs sick_leave vs parental_leave
+    - tuition_assistance vs internal_mobility
+    - card_spending_limit vs card_issuance_eligibility
+    """
+    q_lower = question.lower()
+    facets: Set[str] = set()
+
+    # Meal subsistence vs hotel lodging
+    if any(k in q_lower for k in ("meal", "meals", "subsistence", "per diem", "food", "dining")):
+        facets.add("meal_allowance")
+    if any(k in q_lower for k in ("hotel", "hotels", "lodging", "nightly", "accommodation", "accommodations")):
+        facets.add("hotel_lodging")
+    if any(k in q_lower for k in ("flight", "flights", "advance booking", "booking notice", "airline", "railway", "departure")):
+        facets.add("flight_booking")
+
+    # Personal vs business travel
+    if "personal travel" in q_lower or "personal expense" in q_lower or "personal entertainment" in q_lower:
+        facets.add("personal_travel")
+    elif any(k in q_lower for k in ("business travel", "domestic travel", "official travel", "domestic assignments", "for work", "within india")):
+        facets.add("business_travel")
+
+    # Finance: Submission deadline vs Manager review SLA vs Payment cycle vs Receipt
+    if any(k in q_lower for k in ("manager review", "supervising manager", "inspect and approve", "review and approve", "turnaround time", "review turnaround", "approval turnaround")):
+        facets.add("manager_review_sla")
+    elif any(k in q_lower for k in ("submit", "submission", "employee claim", "filing", "incurring an expense", "file reimbursement")):
+        facets.add("claim_submission_deadline")
+
+    if any(k in q_lower for k in ("receipt", "tax invoice", "itemized", "incidental")):
+        facets.add("receipt_requirement")
+
+    if any(k in q_lower for k in ("corporate credit card", "corporate card", "cardholder", "cardholders")):
+        if any(k in q_lower for k in ("limit", "monthly", "spend")):
+            facets.add("card_spending_limit")
+        if any(k in q_lower for k in ("eligible", "eligibility", "issued", "issuance")):
+            facets.add("card_issuance_eligibility")
+
+    # Procurement: Standard vs Emergency vs Vendor onboarding vs Contract
+    if any(k in q_lower for k in ("emergency procurement", "emergency purchase", "emergency purchases")):
+        facets.add("emergency_procurement")
+    elif any(k in q_lower for k in ("procurement", "purchase order", "bidding", "quote", "vendor quote", "supplier")):
+        facets.add("standard_procurement")
+
+    # People Ops: Vacation vs Sick leave vs Remote core hours vs Tuition vs Mobility
+    if any(k in q_lower for k in ("vacation", "annual leave", "paid annual")):
+        facets.add("vacation_accrual")
+    if any(k in q_lower for k in ("sick leave", "medical certificate", "consecutive sick")):
+        facets.add("sick_leave")
+    if any(k in q_lower for k in ("core hours", "daily hours", "active availability", "availability window", "reachable")):
+        facets.add("core_working_hours")
+    if any(k in q_lower for k in ("tuition", "educational assistance", "degree", "learning allowance", "course")):
+        facets.add("tuition_assistance")
+    if any(k in q_lower for k in ("internal mobility", "internal transfer", "department transfer", "role transfer", "employee transfer")):
+        facets.add("internal_mobility")
+
+    # Security: Classification vs Recertification vs Incident SLA vs Encryption vs Transfer
+    if any(k in q_lower for k in ("classification tier", "classification tiers", "classification level", "classification levels", "categorize corporate information")):
+        facets.add("classification_tiers")
+    if any(k in q_lower for k in ("recertification", "recertify", "recertified")):
+        facets.add("account_recertification")
+    if any(k in q_lower for k in ("incident", "containment", "p1")):
+        facets.add("incident_containment")
+    if any(k in q_lower for k in ("encryption", "aes", "cipher", "storage drives", "purged")):
+        facets.add("data_encryption")
+    if any(k in q_lower for k in ("transferring", "outside authorized networks", "outside company networks", "transmission", "document-transfer")):
+        facets.add("data_transfer_restrictions")
+
+    # Approval threshold vs Expense eligibility check
+    is_threshold_query = bool(re.search(r"\b(maximum|cap|limit|threshold|spending limit|ceiling|rate)\b", q_lower))
+    is_eligibility_query = bool(re.search(r"\b(eligible|eligibility|qualify|entitled|entitlement|who is eligible|allowed to|permissible|can employees spend)\b", q_lower))
+
+    return {
+        "facets": sorted(list(facets)),
+        "is_threshold_query": is_threshold_query,
+        "is_eligibility_query": is_eligibility_query,
+    }
+
+
 def compute_question_indicators(question: str) -> Dict[str, Any]:
     """Extract linguistic and semantic indicators from a question to guard cache reuse."""
     q_norm = normalize_question(question)
@@ -120,17 +207,20 @@ def compute_question_indicators(question: str) -> Dict[str, Any]:
     elif any(k in q_lower for k in ("classification", "tier", "confidential", "restricted", "encryption", "aes", "privileged", "recertification", "incident", "severity", "sla", "sanitiz", "storage", "drives", "smart", "iot")):
         subject = "security"
 
+    fact_signature = compute_fact_target_signature(question)
+
     return {
         "has_negation": has_negation,
         "has_comparison": has_comparison,
         "has_exception": has_exception,
         "approval_authorities": authorities,
         "policy_subject": subject,
+        "fact_signature": fact_signature,
     }
 
 
 def compute_condition_signature(conditions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Create a canonical deterministic signature of extracted condition values and units."""
+    """Create a canonical deterministic signature of extracted condition values, units, and comparisons."""
     sig: Dict[str, Any] = {}
     for c in conditions:
         if not isinstance(c, dict):
@@ -138,16 +228,35 @@ def compute_condition_signature(conditions: Sequence[Dict[str, Any]]) -> Dict[st
         field = c.get("field")
         val = c.get("value")
         unit = (c.get("unit") or "").lower()
+        comp = (c.get("comparison") or "exact").lower()
         if field and val is not None and not c.get("is_ambiguous", False):
-            try:
-                numeric_val = float(val)
-            except (ValueError, TypeError):
-                numeric_val = str(val)
+            if isinstance(val, (list, tuple)):
+                val_repr = [str(x) for x in val]
+            else:
+                val_repr = str(val)
             sig[field] = {
-                "value": numeric_val,
+                "value": val_repr,
                 "unit": unit,
+                "comparison": comp,
             }
+            if c.get("min_value") is not None:
+                sig[field]["min_value"] = str(c.get("min_value"))
+            if c.get("max_value") is not None:
+                sig[field]["max_value"] = str(c.get("max_value"))
     return sig
+
+
+def build_canonical_citation_metadata(chunk: Union[Dict[str, Any], Any]) -> Dict[str, Any]:
+    """Build standardized citation metadata dictionary from a canonical chunk record."""
+    c_dict = chunk if isinstance(chunk, dict) else (chunk.to_dict() if hasattr(chunk, "to_dict") else vars(chunk))
+    return {
+        "chunk_id": c_dict.get("chunk_id", ""),
+        "doc_id": c_dict.get("doc_id", ""),
+        "clause_id": c_dict.get("clause_id", ""),
+        "title": c_dict.get("title", ""),
+        "source_file": c_dict.get("source_file", ""),
+        "source_page": int(c_dict.get("source_page", 1)),
+    }
 
 
 def compute_chunk_content_hash(text: str) -> str:
@@ -189,7 +298,7 @@ class CacheRecord:
         """Construct record from a Qdrant payload dictionary."""
         return cls(
             entry_id=str(payload.get("entry_id", "")),
-            schema_version=str(payload.get("schema_version", "1.0")),
+            schema_version=str(payload.get("schema_version") or ""),
             original_question=str(payload.get("original_question", "")),
             normalized_question=str(payload.get("normalized_question", "")),
             answer=str(payload.get("answer", "")),
@@ -236,42 +345,63 @@ def validate_cache_candidate(
     """Strictly validate whether a candidate cache record may be safely reused.
 
     Applies all mandatory safety checks:
+    - Supported schema version matches exactly
+    - Expected generation and embedding models match exactly
+    - Mandatory payload fields are complete, well-formed, and verified
     - Status must be 'answered'
     - Requesting role matches exactly
     - Query date matches exactly
-    - Corpus fingerprint and embedding model match
-    - Structured conditions match exactly (values and units)
+    - Corpus fingerprint matches exactly
+    - Numerical conditions match exactly (values and units)
     - Negation, comparison, and exception indicators match
     - Approval authority entities match
     - Policy subjects are compatible
+    - Fact-level query signatures match (no same-clause different-fact reuse)
+    - Referenced rule IDs exist in currently applicable rules and have identical outcomes
     - All cached cited chunks are present in currently authorized evidence
     - Canonical content hashes and policy versions for all cited chunks are identical
-    - Referenced rule outcomes remain consistent
-    - Record is complete and well-formed
+    - Citation metadata is verified against canonical corpus records
     """
-    # 1. Status check
+    # 1. Schema version check
+    if getattr(candidate, "schema_version", None) != CACHE_SCHEMA_VERSION:
+        return False, "unsupported_schema_version"
+
+    # 2. Generation and embedding model identity check
+    if getattr(candidate, "model", None) != GENERATION_MODEL:
+        return False, "generation_model_mismatch"
+    if getattr(candidate, "embedding_model", None) != EMBEDDING_MODEL:
+        return False, "embedding_model_mismatch"
+
+    # 3. Basic metadata and payload integrity
+    if (
+        not getattr(candidate, "entry_id", None)
+        or not getattr(candidate, "original_question", None)
+        or not getattr(candidate, "answer", None)
+        or not str(candidate.answer).strip()
+        or not getattr(candidate, "cited_chunk_ids", None)
+        or not getattr(candidate, "cited_chunk_hashes", None)
+        or not getattr(candidate, "cited_policy_versions", None)
+        or not getattr(candidate, "created_at", None)
+    ):
+        return False, "malformed_cache_record"
+
+    # 4. Status check
     if candidate.status != "answered":
         return False, "status_not_answered"
 
-    # 2. Basic metadata integrity
-    if not candidate.answer or not candidate.cited_chunk_ids:
-        return False, "malformed_cache_record"
-
-    # 3. Requesting role verification
+    # 5. Requesting role verification
     if candidate.role != role:
         return False, "role_mismatch"
 
-    # 4. Temporal date verification
+    # 6. Temporal date verification
     if candidate.query_date != query_date:
         return False, "date_mismatch"
 
-    # 5. Corpus fingerprint and model verification
+    # 7. Corpus fingerprint verification
     if candidate.corpus_fingerprint != corpus_fingerprint:
         return False, "corpus_fingerprint_mismatch"
-    if candidate.embedding_model != EMBEDDING_MODEL:
-        return False, "embedding_model_mismatch"
 
-    # 6. Condition signature verification (numerical values and units)
+    # 8. Condition signature verification (numerical values and units)
     query_cond_sig = compute_condition_signature(extracted_conditions)
     candidate_cond_sig = candidate.condition_signature or {}
 
@@ -287,8 +417,12 @@ def validate_cache_candidate(
             return False, "numerical_condition_mismatch"
         if q_val_info.get("unit") != c_val_info.get("unit"):
             return False, "numerical_condition_mismatch"
+        q_comp = (q_val_info.get("comparison") or "exact").lower()
+        c_comp = (c_val_info.get("comparison") or "exact").lower()
+        if q_comp != c_comp:
+            return False, "comparison_mismatch"
 
-    # 7. Semantic and linguistic indicator checks
+    # 9. Semantic and linguistic indicator checks
     query_indicators = compute_question_indicators(question)
     cand_indicators = candidate.indicators or {}
 
@@ -300,6 +434,31 @@ def validate_cache_candidate(
 
     if query_indicators["has_exception"] != cand_indicators.get("has_exception", False):
         return False, "exception_mismatch"
+
+    # 10. Conservative fact-level query signature check (must precede generic entity matching)
+    q_norm = normalize_question(question)
+    c_norm = candidate.normalized_question or normalize_question(candidate.original_question)
+    if q_norm != c_norm:
+        q_fact = compute_fact_target_signature(question)
+        c_fact = (cand_indicators.get("fact_signature") or compute_fact_target_signature(candidate.original_question))
+        q_facets = set(q_fact.get("facets", []))
+        c_facets = set(c_fact.get("facets", []))
+
+        # Reject if domain facts differ (e.g. meal vs hotel, submission deadline vs manager SLA)
+        if q_facets != c_facets:
+            return False, "fact_target_mismatch"
+
+        # Explicit personal vs business travel check
+        if ("personal_travel" in q_facets) != ("personal_travel" in c_facets):
+            return False, "fact_target_mismatch"
+        if ("business_travel" in q_facets) != ("business_travel" in c_facets):
+            return False, "fact_target_mismatch"
+
+        # Threshold vs eligibility distinction
+        if q_fact.get("is_threshold_query") != c_fact.get("is_threshold_query") and (
+            q_fact.get("is_eligibility_query") or c_fact.get("is_eligibility_query")
+        ):
+            return False, "fact_target_mismatch"
 
     # Approval authorities check
     q_auths = set(query_indicators.get("approval_authorities", []))
@@ -313,13 +472,20 @@ def validate_cache_candidate(
     if q_subj and c_subj and q_subj != "general" and c_subj != "general" and q_subj != c_subj:
         return False, "policy_subject_mismatch"
 
-    # 8. Check rule outcomes
-    active_rule_outcomes = {r.rule.rule_id: r.outcome for r in rule_results if not r.is_error}
-    for rule_id, expected_outcome in (candidate.rule_outcomes or {}).items():
-        if rule_id in active_rule_outcomes and active_rule_outcomes[rule_id] != expected_outcome:
+    # 11. Structured rule validation
+    active_rules = {r.rule.rule_id: r for r in rule_results if not r.is_error}
+    for rule_id in (candidate.referenced_rule_ids or []):
+        if rule_id not in active_rules:
+            return False, "missing_referenced_rule"
+        rule_res = active_rules[rule_id]
+        if not rule_res.passed:
             return False, "rule_outcome_mismatch"
+        if candidate.rule_outcomes and rule_id in candidate.rule_outcomes:
+            expected_outcome = candidate.rule_outcomes[rule_id]
+            if rule_res.outcome != expected_outcome:
+                return False, "rule_outcome_mismatch"
 
-    # 9. Verify cited evidence is authorized in current retrieval set
+    # 12. Verify cited evidence is authorized in current retrieval set
     authorized_cids = {
         c.chunk_id if isinstance(c, RetrievalResult) else c.get("chunk_id")
         for c in authorized_chunks
@@ -328,7 +494,7 @@ def validate_cache_candidate(
         if cited_cid not in authorized_cids:
             return False, "missing_authorized_citation"
 
-    # 10. Verify canonical content hash and policy version integrity
+    # 13. Verify canonical content hash and policy version integrity
     for cited_cid in candidate.cited_chunk_ids:
         canon_chunk = canonical_chunks_by_id.get(cited_cid)
         if not canon_chunk:
@@ -343,6 +509,25 @@ def validate_cache_candidate(
         actual_version = canon_chunk.get("version")
         if expected_version != actual_version:
             return False, "stale_citation_content"
+
+    # 14. Verify citation metadata integrity against canonical records
+    if not candidate.citation_metadata or not isinstance(candidate.citation_metadata, list):
+        return False, "incomplete_citation_metadata"
+
+    meta_by_cid = {
+        m.get("chunk_id"): m
+        for m in candidate.citation_metadata
+        if isinstance(m, dict) and m.get("chunk_id")
+    }
+    for cited_cid in candidate.cited_chunk_ids:
+        if cited_cid not in meta_by_cid:
+            return False, "incomplete_citation_metadata"
+        meta_entry = meta_by_cid[cited_cid]
+        if not meta_entry.get("title") or not str(meta_entry.get("title")).strip():
+            return False, "incomplete_citation_metadata"
+        canon_chunk = canonical_chunks_by_id.get(cited_cid)
+        if canon_chunk and meta_entry.get("title") != canon_chunk.get("title"):
+            return False, "incomplete_citation_metadata"
 
     # All mandatory conditions satisfied
     return True, None
@@ -584,6 +769,14 @@ def lookup_cache(
         )
 
         if is_valid:
+            # Reconstruct verified canonical citation metadata rather than trusting mutable stored metadata
+            verified_meta = [
+                build_canonical_citation_metadata(canonical_chunks_by_id[cid])
+                for cid in record.cited_chunk_ids
+                if cid in canonical_chunks_by_id
+            ]
+            if verified_meta:
+                record.citation_metadata = verified_meta
             latency = (time.perf_counter() - start_time) * 1000.0
             return CacheLookupResult(
                 hit=True,
@@ -635,6 +828,8 @@ def insert_cache_entry(
         return None
     if not citations or not answer or not answer.strip():
         return None
+    if any(c.get("is_ambiguous") for c in (extracted_conditions or [])):
+        return None
 
     norm_q = normalize_question(question)
     if not norm_q:
@@ -660,13 +855,28 @@ def insert_cache_entry(
 
     rule_outcomes: Dict[str, str] = {}
     for r in rule_results:
-        if r.rule.rule_id in referenced_rule_ids:
+        if r.rule.rule_id in referenced_rule_ids and r.passed and not r.is_error:
             rule_outcomes[r.rule.rule_id] = r.outcome
+
+    if referenced_rule_ids and any(rid not in rule_outcomes for rid in referenced_rule_ids):
+        return None
 
     condition_sig = compute_condition_signature(extracted_conditions)
     indicators = compute_question_indicators(question)
 
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # Ensure citation metadata is populated and consistent with canonical evidence
+    final_metadata = [dict(m) for m in (citation_metadata or []) if isinstance(m, dict) and m.get("chunk_id")]
+    if not final_metadata and citations and canonical_chunks_by_id:
+        for cid in citations:
+            chk = canonical_chunks_by_id.get(cid)
+            if chk:
+                final_metadata.append({
+                    "chunk_id": cid,
+                    "title": chk.get("title", ""),
+                    "clause_id": chk.get("clause_id", ""),
+                })
 
     record = CacheRecord(
         entry_id=entry_id,
@@ -687,7 +897,7 @@ def insert_cache_entry(
         cited_policy_versions=cited_versions,
         referenced_rule_ids=list(referenced_rule_ids),
         rule_outcomes=rule_outcomes,
-        citation_metadata=[dict(m) for m in citation_metadata],
+        citation_metadata=final_metadata,
         created_at=now_iso,
     )
 

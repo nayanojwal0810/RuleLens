@@ -1085,3 +1085,170 @@ def test_operational_error_never_leaks_arbitrary_secrets_or_paths(
     assert secret_string not in res_str
     assert "super_secret" not in res_str.lower()
     assert "id_rsa" not in res_str
+
+
+# ==============================================================================
+# 8. Numerical Comparison Directional Safeguard Integration Tests (Section 2.5)
+# ==============================================================================
+
+
+def test_integration_exceeding_threshold_deterministic_additional_approval(mock_retriever, canonical_chunks_by_id):
+    """Exceeding INR 50,000 deterministically triggers additional approval with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a manager approve travel expenses exceeding INR 50,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "Additional approval is required" in res.answer
+    assert res.referenced_rule_ids == ["R-TRV-004"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_at_least_threshold_safe_insufficient_refusal(mock_retriever, canonical_chunks_by_id):
+    """At least INR 50,000 crosses approval boundaries; must refuse safely with insufficient and 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a manager approve travel expenses of at least INR 50,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert "unconditional decision cannot be determined" in res.answer or "sufficient evidence" in res.answer
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_range_crossing_boundary_safe_insufficient_refusal(mock_retriever, canonical_chunks_by_id):
+    """Range crossing INR 50,000 threshold must refuse safely with insufficient and 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a manager approve travel expenses between INR 40,000 and 60,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_up_to_threshold_deterministic_standard_approval(mock_retriever, canonical_chunks_by_id):
+    """Up to INR 50,000 deterministically triggers standard approval with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses up to INR 50,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "Standard manager approval is permitted" in res.answer
+    assert res.referenced_rule_ids == ["R-TRV-003"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_below_threshold_deterministic_standard_approval(mock_retriever, canonical_chunks_by_id):
+    """Below INR 50,000 deterministically triggers standard approval with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses below INR 50,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert "Standard manager approval is permitted" in res.answer
+    assert res.referenced_rule_ids == ["R-TRV-003"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_foreign_currency_incompatible_unit_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """USD 50,000 cannot produce INR approval decision; fails closed safely with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses of USD 50,000 under Travel Policy v2?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.error_category == "incompatible_unit"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_personal_travel_unsupported_term_safe_refusal(mock_retriever, canonical_chunks_by_id):
+    """Personal travel unsupported requirement refuses safely with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can employees spend INR 50,000 on personal travel?"
+    res = answer_question(
+        question=q, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
