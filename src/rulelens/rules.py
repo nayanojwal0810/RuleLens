@@ -85,6 +85,7 @@ class AuthoritativeDecision:
     rule_id: Optional[str] = None
     outcome: Optional[str] = None
     reason: Optional[str] = None
+    unsupported_terms: Optional[List[str]] = None
 
 
 # Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
@@ -729,7 +730,7 @@ _DECISION_BENIGN_TERMS: Set[str] = {
     "doc", "trv", "fin", "ppo", "prc", "sec",
     "c04", "b02", "r03", "p02", "e01", "a02", "i02", "v1", "v2", "v3",
     # Broad travel qualifiers
-    "travel", "trip", "trips", "business", "personal",
+    "travel", "trip", "trips", "business",
 }
 
 _RULE_FIELD_SUBJECT_TERMS: Dict[str, Set[str]] = {
@@ -860,7 +861,13 @@ def evaluate_authoritative_rule_decision(
     # 3. Unsupported requirements check: Question must not contain additional unsupported entities
     unsupported_terms = _find_unsupported_query_terms(question, rule_chunk)
     if unsupported_terms:
-        return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(
+            is_authoritative=False,
+            rule=rule,
+            rule_id=rule.rule_id,
+            reason=f"Query introduces unsupported terms [{', '.join(unsupported_terms)}] not established by rule evidence.",
+            unsupported_terms=unsupported_terms,
+        )
 
     answer_text = _format_canonical_decision_answer(rule, cond_val, cond_unit)
 

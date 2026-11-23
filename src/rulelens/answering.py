@@ -47,6 +47,7 @@ from rulelens.retrieval import (
 from rulelens.rules import (
     AuthoritativeDecision,
     RuleEvaluationResult,
+    _find_unsupported_query_terms,
     evaluate_authoritative_rule_decision,
     extract_conditions_from_query,
     resolve_rules_for_evidence,
@@ -311,6 +312,9 @@ _QUERY_STOPWORDS = {
     "had", "be", "are", "was", "were", "been", "being", "which", "who", "whom",
     "this", "that", "these", "those", "am", "via", "per", "under", "without",
     "and", "but", "or", "as", "if", "take", "taking",
+    # Currency units and transaction verbs
+    "inr", "rs", "rupee", "rupees", "usd", "eur", "gbp", "dollar", "dollars", "euro", "euros", "pound", "pounds",
+    "spend", "spending", "spent", "pay", "paying", "payment", "payments", "cost", "costing", "costs",
     # Enterprise policy boilerplate terms appearing across virtually all policies
     "policy", "corporate", "company", "asterline", "services", "group", "required",
     "use", "used", "employee", "employees", "rules", "rule", "guidelines", "guideline",
@@ -645,9 +649,6 @@ def answer_question(
             error=err.explanation,
         )
 
-    # Only rules that successfully passed without error or define approved thresholds are applicable
-    applicable_rule_ids = {r.rule.rule_id for r in rule_results if r.passed and not r.is_error}
-
     # Step G.1: Authoritative deterministic rule decision for clear single-condition decision queries
     authoritative_dec = evaluate_authoritative_rule_decision(
         question=cleaned_question,
@@ -680,7 +681,42 @@ def answer_question(
             has_incomplete_tokens=False,
         )
 
-    # Step G.2: Lexical evidence-support gate for open-ended LLM generation
+    # Step G.2: If the query introduced unsupported terms for a numerical approval/decision rule,
+    # the approval threshold cannot establish whether that expense category or purpose is eligible.
+    # Refuse safely without sending unsupported evidence to Groq for an affirmative decision.
+    if authoritative_dec.unsupported_terms:
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The provided corporate policies do not contain sufficient evidence to answer this question.",
+            status=AnswerStatus.INSUFFICIENT.value,
+            reason=f"Numerical approval threshold does not establish eligibility for unsupported query terms: {', '.join(authoritative_dec.unsupported_terms)}.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+        )
+
+    # Filter applicable rules for generation: A numerical approval threshold must not establish
+    # whether an expense category is eligible; reject rule satisfaction if chunk has unsupported query terms.
+    chunk_map = {c.chunk_id: c for c in authorized_chunks}
+    applicable_rule_results: List[RuleEvaluationResult] = []
+    for r in rule_results:
+        if r.passed and not r.is_error:
+            chk = chunk_map.get(r.rule.chunk_id)
+            if chk and _find_unsupported_query_terms(cleaned_question, chk):
+                continue
+        applicable_rule_results.append(r)
+    applicable_rule_ids = {r.rule.rule_id for r in applicable_rule_results if r.passed and not r.is_error}
+
+    # Step G.3: Lexical evidence-support gate for open-ended LLM generation
     if not check_evidence_support(cleaned_question, authorized_chunks):
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
@@ -780,7 +816,7 @@ def answer_question(
             role=role,
             evidence_chunks=authorized_chunks,
             query_date=date_str,
-            applicable_rule_facts=rule_results,
+            applicable_rule_facts=applicable_rule_results,
         )
         schema_valid_status = True
         if baseline_telemetry is not None:

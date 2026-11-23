@@ -844,6 +844,85 @@ def test_adversarial_spa_treatment_not_approved_by_travel_threshold(canonical_co
     mock_llm.generate_answer.assert_not_called()
 
 
+def test_personal_travel_not_approved_and_groq_not_called(canonical_corpus, canonical_chunks_by_id):
+    """Query 'Can employees spend INR 50,000 on personal travel?' must NOT approve personal travel and must NOT call Groq."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04 = RetrievalResult(
+        chunk_id=c["chunk_id"],
+        text=c["text"],
+        doc_id=c["doc_id"],
+        clause_id=c["clause_id"],
+        title=c["title"],
+        department=c["department"],
+        version=c["version"],
+        source_file=c["source_file"],
+        source_page=int(c["source_page"]),
+        effective_from=c["effective_from"],
+        effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.search.return_value = [c04]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    res = answer_question(
+        question="Can employees spend INR 50,000 on personal travel?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert "approved" not in res.answer.lower() or "not contain sufficient evidence" in res.answer.lower()
+    assert res.citations == []
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_personal_travel_with_real_retriever_refuses_without_groq(repo_root):
+    """End-to-end verification that 'Can employees spend INR 50,000 on personal travel?' with real retriever refuses without Groq."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    retriever = HybridRetriever(base_dir=repo_root)
+    res = answer_question(
+        question="Can employees spend INR 50,000 on personal travel?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=retriever,
+        mode="bm25",
+        llm_client=mock_llm,
+        base_dir=repo_root,
+    )
+    assert res.status == "insufficient"
+    assert "approved" not in res.answer.lower() or "not contain sufficient evidence" in res.answer.lower()
+    assert res.citations == []
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_business_travel_with_real_retriever_approves_deterministically(repo_root):
+    """End-to-end verification that legitimate business travel approval query succeeds deterministically with real retriever."""
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+    retriever = HybridRetriever(base_dir=repo_root)
+    res = answer_question(
+        question="Can a direct manager approve an expense of INR 50,000 under Travel Policy v2?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=retriever,
+        mode="bm25",
+        llm_client=mock_llm,
+        base_dir=repo_root,
+    )
+    assert res.status == "answered"
+    assert "Standard manager approval is permitted" in res.answer
+    assert res.citations == ["DOC-TRV-002_TRV-C04"]
+    assert res.referenced_rule_ids == ["R-TRV-003"]
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
 def test_deterministic_booking_notice_query_bypasses_groq_with_none_schema(canonical_corpus, canonical_chunks_by_id):
     """Booking notice query (14 days) succeeds authoritatively with R-TRV-005, citation DOC-TRV-003_TRV-B02, and schema_valid=None."""
     c = canonical_chunks_by_id["DOC-TRV-003_TRV-B02"]

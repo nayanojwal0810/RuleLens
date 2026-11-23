@@ -667,3 +667,52 @@ def test_adversarial_spa_treatment_not_authoritative(repo_root: Path):
     dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
     assert dec.is_authoritative is False
 
+
+def test_personal_travel_not_authoritative(repo_root: Path):
+    """An expense query about personal travel (INR 50,000) must NOT produce an authoritative approval."""
+    mock_chunks = [
+        {
+            "chunk_id": "DOC-TRV-002_TRV-C04",
+            "doc_id": "DOC-TRV-002",
+            "clause_id": "TRV-C04",
+            "title": "Travel Policy v2",
+            "department": "Travel",
+            "text": (
+                "[TRV-C04] Travel Expense Approval Thresholds\n"
+                "Travel expenses up to and including INR 50,000 follow standard approval by the direct reporting manager. "
+                "Any travel expenses exceeding INR 50,000 require additional approval from the department director prior to reimbursement."
+            ),
+        },
+    ]
+    q = "Can employees spend INR 50,000 on personal travel?"
+    conds = extract_conditions_from_query(q)
+    rules = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds)
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is False
+    assert dec.unsupported_terms == ["personal"]
+
+
+def test_business_travel_authoritative_approval(repo_root: Path):
+    """Standard business travel expense of INR 50,000 MUST produce authoritative approval."""
+    mock_chunks = [
+        {
+            "chunk_id": "DOC-TRV-002_TRV-C04",
+            "doc_id": "DOC-TRV-002",
+            "clause_id": "TRV-C04",
+            "title": "Travel Policy v2",
+            "department": "Travel",
+            "text": (
+                "[TRV-C04] Travel Expense Approval Thresholds\n"
+                "Travel expenses up to and including INR 50,000 follow standard approval by the direct reporting manager. "
+                "Any travel expenses exceeding INR 50,000 require additional approval from the department director prior to reimbursement."
+            ),
+        },
+    ]
+    q = "Can a direct manager approve an expense of INR 50,000 under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    rules = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds)
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is True
+    assert dec.rule_id == "R-TRV-003"
+    assert "Standard manager approval is permitted" in dec.answer
+
