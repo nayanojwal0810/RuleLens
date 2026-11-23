@@ -308,7 +308,7 @@ def test_answer_question_rule_unit_error_fails_safely(mock_retriever, canonical_
         )
 
     assert result.status == "insufficient"
-    assert result.error_category == "invalid_unit"
+    assert result.error_category in ("incompatible_unit", "invalid_unit")
     assert "rule evaluation error" in result.reason.lower()
     mock_llm.generate_answer.assert_not_called()
 
@@ -341,7 +341,7 @@ def test_answer_question_rejects_forged_evidence_metadata(mock_retriever, sample
     )
 
     assert result.status == "operational_error"
-    assert result.error_category == "service_unavailable"
+    assert result.error_category == "evidence_integrity_error"
     assert "integrity" in result.error.lower()
     # Provider must NEVER be called with forged evidence
     mock_llm.generate_answer.assert_not_called()
@@ -541,7 +541,7 @@ def test_answer_question_rejects_forged_department(mock_retriever, sample_retrie
     )
 
     assert result.status == "operational_error"
-    assert result.error_category == "service_unavailable"
+    assert result.error_category == "evidence_integrity_error"
     assert "department" in result.error.lower()
     assert result.provider_calls_attempted == 0
     mock_llm.generate_answer.assert_not_called()
@@ -752,42 +752,41 @@ def test_generic_terms_do_not_trigger_restrictions(canonical_corpus, canonical_c
     assert res.status != "restricted"
 
 
-def test_all_five_restricted_diagnostics_refuse_correctly(canonical_corpus, canonical_chunks_by_id):
+def test_all_five_restricted_diagnostics_refuse_correctly(repo_root: Path, canonical_corpus, canonical_chunks_by_id):
     """All 5 restricted diagnostic queries from dev_questions.json produce status 'restricted'."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    dev_questions = json.loads(dev_path.read_text(encoding="utf-8"))["questions"]
+    q_lookup = {q["question_id"]: q for q in dev_questions}
+    restricted_ids = ["TRV-009", "FIN-009", "PPO-009", "PRC-009", "SEC-009"]
+
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
     retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
-    cases = [
-        # TRV-009: Travel Exceptions Policy (role: employee)
-        ("What executive approval route is required when extraordinary travel exception expenses exceed INR 100,000 under the travel exceptions policy?", "employee", "2026-11-22"),
-        # FIN-009: Corporate Cards Policy (role: employee)
-        ("Who is eligible to be issued an Asterline corporate credit card, and what approval is required for card limit escalation?", "employee", "2026-11-22"),
-        # PPO-009: Employee Transfers Policy (role: auditor)
-        ("What minimum tenure and performance criteria are required for an employee to apply for an internal transfer under the employee transfer policy?", "auditor", "2026-11-22"),
-        # PRC-009: Vendor Onboarding Policy (role: employee)
-        ("What supplier code of conduct must onboarded vendors sign affirming compliance with anti-bribery and fair labor regulations?", "employee", "2026-11-22"),
-        # SEC-009: Storage Media Sanitization / Data Retention (role: finance)
-        ("What standards and physical methods must be used when sanitizing decommissioned storage drives before disposal?", "finance", "2026-11-22"),
-    ]
-
-    for q, role, dt in cases:
+    for qid in restricted_ids:
+        item = q_lookup[qid]
         res = answer_question(
-            question=q,
-            role=role,
-            query_date=dt,
+            question=item["question"],
+            role=item["role"],
+            query_date=item["query_date"],
             retriever=retriever,
             llm_client=mock_llm,
         )
-        assert res.status == "restricted", f"Expected restricted for query: {q} with role {role}"
+        assert res.status == "restricted", f"Expected restricted for {qid}: {item['question']}"
         assert res.provider_calls_attempted == 0
+        assert res.citations == []
         mock_llm.generate_answer.assert_not_called()
 
 
-def test_all_five_unsupported_diagnostics_refuse_as_insufficient(canonical_corpus, canonical_chunks_by_id):
-    """All 5 unsupported diagnostic queries produce safe status 'insufficient' without hallucinations."""
+def test_all_five_unsupported_diagnostics_refuse_as_insufficient(repo_root: Path, canonical_corpus, canonical_chunks_by_id):
+    """All 5 unsupported diagnostic queries from dev_questions.json produce safe status 'insufficient' without hallucinations."""
+    dev_path = repo_root / "data" / "evaluation" / "dev_questions.json"
+    dev_questions = json.loads(dev_path.read_text(encoding="utf-8"))["questions"]
+    q_lookup = {q["question_id"]: q for q in dev_questions}
+    unsupported_ids = ["TRV-010", "FIN-010", "PPO-010", "PRC-010", "SEC-010"]
+
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
@@ -795,25 +794,59 @@ def test_all_five_unsupported_diagnostics_refuse_as_insufficient(canonical_corpu
     retriever.search.return_value = []
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
-    cases = [
-        ("Can employees expense personal spa treatments during business trips?", "employee", "2026-11-22"),
-        ("What is the reimbursement limit for purchasing luxury watches?", "employee", "2026-11-22"),
-        ("Can employees bring their personal pets to work every day?", "employee", "2026-11-22"),
-        ("Can departments procure jet planes without procurement committee approval?", "employee", "2026-11-22"),
-        ("Can employees connect personal smart-home IoT lightbulbs and voice assistants to the corporate internal corporate network?", "employee", "2026-11-22"),
-    ]
-
-    for q, role, dt in cases:
+    for qid in unsupported_ids:
+        item = q_lookup[qid]
         res = answer_question(
-            question=q,
-            role=role,
-            query_date=dt,
+            question=item["question"],
+            role=item["role"],
+            query_date=item["query_date"],
             retriever=retriever,
             llm_client=mock_llm,
         )
-        assert res.status == "insufficient", f"Expected insufficient for query: {q}"
+        assert res.status == "insufficient", f"Expected insufficient for {qid}: {item['question']}"
         assert res.citations == []
+        assert res.provider_calls_attempted == 0
         mock_llm.generate_answer.assert_not_called()
+
+
+def test_deterministic_booking_notice_query_bypasses_groq_with_none_schema(canonical_corpus, canonical_chunks_by_id):
+    """Booking notice query (14 days) succeeds authoritatively with R-TRV-005, citation DOC-TRV-003_TRV-B02, and schema_valid=None."""
+    c = canonical_chunks_by_id["DOC-TRV-003_TRV-B02"]
+    b02 = RetrievalResult(
+        chunk_id=c["chunk_id"],
+        text=c["text"],
+        doc_id=c["doc_id"],
+        clause_id=c["clause_id"],
+        title=c["title"],
+        department=c["department"],
+        version=c["version"],
+        source_file=c["source_file"],
+        source_page=int(c["source_page"]),
+        effective_from=c["effective_from"],
+        effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    retriever = MagicMock()
+    retriever.chunks = canonical_corpus
+    retriever.chunks_by_id = canonical_chunks_by_id
+    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.search.return_value = [b02]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    res = answer_question(
+        question="Is 14 days notice enough for booking?",
+        role="employee",
+        query_date="2026-11-22",
+        retriever=retriever,
+        llm_client=mock_llm,
+    )
+    assert res.status == "answered"
+    assert res.schema_valid is None
+    assert res.provider_calls_attempted == 0
+    assert res.citations == ["DOC-TRV-003_TRV-B02"]
+    assert "R-TRV-005" in res.referenced_rule_ids
+    assert "14-day policy requirement" in res.answer
+    mock_llm.generate_answer.assert_not_called()
 
 
 # ==============================================================================

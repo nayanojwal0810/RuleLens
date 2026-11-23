@@ -292,8 +292,8 @@ def test_rule_unit_mismatch_marks_is_error(repo_root: Path):
     r_err = next(r for r in res if r.rule.rule_id == "R-TRV-003")
     assert r_err.passed is False
     assert r_err.is_error is True
-    assert r_err.error_type == "invalid_unit"
-    assert r_err.outcome == "invalid_unit"
+    assert r_err.error_type in ("invalid_unit", "incompatible_unit")
+    assert r_err.outcome in ("invalid_unit", "incompatible_unit")
     assert "unit error" in r_err.explanation.lower()
 
 
@@ -502,6 +502,8 @@ def test_authoritative_decision_receipt_boundaries(repo_root: Path):
     assert dec_1k.is_authoritative is True
     assert dec_1k.rule_id == "R-FIN-003"
     assert dec_1k.outcome == "no_receipt_required"
+    assert "do not require an itemized tax receipt, provided digital payment confirmation is attached" in dec_1k.answer
+    assert "No receipt is required" not in dec_1k.answer
 
     # 1,001
     q_1k1 = "Does an incidental expense of INR 1,001 require an itemized receipt?"
@@ -511,6 +513,7 @@ def test_authoritative_decision_receipt_boundaries(repo_root: Path):
     assert dec_1k1.is_authoritative is True
     assert dec_1k1.rule_id == "R-FIN-004"
     assert dec_1k1.outcome == "itemized_receipt_required"
+    assert "itemized tax invoice is strictly required" in dec_1k1.answer
 
 
 def test_authoritative_decision_procurement_boundaries(repo_root: Path):
@@ -612,3 +615,32 @@ def test_threshold_definition_and_multidoc_questions_bypass_authoritative_decisi
     rules_m = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds_m)
     dec_m = evaluate_authoritative_rule_decision(multi_q, mock_chunks, rules_m, conds_m)
     assert dec_m.is_authoritative is False
+
+
+def test_foreign_currency_handling_rejected(repo_root: Path):
+    """Foreign currencies (USD, EUR, GBP, $, €, £) must produce incompatible_unit and cannot produce an INR approval decision."""
+    mock_chunks = [
+        {"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04"},
+        {"chunk_id": "DOC-PRC-001_PRC-P02", "doc_id": "DOC-PRC-001", "clause_id": "PRC-P02"},
+        {"chunk_id": "DOC-FIN-002_FIN-R03", "doc_id": "DOC-FIN-002", "clause_id": "FIN-R03"},
+    ]
+    test_queries = [
+        "Is a single quote permitted for a purchase order of USD 150,001?",
+        "Can an employee submit an expense of EUR 50,000?",
+        "Can an employee submit an expense of $50,000?",
+        "Can an employee submit an expense of €50,000?",
+        "Can an employee submit an expense of £1,000?",
+    ]
+    for q in test_queries:
+        conds = extract_conditions_from_query(q)
+        assert len(conds) >= 1
+        unit = conds[0]["unit"]
+        assert unit in ("USD", "EUR", "GBP")
+        rules = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds)
+        # Check rule results: all matching rules must fail with incompatible_unit
+        incomp_rules = [r for r in rules if r.is_error and r.error_type == "incompatible_unit"]
+        assert len(incomp_rules) > 0
+        # Authoritative decision must reject and not return an authoritative approval
+        dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+        assert dec.is_authoritative is False
+

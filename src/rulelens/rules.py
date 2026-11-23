@@ -337,16 +337,17 @@ def resolve_rules_for_evidence(
             except ValueError as val_err:
                 # Incompatible unit: invalid rule evaluation error
                 explanation = f"Rule {rule.rule_id} unit error: {val_err}"
+                err_type = "incompatible_unit" if "incompatible unit" in str(val_err).lower() else "invalid_unit"
                 results.append(
                     RuleEvaluationResult(
                         rule=rule,
                         passed=False,
                         input_value=val,
                         input_unit=unit or rule.unit,
-                        outcome="invalid_unit",
+                        outcome=err_type,
                         explanation=explanation,
                         is_error=True,
-                        error_type="invalid_unit",
+                        error_type=err_type,
                     )
                 )
             except TypeError as type_err:
@@ -388,7 +389,7 @@ def resolve_rules_for_evidence(
 
 # Regular expressions for conservative condition extraction from natural language questions
 _CURRENCY_PATTERN = re.compile(
-    r"(?:inr|rs\.?|₹)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?:inr|rupees)?",
+    r"(?P<prefix>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?P<suffix>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)?",
     re.IGNORECASE,
 )
 _DAYS_PATTERN = re.compile(
@@ -462,22 +463,48 @@ def extract_conditions_from_query(
     if has_restricted:
         raw_candidates.append({"field": "data_classification_tier", "value": "Restricted", "unit": "tier"})
 
-    # Check for INR currency amounts using Decimal precision directly from string
+    # Check for currency amounts using Decimal precision directly from string
     for match in _CURRENCY_PATTERN.finditer(query):
-        raw_num = match.group(1).replace(",", "")
+        raw_num = match.group(2).replace(",", "")
         try:
             val = Decimal(raw_num)
         except (InvalidOperation, ValueError):
             continue
-        # Exclude calendar years (e.g. 2026) unless explicitly preceded/followed by currency mark
+        prefix = (match.group(1) or "").lower()
+        suffix = (match.group(3) or "").lower()
         span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
-        has_curr_mark = any(k in span for k in ("inr", "rs", "₹", "rupee", "cost", "amount", "spend", "claim", "price"))
-        if 2000 <= val <= 2099 and not any(k in span for k in ("inr", "rs", "₹")):
+
+        # Determine explicit currency unit
+        if prefix in ("$", "usd") or suffix in ("usd", "dollar", "dollars") or any(k in span for k in ("usd", "$", "dollar")):
+            curr_unit = "USD"
+        elif prefix in ("€", "eur") or suffix in ("eur", "euro", "euros") or any(k in span for k in ("eur", "€", "euro")):
+            curr_unit = "EUR"
+        elif prefix in ("£", "gbp") or suffix in ("gbp", "pound", "pounds") or any(k in span for k in ("gbp", "£", "pound")):
+            curr_unit = "GBP"
+        elif prefix in ("₹", "inr", "rs", "rs.") or suffix in ("inr", "rupee", "rupees") or any(k in span for k in ("inr", "rs", "₹", "rupee")):
+            curr_unit = "INR"
+        else:
+            # Check global query currency markers
+            if any(k in q_lower for k in ("usd", "$", "dollar")):
+                curr_unit = "USD"
+            elif any(k in q_lower for k in ("eur", "€", "euro")):
+                curr_unit = "EUR"
+            elif any(k in q_lower for k in ("gbp", "£", "pound")):
+                curr_unit = "GBP"
+            else:
+                curr_unit = "INR"
+
+        has_curr_mark = (
+            prefix != ""
+            or suffix != ""
+            or any(k in span for k in ("inr", "rs", "₹", "rupee", "$", "usd", "dollar", "€", "eur", "euro", "£", "gbp", "pound", "cost", "amount", "spend", "claim", "price"))
+        )
+        if 2000 <= val <= 2099 and not (prefix or suffix or any(k in span for k in ("inr", "rs", "₹", "$", "usd", "€", "eur", "£", "gbp"))):
             continue
         if has_curr_mark:
             field = _determine_currency_field(q_lower, span)
             if field:
-                raw_candidates.append({"field": field, "value": val, "unit": "INR"})
+                raw_candidates.append({"field": field, "value": val, "unit": curr_unit})
 
     # Check for days
     for match in _DAYS_PATTERN.finditer(query):
@@ -622,9 +649,9 @@ def _format_canonical_decision_answer(
     elif outcome == "requires_late_exception":
         return f"A late submission exception approval is required for expense claims submitted after {cond_val} days (exceeding the {thresh}-day deadline)."
     elif outcome == "no_receipt_required":
-        return f"No receipt is required for incidental expenses of {cond_val} {unit} (up to {thresh} {rule.unit})."
+        return f"Incidental business expenses of {cond_val} {unit} (up to {thresh} {rule.unit}) do not require an itemized tax receipt, provided digital payment confirmation is attached."
     elif outcome == "itemized_receipt_required":
-        return f"An itemized receipt or tax invoice is required for expenses of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
+        return f"An itemized tax invoice is strictly required for incidental expenses of {cond_val} {unit} (exceeding {thresh} {rule.unit})."
     elif outcome == "within_standard_card_limit":
         return f"The monthly spend of {cond_val} {unit} is within the standard corporate credit card limit of {thresh} {rule.unit}."
     elif outcome == "card_limit_escalation_required":

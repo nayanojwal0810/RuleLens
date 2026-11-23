@@ -242,7 +242,7 @@ def validate_candidate_evidence(
     cid = c_dict.get("chunk_id")
     if not cid or cid not in canonical_chunks_by_id:
         raise SanitizedProviderError(
-            category="service_unavailable",
+            category="evidence_integrity_error",
             safe_message="Evidence integrity verification failed: unknown chunk ID.",
         )
 
@@ -256,7 +256,7 @@ def validate_candidate_evidence(
     for field in exact_fields:
         if c_dict.get(field) != canonical.get(field):
             raise SanitizedProviderError(
-                category="service_unavailable",
+                category="evidence_integrity_error",
                 safe_message=f"Evidence integrity verification failed for field '{field}'.",
             )
 
@@ -265,7 +265,7 @@ def validate_candidate_evidence(
     can_eff_to = canonical.get("effective_to") or None
     if c_eff_to != can_eff_to:
         raise SanitizedProviderError(
-            category="service_unavailable",
+            category="evidence_integrity_error",
             safe_message="Evidence integrity verification failed for 'effective_to'.",
         )
 
@@ -273,12 +273,12 @@ def validate_candidate_evidence(
     try:
         if int(c_dict.get("source_page", -1)) != int(canonical.get("source_page", -2)):
             raise SanitizedProviderError(
-                category="service_unavailable",
+                category="evidence_integrity_error",
                 safe_message="Evidence integrity verification failed for 'source_page'.",
             )
     except (ValueError, TypeError):
         raise SanitizedProviderError(
-            category="service_unavailable",
+            category="evidence_integrity_error",
             safe_message="Evidence integrity verification failed for 'source_page'.",
         )
 
@@ -287,14 +287,14 @@ def validate_candidate_evidence(
     can_roles = sorted(list(canonical.get("allowed_roles", [])))
     if c_roles != can_roles:
         raise SanitizedProviderError(
-            category="service_unavailable",
+            category="evidence_integrity_error",
             safe_message="Evidence integrity verification failed for 'allowed_roles'.",
         )
 
     # Re-verify eligibility on canonical record
     if not is_chunk_eligible(canonical, role, query_date):
         raise SanitizedProviderError(
-            category="service_unavailable",
+            category="evidence_integrity_error",
             safe_message="Evidence authorization verification failed.",
         )
 
@@ -560,8 +560,8 @@ def answer_question(
 
     ev_fingerprint = build_evidence_fingerprint(authorized_chunks, corpus_fp)
 
-    # Step F: Safe refusal if authorized evidence is empty or cannot support the query
-    if not authorized_chunks or not check_evidence_support(cleaned_question, authorized_chunks):
+    # Step F: Safe refusal if authorized evidence is empty
+    if not authorized_chunks:
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -676,8 +676,29 @@ def answer_question(
             provider_calls_attempted=0,
             provider_latency_ms=None,
             token_usage=None,
-            schema_valid=True,
+            schema_valid=None,
             has_incomplete_tokens=False,
+        )
+
+    # Step G.2: Lexical evidence-support gate for open-ended LLM generation
+    if not check_evidence_support(cleaned_question, authorized_chunks):
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The provided corporate policies do not contain sufficient evidence to answer this question.",
+            status=AnswerStatus.INSUFFICIENT.value,
+            reason="Retrieved evidence does not contain information supporting the requested policy facts.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
         )
 
     # Step H: Call Groq LLM

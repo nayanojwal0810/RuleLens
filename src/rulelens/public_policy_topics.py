@@ -23,7 +23,7 @@ class PolicyTopicDefinition(NamedTuple):
 # Approved catalog of public, non-sensitive policy topics keyed by document ID.
 # Only covers high-level governance areas; contains NO clause text or confidential data.
 PUBLIC_POLICY_TOPIC_CATALOG: Dict[str, List[PolicyTopicDefinition]] = {
-    # DOC-SEC-004: Data Retention Policy (authorized roles: security, auditor)
+    # DOC-SEC-004: Data Retention Policy
     # Covers storage media sanitization, decommissioning, and physical destruction.
     "DOC-SEC-004": [
         PolicyTopicDefinition(
@@ -83,7 +83,7 @@ PUBLIC_POLICY_TOPIC_CATALOG: Dict[str, List[PolicyTopicDefinition]] = {
             ),
         ),
     ],
-    # DOC-TRV-004: Travel Exceptions Policy (authorized roles: manager, finance, hr, auditor)
+    # DOC-TRV-004: Travel Exceptions Policy
     "DOC-TRV-004": [
         PolicyTopicDefinition(
             doc_id="DOC-TRV-004",
@@ -99,7 +99,7 @@ PUBLIC_POLICY_TOPIC_CATALOG: Dict[str, List[PolicyTopicDefinition]] = {
             ),
         ),
     ],
-    # DOC-FIN-003: Corporate Cards Policy (authorized roles: manager, finance, auditor)
+    # DOC-FIN-003: Corporate Cards Policy
     "DOC-FIN-003": [
         PolicyTopicDefinition(
             doc_id="DOC-FIN-003",
@@ -117,7 +117,7 @@ PUBLIC_POLICY_TOPIC_CATALOG: Dict[str, List[PolicyTopicDefinition]] = {
             ),
         ),
     ],
-    # DOC-PPO-004: Employee Transfers Policy (authorized roles: employee, manager, hr)
+    # DOC-PPO-004: Employee Transfers Policy
     "DOC-PPO-004": [
         PolicyTopicDefinition(
             doc_id="DOC-PPO-004",
@@ -134,7 +134,7 @@ PUBLIC_POLICY_TOPIC_CATALOG: Dict[str, List[PolicyTopicDefinition]] = {
             ),
         ),
     ],
-    # DOC-PRC-002: Vendor Onboarding Policy (authorized roles: manager, finance, procurement, auditor)
+    # DOC-PRC-002: Vendor Onboarding Policy
     "DOC-PRC-002": [
         PolicyTopicDefinition(
             doc_id="DOC-PRC-002",
@@ -163,7 +163,10 @@ def _extract_stemmed_tokens(text: str) -> Set[str]:
     words = re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
     stems = set(words)
     for w in words:
-        stems.add(w.rstrip("s").rstrip("ing").rstrip("ed"))
+        for suffix in ("ing", "ed", "es", "s"):
+            if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+                stems.add(w[:-len(suffix)])
+                break
     return stems
 
 
@@ -206,10 +209,15 @@ def match_public_policy_topics(query: str) -> List[Tuple[str, int]]:
                 matched_in_group = query_tokens.intersection(group)
                 if not matched_in_group:
                     # Also check simple stem overlap
-                    matched_stem = any(
-                        w.rstrip("s").rstrip("ing").rstrip("ed") in group
-                        for w in query_tokens
-                    )
+                    matched_stem = False
+                    for w in query_tokens:
+                        for suffix in ("ing", "ed", "es", "s"):
+                            if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+                                if w[:-len(suffix)] in group:
+                                    matched_stem = True
+                                    break
+                        if matched_stem:
+                            break
                     if not matched_stem:
                         all_groups_matched = False
                         break

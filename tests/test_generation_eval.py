@@ -961,3 +961,137 @@ def test_reconcile_stage_e_evaluations_missing_file(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError):
         reconcile_stage_e_evaluations(valid_file, missing)
+
+
+def test_reconcile_stage_e_evaluations_duplicate_qid_rejected(tmp_path: Path):
+    """reconcile_stage_e_evaluations rejects duplicate question IDs within a run."""
+    base_file = tmp_path / "base.json"
+    rem_file = tmp_path / "rem.json"
+
+    base_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [
+            {"question_id": "Q1", "status": "answered", "answerability": True},
+            {"question_id": "Q1", "status": "answered", "answerability": True},
+        ],
+    }
+    rem_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [
+            {"question_id": "Q2", "status": "answered", "answerability": True},
+        ],
+    }
+    base_file.write_text(json.dumps(base_data), encoding="utf-8")
+    rem_file.write_text(json.dumps(rem_data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Duplicate question ID"):
+        reconcile_stage_e_evaluations(base_file, rem_file, subset_question_ids=["Q1", "Q2"])
+
+
+def test_reconcile_stage_e_evaluations_unexpected_qid_rejected(tmp_path: Path):
+    """reconcile_stage_e_evaluations rejects question IDs not in target_ids."""
+    base_file = tmp_path / "base.json"
+    rem_file = tmp_path / "rem.json"
+
+    base_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [
+            {"question_id": "UNEXPECTED_ID", "status": "answered", "answerability": True},
+        ],
+    }
+    rem_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [],
+    }
+    base_file.write_text(json.dumps(base_data), encoding="utf-8")
+    rem_file.write_text(json.dumps(rem_data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unexpected question ID"):
+        reconcile_stage_e_evaluations(base_file, rem_file, subset_question_ids=["Q1"])
+
+
+def test_reconcile_stage_e_evaluations_invalid_replacement_rejected(tmp_path: Path):
+    """reconcile_stage_e_evaluations rejects replacement of previously successful question."""
+    base_file = tmp_path / "base.json"
+    rem_file = tmp_path / "rem.json"
+
+    # Q1 was successfully answered in base run
+    base_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [
+            {"question_id": "Q1", "status": "answered", "answerability": True, "provider_error": False},
+        ],
+    }
+    # Continuation attempts to replace Q1
+    rem_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [
+            {"question_id": "Q1", "status": "answered", "answerability": True, "provider_error": False},
+        ],
+    }
+    base_file.write_text(json.dumps(base_data), encoding="utf-8")
+    rem_file.write_text(json.dumps(rem_data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="previously successful question"):
+        reconcile_stage_e_evaluations(base_file, rem_file, subset_question_ids=["Q1"])
+
+
+def test_reconcile_stage_e_evaluations_completed_with_errors_and_provenance(tmp_path: Path):
+    """reconcile_stage_e_evaluations sets completed_with_errors when final result has failure and writes provenance note."""
+    base_file = tmp_path / "base.json"
+    rem_file = tmp_path / "rem.json"
+
+    base_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [
+            {"question_id": "Q1", "status": "operational_error", "provider_error": True, "answerability": True},
+        ],
+    }
+    rem_data = {
+        "model": "openai/gpt-oss-20b",
+        "per_question_results": [],
+    }
+    base_file.write_text(json.dumps(base_data), encoding="utf-8")
+    rem_file.write_text(json.dumps(rem_data), encoding="utf-8")
+
+    reconciled = reconcile_stage_e_evaluations(base_file, rem_file, subset_question_ids=["Q1"])
+    assert reconciled["evaluation_state"] == "completed_with_errors"
+    assert reconciled["provider_failures"] == 1
+    assert "Historical evaluation result files do not record top-level corpus_fingerprint" in reconciled["provenance_note"]
+
+
+def test_evaluate_single_question_evidence_integrity_error(dev_dataset: Dict[str, Any], mock_retriever):
+    """evaluate_single_question marks evidence_validation_failure=True when error_category is evidence_integrity_error."""
+    from rulelens.answering import GenerationResult
+    # Diagnostic question calls answer_question
+    q_diag = next(q for q in dev_dataset["questions"] if not q["answerability"])
+
+    with patch("rulelens.generation_eval.answer_question") as mock_answer:
+        mock_answer.return_value = GenerationResult(
+            question=q_diag["question"],
+            role=q_diag["role"],
+            query_date=q_diag["query_date"],
+            answer="Evidence integrity failed.",
+            status="operational_error",
+            reason="Corrupted candidate evidence.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model="openai/gpt-oss-20b",
+            corpus_fingerprint="test_fp",
+            evidence_fingerprint={},
+            latency_ms=10.0,
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+            error_category="evidence_integrity_error",
+            error="Evidence integrity failed.",
+        )
+        res = evaluate_single_question(
+            question_data=q_diag,
+            retriever=mock_retriever,
+            llm_client=MagicMock(),
+        )
+        assert res["status"] == "operational_error"
+        assert res["evidence_validation_failure"] is True
+        assert res["provider_error"] is False
+        assert res["citation_validation_failure"] is False

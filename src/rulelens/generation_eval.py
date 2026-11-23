@@ -181,15 +181,15 @@ def evaluate_single_question(
         evidence_val_failure = False
 
         if app_result.status == "operational_error":
-            if app_result.error_category == "invalid_citation":
+            if app_result.error_category == "evidence_integrity_error":
+                evidence_val_failure = True
+            elif app_result.error_category == "invalid_citation":
                 cit_val_failure = True
             elif (
                 app_result.error_category in ("rate_limited", "authentication_error", "timeout", "invalid_generation")
                 or (app_result.provider_calls_attempted is not None and app_result.provider_calls_attempted > 0)
             ):
                 provider_err = True
-            elif app_result.error_category == "evidence_integrity_error":
-                evidence_val_failure = True
             else:
                 other_op_err = True
 
@@ -564,15 +564,15 @@ def evaluate_single_question(
         evidence_val_failure = False
 
         if app_result.status == "operational_error":
-            if app_result.error_category == "invalid_citation":
+            if app_result.error_category == "evidence_integrity_error":
+                evidence_val_failure = True
+            elif app_result.error_category == "invalid_citation":
                 cit_val_failure = True
             elif (
                 app_result.error_category in ("rate_limited", "authentication_error", "timeout", "invalid_generation")
                 or (app_result.provider_calls_attempted is not None and app_result.provider_calls_attempted > 0)
             ):
                 provider_err = True
-            elif app_result.error_category == "evidence_integrity_error":
-                evidence_val_failure = True
             else:
                 other_op_err = True
 
@@ -948,30 +948,30 @@ def generate_reconciled_markdown(summary: Dict[str, Any]) -> str:
         f"- **Reconciliation Timestamp**: `{summary['timestamp']}`",
         f"- **Model**: `{summary['model']}`",
         f"- **Dense Retrieval Backend**: `{summary.get('retrieval_backend', 'local')}`",
-        "- **Evaluation Status**: **COMPLETED** (Reconciled from 26-question primary run + 5-question continuation run)",
+        f"- **Evaluation Status**: **{summary.get('evaluation_state', 'completed').upper()}** (Reconciled from primary run + continuation run)",
         f"- **Planned Questions**: {summary['planned_questions']}",
-        f"- **Unique Questions Evaluated**: {completed} (100% of planned 30 questions)",
+        f"- **Unique Questions Evaluated**: {completed} (100% of planned {summary['planned_questions']} questions)",
         f"- **Answerable Questions Evaluated**: {ans_count} (Gold-evidence grounded generation)",
         f"- **Diagnostic Questions Evaluated**: {diag_count} (Restricted: {restr_count}, Unsupported: {unsupp_count})",
         f"- **Historical Retry Attempts**: {retries_count} (SEC-003 initial HTTP 429 rate limit recorded in historical audit)",
         f"- **Total Provider Requests (with retries)**: {prov_reqs}",
         f"- **Total Known Tokens Consumed**: {summary.get('total_tokens_consumed', summary.get('tokens_used', 0))}",
-        "- **Corpus Integrity**: Fingerprint match verified against canonical corpus",
+        f"- **Corpus Integrity**: {summary.get('provenance_note') or 'Fingerprint match verified against canonical corpus'}",
         "- **Factual Correctness Status**: `not_reviewed` (Awaiting independent human/expert review)",
         "",
         "## 2. Quantitative Summary",
         "",
         "| Metric | Result | Target |",
         "|---|:---:|:---:|",
-        f"| **Unique Questions Completed** | {completed} / {summary['planned_questions']} (100.0%) | 30 / 30 |",
+        f"| **Unique Questions Completed** | {completed} / {summary['planned_questions']} (100.0%) | {summary['planned_questions']} / {summary['planned_questions']} |",
         f"| **Schema Validity (Groq)** | {format_rate(summary['schema_valid_generations'], generations_att)} | 100% |",
         f"| **Citation Validity (Answerable)** | {format_rate(summary['citation_valid_generations'], cit_denom)} | 100% |",
         f"| **Restricted Refusal Success** | {format_rate(summary['restricted_refusal_successes'], restr_count)} | 100% |",
         f"| **Unsupported Refusal Success** | {format_rate(summary['unsupported_refusal_successes'], unsupp_count)} | 100% |",
-        f"| **Provider Failures (Final Outcome)** | 0 | 0 |",
-        f"| **Evidence Validation Failures** | 0 | 0 |",
-        f"| **Citation Validation Failures** | 0 | 0 |",
-        f"| **Other Operational Failures** | 0 | 0 |",
+        f"| **Provider Failures (Final Outcome)** | {summary.get('provider_failures', 0)} | 0 |",
+        f"| **Evidence Validation Failures** | {summary.get('evidence_validation_failures', 0)} | 0 |",
+        f"| **Citation Validation Failures** | {summary.get('citation_validation_failures', 0)} | 0 |",
+        f"| **Other Operational Failures** | {summary.get('other_operational_failures', 0)} | 0 |",
         f"| **Incorrect Refusals** | {summary.get('incorrect_refusals', 0)} (SEC-009 in historical run) | 0 |",
         f"| **Total Provider Requests Attempted** | {prov_reqs} (includes 1 rate-limited attempt) | Monitored |",
         f"| **Median E2E Latency** | {summary['median_e2e_latency_ms']} ms | < 2500 ms |",
@@ -1013,6 +1013,7 @@ def reconcile_stage_e_evaluations(
     output_json_path: Optional[Union[Path, str]] = None,
     output_md_path: Optional[Union[Path, str]] = None,
     subset_question_ids: Optional[Sequence[str]] = None,
+    base_dir: Optional[Union[Path, str]] = None,
 ) -> Dict[str, Any]:
     """Reconcile Stage E partial evaluation with continuation run.
 
@@ -1032,6 +1033,11 @@ def reconcile_stage_e_evaluations(
     primary_data = json.loads(p_path.read_text(encoding="utf-8"))
     cont_data = json.loads(c_path.read_text(encoding="utf-8"))
 
+    if not isinstance(primary_data, dict) or "per_question_results" not in primary_data or not isinstance(primary_data["per_question_results"], list):
+        raise ValueError("Invalid primary evaluation JSON format: must contain 'per_question_results' list")
+    if not isinstance(cont_data, dict) or "per_question_results" not in cont_data or not isinstance(cont_data["per_question_results"], list):
+        raise ValueError("Invalid continuation evaluation JSON format: must contain 'per_question_results' list")
+
     # Verification checks
     if primary_data.get("model") != cont_data.get("model"):
         raise ValueError(
@@ -1043,13 +1049,82 @@ def reconcile_stage_e_evaluations(
     primary_qs = primary_data.get("per_question_results", [])
     cont_qs = cont_data.get("per_question_results", [])
 
+    target_ids = list(subset_question_ids) if subset_question_ids is not None else list(DEV_SUBSET_QUESTION_IDS)
+    target_id_set = set(target_ids)
+
+    # 1. Reject duplicate question IDs within either run
+    p_ids = [q["question_id"] for q in primary_qs]
+    if len(p_ids) != len(set(p_ids)):
+        raise ValueError("Duplicate question ID found within primary evaluation run")
+    c_ids = [q["question_id"] for q in cont_qs]
+    if len(c_ids) != len(set(c_ids)):
+        raise ValueError("Duplicate question ID found within continuation evaluation run")
+
+    # 2. Reject unexpected question IDs not in target_ids
+    for qid in p_ids:
+        if qid not in target_id_set:
+            raise ValueError(f"Unexpected question ID '{qid}' in primary run")
+    for qid in c_ids:
+        if qid not in target_id_set:
+            raise ValueError(f"Unexpected question ID '{qid}' in continuation run")
+
+    # 3. Require continuation to replace ONLY previously failed questions
+    primary_by_qid = {q["question_id"]: q for q in primary_qs}
+    for q in cont_qs:
+        qid = q["question_id"]
+        if qid in primary_by_qid:
+            prev = primary_by_qid[qid]
+            is_prev_failed = (
+                prev.get("status") == "operational_error"
+                or prev.get("provider_error", False)
+                or prev.get("error_category") == "rate_limited"
+            )
+            if not is_prev_failed:
+                raise ValueError(
+                    f"Continuation run attempts to replace previously successful question '{qid}'."
+                )
+
+    # 4. Verify question metadata against dev_questions.json if available
+    root_dir = Path(base_dir) if base_dir is not None else Path.cwd()
+    dev_q_path = root_dir / "data" / "evaluation" / "dev_questions.json"
+    if dev_q_path.is_file():
+        dev_data = json.loads(dev_q_path.read_text(encoding="utf-8"))
+        dev_list = dev_data.get("questions", []) if isinstance(dev_data, dict) else dev_data
+        dev_lookup = {q["question_id"]: q for q in dev_list if isinstance(q, dict) and "question_id" in q}
+        for q in primary_qs + cont_qs:
+            qid = q.get("question_id")
+            if qid in dev_lookup:
+                canon = dev_lookup[qid]
+                if q.get("role") != canon.get("role"):
+                    raise ValueError(f"Metadata role mismatch for question '{qid}': '{q.get('role')}' vs '{canon.get('role')}'")
+                if q.get("query_date") != canon.get("query_date"):
+                    raise ValueError(f"Metadata query_date mismatch for question '{qid}': '{q.get('query_date')}' vs '{canon.get('query_date')}'")
+                if bool(q.get("answerability")) != bool(canon.get("answerability")):
+                    raise ValueError(f"Metadata answerability mismatch for question '{qid}': '{q.get('answerability')}' vs '{canon.get('answerability')}'")
+
+    # 5. Check corpus fingerprints when recorded; report provenance note
+    p_fp = primary_data.get("corpus_fingerprint")
+    c_fp = cont_data.get("corpus_fingerprint")
+    if p_fp and c_fp:
+        if p_fp != c_fp:
+            raise ValueError(f"Corpus fingerprint mismatch: '{p_fp}' vs '{c_fp}'")
+        provenance_note = f"Corpus fingerprint match verified: {p_fp}"
+    elif p_fp or c_fp:
+        fp = p_fp or c_fp
+        provenance_note = f"Corpus fingerprint verified: {fp}"
+    else:
+        provenance_note = (
+            "Historical evaluation result files do not record top-level corpus_fingerprint; "
+            "metadata cross-verified against canonical dev_questions.json."
+        )
+
     # Map results by question ID; continuation results supersede failed/earlier attempts
     final_by_qid: Dict[str, Dict[str, Any]] = {}
     historical_attempts: List[Dict[str, Any]] = []
 
     for q in primary_qs:
         qid = q["question_id"]
-        if q.get("status") == "operational_error" and q.get("error_category") == "rate_limited":
+        if any(cq["question_id"] == qid for cq in cont_qs):
             historical_attempts.append(q)
         else:
             final_by_qid[qid] = q
@@ -1058,7 +1133,6 @@ def reconcile_stage_e_evaluations(
         qid = q["question_id"]
         final_by_qid[qid] = q
 
-    target_ids = list(subset_question_ids) if subset_question_ids is not None else list(DEV_SUBSET_QUESTION_IDS)
     reconciled_results = [final_by_qid[qid] for qid in target_ids if qid in final_by_qid]
     if len(reconciled_results) != len(target_ids):
         raise ValueError(f"Expected {len(target_ids)} unique questions in reconciled report, found {len(reconciled_results)}.")
@@ -1096,6 +1170,21 @@ def reconcile_stage_e_evaluations(
         if r.get("citation_expected", False) and r.get("citation_valid", False)
     )
 
+    provider_failures = sum(1 for r in reconciled_results if r.get("provider_error", False))
+    evidence_validation_failures = sum(1 for r in reconciled_results if r.get("evidence_validation_failure", False))
+    citation_validation_failures = sum(1 for r in reconciled_results if r.get("citation_validation_failure", False))
+    other_operational_failures = sum(1 for r in reconciled_results if r.get("other_operational_failure", False))
+
+    has_final_errors = any(
+        r.get("status") == "operational_error"
+        or r.get("provider_error", False)
+        or r.get("evidence_validation_failure", False)
+        or r.get("citation_validation_failure", False)
+        or r.get("other_operational_failure", False)
+        for r in reconciled_results
+    )
+    evaluation_state = "completed_with_errors" if has_final_errors else "completed"
+
     prov_req_primary = primary_data.get("actual_provider_requests") or primary_data.get("generation_calls")
     if prov_req_primary is None:
         prov_req_primary = sum(q.get("provider_calls_attempted", 0) or 0 for q in primary_qs)
@@ -1128,9 +1217,11 @@ def reconcile_stage_e_evaluations(
     reconciled_summary = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "model": primary_data.get("model", GENERATION_MODEL),
-        "evaluation_state": "completed",
+        "evaluation_state": evaluation_state,
         "stop_reason": None,
         "retrieval_backend": primary_data.get("retrieval_backend", "local"),
+        "provenance_note": provenance_note,
+        "corpus_fingerprint": p_fp or c_fp,
         "planned_questions": planned_questions,
         "completed_questions": completed_questions,
         "unique_questions_evaluated": completed_questions,
@@ -1143,11 +1234,11 @@ def reconcile_stage_e_evaluations(
         "unsupported_refusal_successes": unsupp_successes,
         "incorrect_refusals": sum(1 for r in diag_results if not r.get("refusal_correct", False)),
         "incorrect_answers": sum(1 for r in ans_results if r["status"] != "answered"),
-        "provider_errors": 0,
-        "provider_failures": 0,
-        "evidence_validation_failures": 0,
-        "citation_validation_failures": 0,
-        "other_operational_failures": 0,
+        "provider_errors": provider_failures,
+        "provider_failures": provider_failures,
+        "evidence_validation_failures": evidence_validation_failures,
+        "citation_validation_failures": citation_validation_failures,
+        "other_operational_failures": other_operational_failures,
         "generations_attempted": generations_attempted,
         "schema_valid_generations": schema_valid_gens,
         "citation_expected_count": cit_expected_count,
@@ -1155,6 +1246,7 @@ def reconcile_stage_e_evaluations(
         "total_provider_requests_attempted": total_prov_requests,
         "total_tokens_consumed": total_tokens,
         "known_tokens_used": total_tokens,
+        "tokens_used": total_tokens,
         "known_tokens_incomplete": primary_data.get("known_tokens_incomplete", False) or cont_data.get("known_tokens_incomplete", False),
         "median_e2e_latency_ms": round(median_e2e, 2),
         "median_provider_latency_ms": round(median_prov, 2),

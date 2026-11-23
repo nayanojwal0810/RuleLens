@@ -30,6 +30,7 @@ SANITIZED_ERROR_CATEGORIES = {
     "service_unavailable",
     "invalid_generation",
     "invalid_citation",
+    "evidence_integrity_error",
 }
 
 
