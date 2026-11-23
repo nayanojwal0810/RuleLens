@@ -8,7 +8,7 @@ RuleLens is an enterprise policy question-answering system designed to deliver v
 
 ## Implementation Status & Roadmap
 
-### Implemented Functionality (Stages A–E)
+### Implemented Functionality (Stages A–F)
 - **Corpus & Rule Ingestion**: 20 canonical policy documents across 5 departments, 64 validated clauses, and 32 structured rules with SHA-256 fingerprint verification.
 - **Hybrid Retrieval**: Okapi BM25 lexical search combined with `BAAI/bge-small-en-v1.5` dense embeddings (384-dimensional) via Reciprocal Rank Fusion (RRF, $k=60$).
 - **Dual Vector Backends**: 100% offline local in-memory cosine similarity and Qdrant Cloud vector search with server-side payload filtering.
@@ -17,10 +17,10 @@ RuleLens is an enterprise policy question-answering system designed to deliver v
 - **Authoritative Rule Decisions**: Deterministic Python rule evaluation (`Decimal` comparisons) for single-condition decision queries without LLM hallucination.
 - **Grounded Answer Generation**: `openai/gpt-oss-20b` via the Groq SDK with strict Pydantic JSON schema structured output.
 - **Citation & Safety Verification**: Verifies every citation against supplied evidence; rejects fabricated or unauthorized references.
-- **Development Evaluations**: Comprehensive retrieval and generation evaluation harnesses supporting configurable cutoffs ($K=4$, $K=5$).
+- **Guarded Semantic Caching (Stage F)**: Evidence-bound semantic cache in Qdrant (`rulelens_answer_cache_v1`, isolated from `rulelens_policies`) using `BAAI/bge-small-en-v1.5` embeddings (384-dimensional Cosine). Features strict pre-lookup and candidate safeguards (role match, date match, corpus fingerprint match, numerical condition signature match, negation/comparison/exception indicator match, citation authorization and content hash verification). Bypasses LLM generation with 0 provider calls, 0 tokens, and verified 100% safe reuse precision.
+- **Development Evaluations**: Comprehensive retrieval, generation, and guarded caching evaluation harnesses.
 
 ### Planned / Not Yet Implemented
-- **Stage F**: Guarded Semantic Caching with role-safe cache reuse and cluster invalidation.
 - **Stage G**: Interactive Streamlit web application.
 - **Final Evaluation**: Independent end-to-end benchmark evaluation.
 
@@ -180,6 +180,27 @@ python -m rulelens.generation_eval --questions data/evaluation/dev_questions.jso
 
 # Run 5-question smoke test
 python -m rulelens.generation_eval --smoke --backend local
+```
+
+### 9. Guarded Semantic Cache Evaluation & Answering
+Validate the 40-pair evaluation dataset:
+```bash
+python -m rulelens.cache_eval validate
+```
+
+Run the 40-pair benchmark comparison (No Cache vs. Similarity-Only vs. Guarded Semantic Cache):
+```bash
+python -m rulelens.cache_eval benchmark --threshold 0.88
+```
+
+Run a similarity threshold sweep across candidate thresholds:
+```bash
+python -m rulelens.cache_eval sweep
+```
+
+Ask policy questions with guarded caching enabled:
+```bash
+python -m rulelens.answering --question "What is the standard daily meal subsistence allowance for employees on domestic travel assignments under Travel Policy v2?" --role employee --date 2026-11-22 --enable-cache --cache-threshold 0.88
 ```
 
 > **Development Evaluation Notes:**

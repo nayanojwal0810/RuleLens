@@ -18,10 +18,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from rulelens.config import (
+    CACHE_DEFAULT_SIMILARITY_THRESHOLD,
     GENERATION_EVIDENCE_LIMIT,
     GENERATION_MODEL,
     GROQ_API_KEY,
+    QDRANT_CACHE_COLLECTION_NAME,
+    get_cache_similarity_threshold,
     get_env_var,
+    is_cache_enabled,
 )
 from rulelens.dataset import ROLES
 from rulelens.llm import (
@@ -39,6 +43,7 @@ from rulelens.public_policy_topics import match_public_policy_topics
 from rulelens.qdrant_store import get_qdrant_client
 from rulelens.retrieval import (
     ALLOWED_ROLES_SET,
+    BGEEmbedder,
     HybridRetriever,
     RetrievalResult,
     is_chunk_eligible,
@@ -51,6 +56,12 @@ from rulelens.rules import (
     evaluate_authoritative_rule_decision,
     extract_conditions_from_query,
     resolve_rules_for_evidence,
+)
+from rulelens.cache import (
+    CacheLookupResult,
+    ensure_cache_collection,
+    insert_cache_entry,
+    lookup_cache,
 )
 
 
@@ -100,6 +111,13 @@ class GenerationResult:
     has_incomplete_tokens: bool = False
     error_category: Optional[str] = None
     error: Optional[str] = None
+    # Stage F: Cache telemetry
+    cache_enabled: bool = False
+    cache_hit: bool = False
+    cache_similarity: Optional[float] = None
+    cache_rejection_reason: Optional[str] = None
+    cache_lookup_latency_ms: Optional[float] = None
+    cache_entry_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -108,6 +126,12 @@ class GenerationResult:
         d["token_usage"] = _safe_int(self.token_usage, default=None)
         d["schema_valid"] = self.schema_valid if isinstance(self.schema_valid, bool) else None
         d["has_incomplete_tokens"] = bool(self.has_incomplete_tokens) if isinstance(self.has_incomplete_tokens, bool) else False
+        d["cache_enabled"] = bool(self.cache_enabled)
+        d["cache_hit"] = bool(self.cache_hit)
+        d["cache_similarity"] = _safe_float(self.cache_similarity)
+        d["cache_rejection_reason"] = self.cache_rejection_reason
+        d["cache_lookup_latency_ms"] = _safe_float(self.cache_lookup_latency_ms)
+        d["cache_entry_id"] = self.cache_entry_id
         return d
 
 
@@ -378,6 +402,10 @@ def answer_question(
     candidate_depth: int = 20,
     mode: str = "hybrid",
     dense_backend: str = "local",
+    cache_client: Optional[Any] = None,
+    cache_enabled: Optional[bool] = None,
+    cache_threshold: Optional[float] = None,
+    embedder: Optional[BGEEmbedder] = None,
 ) -> GenerationResult:
     """Answer an enterprise policy question using verified retrieval, rules, and Groq.
 
@@ -737,6 +765,82 @@ def answer_question(
             provider_latency_ms=None,
         )
 
+    # Step G.4: Guarded semantic cache lookup
+    is_cache_active = cache_enabled if cache_enabled is not None else is_cache_enabled()
+    active_cache_client = cache_client or qdrant_client
+    active_embedder = embedder
+    if is_cache_active and active_embedder is None:
+        dense_ret = getattr(active_retriever, "dense_retriever", None)
+        active_embedder = getattr(dense_ret, "embedder", None)
+        if active_embedder is None:
+            try:
+                active_embedder = BGEEmbedder()
+            except Exception:
+                active_embedder = None
+
+    if is_cache_active and active_cache_client is None:
+        try:
+            active_cache_client = get_qdrant_client()
+        except Exception:
+            active_cache_client = None
+
+    cache_lookup_res: Optional[CacheLookupResult] = None
+    if is_cache_active and active_cache_client is not None and active_embedder is not None:
+        eff_threshold = (
+            cache_threshold
+            if cache_threshold is not None
+            else (get_cache_similarity_threshold() or CACHE_DEFAULT_SIMILARITY_THRESHOLD)
+        )
+        try:
+            ensure_cache_collection(active_cache_client)
+            cache_lookup_res = lookup_cache(
+                client=active_cache_client,
+                embedder=active_embedder,
+                question=cleaned_question,
+                role=role,
+                query_date=date_str,
+                corpus_fingerprint=corpus_fp,
+                authorized_chunks=authorized_chunks,
+                extracted_conditions=extracted_conds,
+                rule_results=rule_results,
+                canonical_chunks_by_id=canonical_chunks,
+                similarity_threshold=eff_threshold,
+            )
+            if cache_lookup_res.hit and cache_lookup_res.record:
+                total_latency = (time.perf_counter() - start_total_time) * 1000.0
+                rec = cache_lookup_res.record
+                return GenerationResult(
+                    question=cleaned_question,
+                    role=role,
+                    query_date=date_str,
+                    answer=rec.answer,
+                    status=AnswerStatus.ANSWERED.value,
+                    reason=f"Reused verified answer from semantic cache (entry {rec.entry_id}, similarity {cache_lookup_res.similarity:.4f}).",
+                    citations=rec.cited_chunk_ids,
+                    citation_metadata=rec.citation_metadata,
+                    referenced_rule_ids=rec.referenced_rule_ids,
+                    model=rec.model,
+                    corpus_fingerprint=corpus_fp,
+                    evidence_fingerprint=ev_fingerprint,
+                    latency_ms=round(total_latency, 2),
+                    provider_calls_attempted=0,
+                    provider_latency_ms=None,
+                    token_usage=0,
+                    schema_valid=None,
+                    has_incomplete_tokens=False,
+                    cache_enabled=True,
+                    cache_hit=True,
+                    cache_similarity=cache_lookup_res.similarity,
+                    cache_rejection_reason=None,
+                    cache_lookup_latency_ms=cache_lookup_res.latency_ms,
+                    cache_entry_id=rec.entry_id,
+                )
+        except Exception:
+            cache_lookup_res = CacheLookupResult(
+                hit=False,
+                rejection_reason="cache_lookup_error",
+            )
+
     # Step H: Call Groq LLM
     try:
         active_llm = llm_client or GroqClientWrapper()
@@ -962,6 +1066,31 @@ def answer_question(
             error="Citation validation failed.",
         )
 
+    # Step J: Insert verified answer into semantic cache if eligible
+    inserted_cache_id = None
+    if is_cache_active and active_cache_client is not None and active_embedder is not None:
+        if model_resp.status == AnswerStatus.ANSWERED and val_citations:
+            try:
+                inserted_cache_id = insert_cache_entry(
+                    client=active_cache_client,
+                    embedder=active_embedder,
+                    question=cleaned_question,
+                    answer=model_resp.answer,
+                    status=model_resp.status.value,
+                    role=role,
+                    query_date=date_str,
+                    corpus_fingerprint=corpus_fp,
+                    citations=val_citations,
+                    citation_metadata=val_metadata,
+                    referenced_rule_ids=val_rules,
+                    rule_results=rule_results,
+                    canonical_chunks_by_id=canonical_chunks,
+                    extracted_conditions=extracted_conds,
+                    model=GENERATION_MODEL,
+                )
+            except Exception:
+                inserted_cache_id = None
+
     total_latency = (time.perf_counter() - start_total_time) * 1000.0
 
     return GenerationResult(
@@ -983,6 +1112,12 @@ def answer_question(
         token_usage=toks_used,
         schema_valid=True,
         has_incomplete_tokens=has_inc_toks,
+        cache_enabled=is_cache_active,
+        cache_hit=False,
+        cache_similarity=cache_lookup_res.similarity if cache_lookup_res else None,
+        cache_rejection_reason=cache_lookup_res.rejection_reason if cache_lookup_res else None,
+        cache_lookup_latency_ms=cache_lookup_res.latency_ms if cache_lookup_res else None,
+        cache_entry_id=inserted_cache_id,
     )
 
 
@@ -998,10 +1133,22 @@ def main():
         choices=["local", "qdrant"],
         help="Dense retrieval backend (default: local)",
     )
+    parser.add_argument(
+        "--enable-cache",
+        action="store_true",
+        default=False,
+        help="Enable guarded semantic cache",
+    )
+    parser.add_argument(
+        "--cache-threshold",
+        type=float,
+        default=None,
+        help="Semantic cache similarity threshold (default: 0.90)",
+    )
     args = parser.parse_args()
 
     q_client = None
-    if args.backend == "qdrant":
+    if args.backend == "qdrant" or args.enable_cache:
         try:
             q_client = get_qdrant_client()
         except Exception as exc:
@@ -1015,6 +1162,8 @@ def main():
             query_date=args.date,
             dense_backend=args.backend,
             qdrant_client=q_client,
+            cache_enabled=args.enable_cache,
+            cache_threshold=args.cache_threshold,
         )
     except Exception as exc:
         sanitized = re.sub(r"gsk_[a-zA-Z0-9_-]+", "[REDACTED_API_KEY]", str(exc))
@@ -1037,6 +1186,10 @@ def main():
     print(f"Latency:    {result.latency_ms} ms")
     if result.token_usage:
         print(f"Tokens:     {result.token_usage}")
+    if result.cache_enabled:
+        hit_str = "HIT" if result.cache_hit else f"MISS ({result.cache_rejection_reason or 'uncached'})"
+        sim_str = f" | Similarity: {result.cache_similarity}" if result.cache_similarity is not None else ""
+        print(f"Cache:      {hit_str}{sim_str}")
     if result.error:
         sanitized_err = re.sub(r"gsk_[a-zA-Z0-9_-]+", "[REDACTED_API_KEY]", result.error)
         sanitized_err = re.sub(r"Bearer\s+[^\s]+", "Bearer [REDACTED]", sanitized_err)

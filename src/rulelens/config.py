@@ -11,6 +11,40 @@ QDRANT_API_KEY: str = "QDRANT_API_KEY"
 
 # Qdrant configuration
 QDRANT_COLLECTION_NAME: str = "rulelens_policies"
+QDRANT_CACHE_COLLECTION_NAME: str = "rulelens_answer_cache_v1"
+
+# Semantic cache configuration
+RULELENS_CACHE_ENABLED_VAR: str = "RULELENS_CACHE_ENABLED"
+RULELENS_CACHE_THRESHOLD_VAR: str = "RULELENS_CACHE_THRESHOLD"
+CACHE_DEFAULT_SIMILARITY_THRESHOLD: float = 0.90
+
+
+def is_cache_enabled() -> bool:
+    """Return True if semantic caching is explicitly enabled in the environment.
+
+    Defaults to False until an evaluated similarity threshold is configured.
+    """
+    val = get_env_var(RULELENS_CACHE_ENABLED_VAR, "false")
+    return bool(val and val.strip().lower() in ("true", "1", "yes", "on"))
+
+
+def get_cache_similarity_threshold() -> Optional[float]:
+    """Return the configured similarity threshold for semantic cache candidate lookup.
+
+    Returns None if caching is disabled or no threshold is set.
+    """
+    if not is_cache_enabled():
+        return None
+    val = get_env_var(RULELENS_CACHE_THRESHOLD_VAR)
+    if val is None or not val.strip():
+        return CACHE_DEFAULT_SIMILARITY_THRESHOLD
+    try:
+        thresh = float(val.strip())
+        if 0.0 <= thresh <= 1.0:
+            return thresh
+    except ValueError:
+        pass
+    return CACHE_DEFAULT_SIMILARITY_THRESHOLD
 
 # Model identifiers
 EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
