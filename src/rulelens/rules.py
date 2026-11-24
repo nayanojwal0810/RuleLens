@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -98,14 +99,47 @@ class AuthoritativeDecision:
     reason: Optional[str] = None
     unsupported_terms: Optional[List[str]] = None
     is_boundary_crossing: bool = False
+    is_unresolved: bool = False
+    is_decision_request: bool = False
 
 
 # Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
 _RULES_CACHE: Dict[Path, List[RuleRecord]] = {}
+@dataclass(frozen=True)
+class _RulesCacheEntry:
+    fingerprint: str
+    rules: List[RuleRecord]
+
+
+# Content-fingerprinted cache of loaded rules keyed by base_dir to avoid cross-corpus pollution
+# and stale in-memory reuse when the underlying rules file changes.
+_RULES_CACHE: Dict[Path, _RulesCacheEntry] = {}
+
+
+def clear_rules_cache() -> None:
+    """Clear the in-memory rules cache."""
+    global _RULES_CACHE
+    _RULES_CACHE.clear()
+
+
+def get_rules_fingerprint(base_dir: Optional[Union[Path, str]] = None) -> str:
+    """Compute content fingerprint (SHA-256) of canonical rules file."""
+    base = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+    rules_path = base / "data" / "processed" / "rules.jsonl"
+    if not rules_path.is_file():
+        alt_path = base.parent / "data" / "processed" / "rules.jsonl"
+        if alt_path.is_file():
+            rules_path = alt_path
+        else:
+            raise FileNotFoundError(f"Canonical rules file not found: {rules_path}")
+    return hashlib.sha256(rules_path.read_bytes()).hexdigest()
 
 
 def load_rules(base_dir: Optional[Union[Path, str]] = None, reload: bool = False) -> List[RuleRecord]:
     """Load and validate all 32 canonical rules from rules.jsonl.
+
+    Validates content fingerprint on every call to prevent stale rule reuse
+    when the rules file or validated corpus changes on disk.
 
     Args:
         base_dir: Repository root directory. Defaults to cwd.
@@ -113,11 +147,13 @@ def load_rules(base_dir: Optional[Union[Path, str]] = None, reload: bool = False
 
     Returns:
         List of RuleRecord objects.
+
+    Raises:
+        FileNotFoundError: If rules.jsonl cannot be found.
+        ValueError: If file is malformed or rule count != 32.
     """
     global _RULES_CACHE
     base = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
-    if not reload and base in _RULES_CACHE:
-        return _RULES_CACHE[base]
 
     rules_path = base / "data" / "processed" / "rules.jsonl"
     if not rules_path.is_file():
@@ -128,33 +164,45 @@ def load_rules(base_dir: Optional[Union[Path, str]] = None, reload: bool = False
         else:
             raise FileNotFoundError(f"Canonical rules file not found: {rules_path}")
 
+    # Read raw content to compute content fingerprint
+    raw_bytes = rules_path.read_bytes()
+    content_fingerprint = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Reuse cache only if not reload and content fingerprint matches
+    if not reload and base in _RULES_CACHE:
+        entry = _RULES_CACHE[base]
+        if entry.fingerprint == content_fingerprint:
+            return entry.rules
+
+    # Parse and validate the new content
     rules = []
-    with open(rules_path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            data = json.loads(line)
-            chunk_id = f"{data['doc_id']}_{data['clause_id']}"
-            rule = RuleRecord(
-                rule_id=data["rule_id"],
-                doc_id=data["doc_id"],
-                clause_id=data["clause_id"],
-                chunk_id=chunk_id,
-                condition_field=data["condition_field"],
-                operator=data["operator"],
-                threshold_value=data["threshold_value"],
-                unit=data["unit"],
-                outcome=data["outcome"],
-                effective_from=data["effective_from"],
-                effective_to=data["effective_to"],
-            )
-            rules.append(rule)
+    lines = raw_bytes.decode("utf-8").splitlines()
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        data = json.loads(line)
+        chunk_id = f"{data['doc_id']}_{data['clause_id']}"
+        rule = RuleRecord(
+            rule_id=data["rule_id"],
+            doc_id=data["doc_id"],
+            clause_id=data["clause_id"],
+            chunk_id=chunk_id,
+            condition_field=data["condition_field"],
+            operator=data["operator"],
+            threshold_value=data["threshold_value"],
+            unit=data["unit"],
+            outcome=data["outcome"],
+            effective_from=data["effective_from"],
+            effective_to=data["effective_to"],
+        )
+        rules.append(rule)
 
     if len(rules) != 32:
         raise ValueError(f"Expected 32 canonical rules in {rules_path}, found {len(rules)}.")
 
-    _RULES_CACHE[base] = rules
+    # Only update cache if validation succeeds completely
+    _RULES_CACHE[base] = _RulesCacheEntry(fingerprint=content_fingerprint, rules=rules)
     return rules
 
 
@@ -234,10 +282,16 @@ def evaluate_rule_condition(
             numeric_max = Decimal(str(c_max).strip().replace(",", ""))
             if numeric_min > numeric_max:
                 numeric_min, numeric_max = numeric_max, numeric_min
+            if numeric_min < 0:
+                raise ValueError(f"Negative values ({numeric_min}) are unsupported for policy rules.")
         else:
             clean_val_str = str(value).strip().replace(",", "")
             numeric_val = Decimal(clean_val_str)
+            if numeric_val < 0:
+                raise ValueError(f"Negative values ({numeric_val}) are unsupported for policy rules.")
     except (InvalidOperation, ValueError, TypeError) as exc:
+        if isinstance(exc, ValueError) and "Negative values" in str(exc):
+            raise
         raise TypeError(
             f"Cannot evaluate operator '{rule_op}' with non-numeric value '{value}' and threshold '{threshold}'."
         ) from exc
@@ -363,6 +417,9 @@ def resolve_rules_for_evidence(
                 )
                 if b_res.status == "crossing_outcomes":
                     cond_entry["is_boundary_crossing"] = True
+                elif b_res.status == "cannot_evaluate":
+                    cond_entry["cannot_evaluate"] = True
+                    cond_entry["cannot_evaluate_reason"] = b_res.reason
 
     results: List[RuleEvaluationResult] = []
 
@@ -396,6 +453,34 @@ def resolve_rules_for_evidence(
                         explanation=explanation,
                         is_error=True,
                         error_type="ambiguous_condition",
+                    )
+                )
+                continue
+
+            if cond_entry.get("cannot_evaluate"):
+                reason_str = str(cond_entry.get("cannot_evaluate_reason") or "")
+                if "incompatible unit" in reason_str.lower() or "missing unit" in reason_str.lower():
+                    err_type = "incompatible_unit"
+                    explanation = f"Rule {rule.rule_id} unit error: {reason_str}"
+                elif "unsupported numerical expression" in reason_str.lower() or "non-numeric" in reason_str.lower():
+                    err_type = "invalid_type"
+                    explanation = f"Rule {rule.rule_id} type error: {reason_str}"
+                elif "negative" in reason_str.lower():
+                    err_type = "cannot_evaluate"
+                    explanation = f"Rule {rule.rule_id} condition cannot be evaluated: {reason_str}"
+                else:
+                    err_type = "cannot_evaluate"
+                    explanation = f"Rule {rule.rule_id} condition cannot be evaluated: {reason_str}"
+                results.append(
+                    RuleEvaluationResult(
+                        rule=rule,
+                        passed=False,
+                        input_value=cond_entry.get("value"),
+                        input_unit=rule.unit,
+                        outcome=err_type,
+                        explanation=explanation,
+                        is_error=True,
+                        error_type=err_type,
                     )
                 )
                 continue
@@ -447,16 +532,21 @@ def resolve_rules_for_evidence(
                         )
                     )
             except ValueError as val_err:
-                # Incompatible unit: invalid rule evaluation error
-                explanation = f"Rule {rule.rule_id} unit error: {val_err}"
-                err_type = "incompatible_unit" if "incompatible unit" in str(val_err).lower() else "invalid_unit"
+                # Incompatible unit or negative value: invalid rule evaluation error
+                explanation = f"Rule {rule.rule_id} error: {val_err}"
+                if "incompatible unit" in str(val_err).lower():
+                    err_type = "incompatible_unit"
+                elif "negative value" in str(val_err).lower():
+                    err_type = "unsupported_negative_value"
+                else:
+                    err_type = "invalid_unit"
                 results.append(
                     RuleEvaluationResult(
                         rule=rule,
                         passed=False,
                         input_value=val,
                         input_unit=unit or rule.unit,
-                        outcome=err_type,
+                        outcome="rule_error",
                         explanation=explanation,
                         is_error=True,
                         error_type=err_type,
@@ -501,31 +591,31 @@ def resolve_rules_for_evidence(
 
 # Regular expressions for conservative condition extraction from natural language questions
 _CURRENCY_PATTERN = re.compile(
-    r"(?P<prefix>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?P<suffix>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)?",
+    r"(?P<neg1>-)?\s*(?P<prefix>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*(?P<neg2>-)?\s*(?P<num>[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?P<suffix>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)?",
     re.IGNORECASE,
 )
 _RANGE_CURRENCY_PATTERN = re.compile(
-    r"\b(?:between|from)\s+(?:(?P<pre1>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)\s*)?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?:(?P<suf1>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)\s*)?(?:and|to)\s+(?:(?P<pre2>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)\s*)?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?:(?P<suf2>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?))?\b",
+    r"\b(?:between|from)\s+(?:(?P<neg1>-)?\s*(?P<pre1>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*(?P<neg2>-)?\s*(?P<num1>[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?))\s*(?:(?P<suf1>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)\s*)?(?:and|to)\s+(?:(?P<neg3>-)?\s*(?P<pre2>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*(?P<neg4>-)?\s*(?P<num2>[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?))\s*(?:(?P<suf2>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?))?\b",
     re.IGNORECASE,
 )
 _DAYS_PATTERN = re.compile(
-    r"\b([0-9]+)\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
+    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
     re.IGNORECASE,
 )
 _RANGE_DAYS_PATTERN = re.compile(
-    r"\b(?:between|from)\s+([0-9]+)\s+(?:and|to)\s+([0-9]+)\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
+    r"\b(?:between|from)\s+(?:(?P<neg1>-)?\s*(?P<num1>[0-9]+))\s+(?:and|to)\s+(?:(?P<neg2>-)?\s*(?P<num2>[0-9]+))\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
     re.IGNORECASE,
 )
 _MONTHS_PATTERN = re.compile(
-    r"\b([0-9]+)\s*months?\b",
+    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*months?\b",
     re.IGNORECASE,
 )
 _MBPS_PATTERN = re.compile(
-    r"\b([0-9]+)\s*mbps\b",
+    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*mbps\b",
     re.IGNORECASE,
 )
 _HOURS_PATTERN = re.compile(
-    r"\b([0-9]+)\s*hours?\b",
+    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*hours?\b",
     re.IGNORECASE,
 )
 
@@ -612,9 +702,13 @@ def does_condition_intersect_rule(
             d_max = Decimal(str(c_max).strip().replace(",", ""))
             if d_min > d_max:
                 d_min, d_max = d_max, d_min
+            if d_min < 0 or d_max < 0:
+                return False
         else:
             clean_val = str(value).strip().replace(",", "")
             d_val = Decimal(clean_val)
+            if d_val < 0:
+                return False
     except (InvalidOperation, ValueError, TypeError):
         return False
 
@@ -686,8 +780,11 @@ def analyze_numerical_boundary(
             reason="No active rules provided for numerical boundary evaluation.",
         )
 
+    comp = (comparison or "exact").strip().lower()
+
     # 1. Check unit compatibility across active rules
-    if unit is not None:
+    all_rules_have_unit = all(bool(getattr(r, "unit", None) if isinstance(r, RuleRecord) else r.get("unit")) for r in active_rules)
+    if unit is not None and str(unit).strip():
         for r in active_rules:
             r_unit = r.unit if isinstance(r, RuleRecord) else r["unit"]
             if r_unit and unit.strip().lower() != r_unit.strip().lower():
@@ -695,8 +792,41 @@ def analyze_numerical_boundary(
                     status="cannot_evaluate",
                     reason=f"Incompatible unit '{unit}' for rule. Expected '{r_unit}'.",
                 )
+    elif all_rules_have_unit and (unit is None or not str(unit).strip()):
+        return NumericalBoundaryAnalysis(
+            status="cannot_evaluate",
+            reason="Missing unit for numerical condition.",
+        )
 
     # 2. Check rule intersection (which outcomes does the condition intersect?)
+    # 2. Check for negative or unsupported numerical expressions
+    try:
+        rule_op_0 = active_rules[0].operator if isinstance(active_rules[0], RuleRecord) else active_rules[0]["operator"]
+        if rule_op_0 != "==":
+            if comp == "range":
+                c_min = min_value if min_value is not None else (value[0] if isinstance(value, (list, tuple)) else value)
+                c_max = max_value if max_value is not None else (value[1] if isinstance(value, (list, tuple)) else value)
+                d_min = Decimal(str(c_min).strip().replace(",", ""))
+                d_max = Decimal(str(c_max).strip().replace(",", ""))
+                if d_min < 0 or d_max < 0:
+                    return NumericalBoundaryAnalysis(
+                        status="cannot_evaluate",
+                        reason=f"Negative values [{d_min}, {d_max}] are unsupported for policy rules.",
+                    )
+            elif value is not None:
+                d_val = Decimal(str(value).strip().replace(",", ""))
+                if d_val < 0:
+                    return NumericalBoundaryAnalysis(
+                        status="cannot_evaluate",
+                        reason=f"Negative value '{d_val}' is unsupported for policy rules.",
+                    )
+    except (InvalidOperation, ValueError, TypeError):
+        return NumericalBoundaryAnalysis(
+            status="cannot_evaluate",
+            reason=f"Unsupported numerical expression: '{value}'.",
+        )
+
+    # 3. Check rule intersection (which outcomes does the condition intersect?)
     intersecting = []
     for r in active_rules:
         if does_condition_intersect_rule(r, comparison, value, unit, min_value, max_value):
@@ -843,23 +973,28 @@ def extract_conditions_from_query(
 
     # Check for currency ranges: "between INR 40,000 and 60,000" / "from 40000 to 60000 INR"
     for match in _RANGE_CURRENCY_PATTERN.finditer(query):
-        raw_num1 = match.group(2).replace(",", "")
-        raw_num2 = match.group(5).replace(",", "")
+        raw_num1 = match.group("num1").replace(",", "")
+        raw_num2 = match.group("num2").replace(",", "")
         try:
             val1 = Decimal(raw_num1)
+            if match.group("neg1") or match.group("neg2"):
+                val1 = -val1
             val2 = Decimal(raw_num2)
+            if match.group("neg3") or match.group("neg4"):
+                val2 = -val2
         except (InvalidOperation, ValueError):
             continue
 
         min_val = min(val1, val2)
         max_val = max(val1, val2)
+        cannot_eval = (min_val < 0 or max_val < 0)
         span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
 
         # Determine currency unit
-        p1 = (match.group(1) or "").lower()
-        s1 = (match.group(3) or "").lower()
-        p2 = (match.group(4) or "").lower()
-        s2 = (match.group(6) or "").lower()
+        p1 = (match.group("pre1") or "").lower()
+        s1 = (match.group("suf1") or "").lower()
+        p2 = (match.group("pre2") or "").lower()
+        s2 = (match.group("suf2") or "").lower()
 
         if any(p in ("$", "usd") or s in ("usd", "dollar", "dollars") for p, s in ((p1, s1), (p2, s2))) or any(k in span for k in ("usd", "$", "dollar")):
             curr_unit = "USD"
@@ -880,18 +1015,25 @@ def extract_conditions_from_query(
                 "min_value": min_val,
                 "max_value": max_val,
                 "is_boundary_crossing": False,
+                "cannot_evaluate": cannot_eval,
+                "cannot_evaluate_reason": "Negative values are unsupported for policy rules." if cannot_eval else None,
             })
             covered_spans.append((match.start(), match.end()))
 
     # Check for days ranges: "between 10 and 20 days"
     for match in _RANGE_DAYS_PATTERN.finditer(query):
         try:
-            d1 = int(match.group(1))
-            d2 = int(match.group(2))
-        except ValueError:
+            d1 = int(match.group("num1"))
+            if match.group("neg1"):
+                d1 = -d1
+            d2 = int(match.group("num2"))
+            if match.group("neg2"):
+                d2 = -d2
+        except (ValueError, IndexError):
             continue
         min_d = min(d1, d2)
         max_d = max(d1, d2)
+        cannot_eval = (min_d < 0 or max_d < 0)
         field = None
         if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
             field = "advance_booking_days"
@@ -911,6 +1053,8 @@ def extract_conditions_from_query(
                 "min_value": min_d,
                 "max_value": max_d,
                 "is_boundary_crossing": False,
+                "cannot_evaluate": cannot_eval,
+                "cannot_evaluate_reason": "Negative values are unsupported for policy rules." if cannot_eval else None,
             })
             covered_spans.append((match.start(), match.end()))
 
@@ -920,13 +1064,15 @@ def extract_conditions_from_query(
         if any(start <= match.start() < end for start, end in covered_spans):
             continue
 
-        raw_num = match.group(2).replace(",", "")
+        raw_num = match.group("num").replace(",", "")
         try:
             val = Decimal(raw_num)
+            if match.group("neg1") or match.group("neg2"):
+                val = -val
         except (InvalidOperation, ValueError):
             continue
-        prefix = (match.group(1) or "").lower()
-        suffix = (match.group(3) or "").lower()
+        prefix = (match.group("prefix") or "").lower()
+        suffix = (match.group("suffix") or "").lower()
         span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
 
         # Determine explicit currency unit
@@ -960,6 +1106,7 @@ def extract_conditions_from_query(
             field = _determine_currency_field(q_lower, span)
             if field:
                 comp = _detect_comparison_operator(query, match.start(), match.end())
+                cannot_eval = (val < 0)
                 raw_candidates.append({
                     "field": field,
                     "value": val,
@@ -968,6 +1115,8 @@ def extract_conditions_from_query(
                     "min_value": None,
                     "max_value": None,
                     "is_boundary_crossing": False,
+                    "cannot_evaluate": cannot_eval,
+                    "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
                 })
 
     # Check for days
@@ -975,8 +1124,10 @@ def extract_conditions_from_query(
         if any(start <= match.start() < end for start, end in covered_spans):
             continue
         try:
-            val = int(match.group(1))
-        except ValueError:
+            val = int(match.group("num"))
+            if match.group("neg"):
+                val = -val
+        except (ValueError, IndexError):
             continue
         field = None
         if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
@@ -990,6 +1141,7 @@ def extract_conditions_from_query(
 
         if field:
             comp = _detect_comparison_operator(query, match.start(), match.end())
+            cannot_eval = (val < 0)
             raw_candidates.append({
                 "field": field,
                 "value": val,
@@ -998,16 +1150,21 @@ def extract_conditions_from_query(
                 "min_value": None,
                 "max_value": None,
                 "is_boundary_crossing": False,
+                "cannot_evaluate": cannot_eval,
+                "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
             })
 
     # Check for months
     for match in _MONTHS_PATTERN.finditer(query):
         try:
-            val = int(match.group(1))
-        except ValueError:
+            val = int(match.group("num"))
+            if match.group("neg"):
+                val = -val
+        except (ValueError, IndexError):
             continue
         if any(k in q_lower for k in ("contract", "duration", "agreement")):
             comp = _detect_comparison_operator(query, match.start(), match.end())
+            cannot_eval = (val < 0)
             raw_candidates.append({
                 "field": "contract_duration_months",
                 "value": val,
@@ -1016,15 +1173,20 @@ def extract_conditions_from_query(
                 "min_value": None,
                 "max_value": None,
                 "is_boundary_crossing": False,
+                "cannot_evaluate": cannot_eval,
+                "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
             })
 
     # Check for mbps
     for match in _MBPS_PATTERN.finditer(query):
         try:
-            val = int(match.group(1))
-        except ValueError:
+            val = int(match.group("num"))
+            if match.group("neg"):
+                val = -val
+        except (ValueError, IndexError):
             continue
         comp = _detect_comparison_operator(query, match.start(), match.end())
+        cannot_eval = (val < 0)
         raw_candidates.append({
             "field": "internet_speed_mbps",
             "value": val,
@@ -1033,16 +1195,21 @@ def extract_conditions_from_query(
             "min_value": None,
             "max_value": None,
             "is_boundary_crossing": False,
+            "cannot_evaluate": cannot_eval,
+            "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
         })
 
     # Check for hours
     for match in _HOURS_PATTERN.finditer(query):
         try:
-            val = int(match.group(1))
-        except ValueError:
+            val = int(match.group("num"))
+            if match.group("neg"):
+                val = -val
+        except (ValueError, IndexError):
             continue
         if any(k in q_lower for k in ("incident", "p1", "severity", "sla")):
             comp = _detect_comparison_operator(query, match.start(), match.end())
+            cannot_eval = (val < 0)
             raw_candidates.append({
                 "field": "incident_severity_p1_response_hours",
                 "value": val,
@@ -1051,6 +1218,8 @@ def extract_conditions_from_query(
                 "min_value": None,
                 "max_value": None,
                 "is_boundary_crossing": False,
+                "cannot_evaluate": cannot_eval,
+                "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
             })
 
     # Filter to relevant fields if specified
@@ -1115,6 +1284,8 @@ def extract_conditions_from_query(
             "max_value": chosen.get("max_value"),
             "is_ambiguous": False,
             "is_boundary_crossing": chosen.get("is_boundary_crossing", False),
+            "cannot_evaluate": chosen.get("cannot_evaluate", False),
+            "cannot_evaluate_reason": chosen.get("cannot_evaluate_reason"),
         })
 
     return conditions
@@ -1247,20 +1418,26 @@ def _format_canonical_decision_answer(
 _DECISION_BENIGN_TERMS: Set[str] = {
     # Functional / grammatical terms
     "what", "is", "are", "was", "were", "can", "could", "does", "do", "did", "may", "might",
-    "have", "has", "had",
+    "have", "has", "had", "will", "would", "shall", "should",
     "a", "an", "the", "of", "for", "under", "in", "on", "at", "by", "with", "about", "within",
     "after", "before", "to", "from", "than", "into", "through", "during", "and", "or", "as", "if",
     "not", "no", "per", "via", "without", "this", "that", "these", "those", "who", "whom", "which",
     "below", "above", "over", "between", "least", "most", "strictly", "fewer", "higher", "lower",
     "more", "less", "greater", "exact", "exactly", "including", "included",
+    "off", "out", "up", "down",
     # Currency and units
     "inr", "rs", "rupee", "rupees", "usd", "eur", "gbp", "dollar", "dollars", "euro", "euros", "pound", "pounds",
     "day", "days", "month", "months", "hour", "hours", "mbps",
-    # Decision / permission framing
+    # Decision / permission framing and query verbs
     "approve", "approval", "approved", "permits", "permit", "permitted", "permission", "permissible",
-    "allows", "allow", "allowed", "allowable", "requires", "require", "required", "requirement",
-    "standard", "additional", "compliant", "compliance", "meet", "meets", "meeting", "suffice",
-    "sufficient", "enough", "exceed", "exceeds", "exceeding", "eligible", "eligibility", "status",
+    "allows", "allow", "allowed", "allowable", "requires", "require", "required", "requirement", "requirements",
+    "standard", "additional", "compliant", "compliance", "comply", "complies", "meet", "meets", "meeting",
+    "suffice", "sufficient", "enough", "exceed", "exceeds", "exceeding", "eligible", "eligibility", "status",
+    "qualify", "qualifies", "qualified", "applies", "apply", "applied",
+    "trigger", "triggers", "triggered", "issue", "issues", "issued", "issuing",
+    "use", "uses", "used", "using", "make", "makes", "made", "making",
+    "need", "needs", "needed", "follow", "follows", "followed", "following",
+    "sign", "signed", "signing", "signoff", "order", "orders",
     # Corporate roles and entities
     "director", "manager", "lead", "employee", "employees", "role", "roles", "policy", "corporate",
     "company", "asterline", "group", "threshold", "limit", "limits", "amount", "expense", "expenses",
@@ -1269,10 +1446,10 @@ _DECISION_BENIGN_TERMS: Set[str] = {
     # Canonical condition field domain vocabulary
     "booking", "notice", "advance", "departure", "flight", "receipt", "tax", "invoice", "itemized",
     "incidental", "payment", "confirmation", "attached", "quote", "quotes", "single", "competitive",
-    "three", "two", "multiple", "supplier", "purchase", "order", "po", "emergency", "card", "credit",
+    "three", "two", "multiple", "supplier", "purchase", "po", "emergency", "card", "credit",
     "monthly", "sick", "illness", "leave", "medical", "certificate", "self", "remote", "setup", "work",
-    "internet", "speed", "tuition", "assistance", "annual", "grant", "committee", "contract", "vendor", "agreement",
-    "duration", "signoff", "legal", "procurement", "board", "data", "classification", "tier",
+    "internet", "speed", "remediation", "tuition", "assistance", "annual", "grant", "committee", "contract", "vendor", "agreement",
+    "duration", "legal", "procurement", "board", "data", "classification", "tier",
     "confidential", "restricted", "encryption", "tokenized", "hsm", "aes", "privileged", "access",
     "review", "recertification", "suspension", "automatic", "cycle", "interval", "incident", "severity",
     "priority", "response", "time", "window", "sla", "breach", "escalation", "late", "exception", "exceptions",
@@ -1298,6 +1475,7 @@ _RULE_FIELD_SUBJECT_TERMS: Dict[str, Set[str]] = {
     "incident_severity_p1_response_hours": {"incident", "severity", "p1", "priority 1", "response", "sla"},
     "data_classification_tier": {"classification", "tier", "confidential", "restricted", "encryption"},
     "submission_delay_days": {"submit", "submission", "delay", "deadline"},
+    "exception_amount": {"exception", "urgent", "deployment", "travel exception"},
 }
 
 
@@ -1346,6 +1524,7 @@ def evaluate_authoritative_rule_decision(
     """
     if not question or not question.strip():
         return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     q_lower = question.lower()
 
@@ -1354,9 +1533,12 @@ def evaluate_authoritative_rule_decision(
         "what is the maximum", "what is the threshold", "what is the limit",
         "what are the tiers", "into what four", "what four severity",
         "and what timeframe", "and who", "and when", "and within what"
+        "and what timeframe", "and who", "and when", "and within what",
+        "what are the rules", "explain ", "describe ", "how does", "how do", "overview of"
     )
     if any(em in q_lower for em in explanatory_markers):
         return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     # Must contain a decision indicator
     decision_markers = (
@@ -1366,14 +1548,24 @@ def evaluate_authoritative_rule_decision(
     )
     if not any(m in q_lower for m in decision_markers):
         return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     # Must have exactly one valid condition, and no ambiguous conditions
+    # Check for ambiguous or conflicting condition inputs
     if any(c.get("is_ambiguous") for c in extracted_conditions):
         return AuthoritativeDecision(is_authoritative=False)
+        ambig_reasons = [c.get("error") for c in extracted_conditions if c.get("is_ambiguous")]
+        return AuthoritativeDecision(
+            is_authoritative=False,
+            is_decision_request=True,
+            is_unresolved=True,
+            reason="; ".join(filter(None, ambig_reasons)) or "Ambiguous condition inputs detected in query.",
+        )
 
     valid_conds = [c for c in extracted_conditions if c.get("value") is not None and not c.get("is_ambiguous")]
     if len(valid_conds) != 1:
         return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     target_cond = valid_conds[0]
     cond_field = target_cond["field"]
@@ -1402,30 +1594,88 @@ def evaluate_authoritative_rule_decision(
         if boundary_analysis.status == "crossing_outcomes" or target_cond.get("is_boundary_crossing"):
             return AuthoritativeDecision(
                 is_authoritative=False,
+                is_decision_request=True,
                 is_boundary_crossing=True,
                 reason="Numerical condition crosses policy rule boundaries or has conflicting outcomes.",
+            )
+        if boundary_analysis.status == "cannot_evaluate" or target_cond.get("cannot_evaluate"):
+            return AuthoritativeDecision(
+                is_authoritative=False,
+                is_decision_request=True,
+                is_unresolved=True,
+                reason=f"Numerical condition cannot be evaluated safely: {boundary_analysis.reason or target_cond.get('cannot_evaluate_reason')}",
             )
         if boundary_analysis.status != "single_outcome":
             return AuthoritativeDecision(is_authoritative=False)
     elif target_cond.get("is_boundary_crossing"):
+            return AuthoritativeDecision(
+                is_authoritative=False,
+                is_decision_request=True,
+                is_unresolved=True,
+                reason="Condition does not fit completely within any single active rule outcome.",
+            )
+    else:
+        if target_cond.get("is_boundary_crossing"):
+            return AuthoritativeDecision(
+                is_authoritative=False,
+                is_decision_request=True,
+                is_boundary_crossing=True,
+                reason="Numerical condition crosses policy rule boundaries or has conflicting outcomes.",
+            )
+        if target_cond.get("cannot_evaluate"):
+            return AuthoritativeDecision(
+                is_authoritative=False,
+                is_decision_request=True,
+                is_unresolved=True,
+                reason=f"Numerical condition cannot be evaluated safely: {target_cond.get('cannot_evaluate_reason')}",
+            )
         return AuthoritativeDecision(
             is_authoritative=False,
-            is_boundary_crossing=True,
-            reason="Numerical condition crosses policy rule boundaries or has conflicting outcomes.",
+            is_decision_request=True,
+            is_unresolved=True,
+            reason=f"Incomplete retrieval evidence: no active authorized rules found for condition field '{cond_field}'.",
         )
 
     if len(passing_rules) != 1:
-        return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(
+            is_authoritative=False,
+            is_decision_request=True,
+            is_unresolved=True,
+            reason=f"Condition cannot be resolved to a unique active rule ({len(passing_rules)} rules satisfied).",
+        )
 
     passing_result = passing_rules[0]
     rule = passing_result.rule
 
     # 1. Subject match verification: Question must be about the matched rule's policy subject
+    # 1. Unit verification: If rule has a unit, condition must supply compatible unit
+    if rule.unit and (not cond_unit or not str(cond_unit).strip()):
+        return AuthoritativeDecision(
+            is_authoritative=False,
+            is_decision_request=True,
+            is_unresolved=True,
+            rule=rule,
+            rule_id=rule.rule_id,
+            reason=f"Missing unit for condition '{cond_field}'. Expected '{rule.unit}'.",
+        )
+    if rule.unit and cond_unit and cond_unit.strip().lower() != rule.unit.strip().lower():
+        return AuthoritativeDecision(
+            is_authoritative=False,
+            is_decision_request=True,
+            is_unresolved=True,
+            rule=rule,
+            rule_id=rule.rule_id,
+            reason=f"Incompatible unit '{cond_unit}' for rule {rule.rule_id}. Expected '{rule.unit}'.",
+        )
+
+    # 2. Subject match verification: Question must be about the matched rule's policy subject
     subject_terms = _RULE_FIELD_SUBJECT_TERMS.get(cond_field)
     if subject_terms and not any(st in q_lower for st in subject_terms):
         return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     # 2. Verify rule's linked chunk is present in authorized chunks
+    # 3. Verify rule's linked chunk is present in authorized chunks
     rule_chunk = None
     for c in authorized_chunks:
         cid = c.get("chunk_id") if isinstance(c, dict) else getattr(c, "chunk_id", None)
@@ -1435,12 +1685,20 @@ def evaluate_authoritative_rule_decision(
 
     if not rule_chunk:
         return AuthoritativeDecision(is_authoritative=False)
+        return AuthoritativeDecision(
+            is_authoritative=False,
+            is_decision_request=True,
+            is_unresolved=True,
+            reason=f"Incomplete retrieval evidence: rule chunk '{rule.chunk_id}' is missing from authorized evidence.",
+        )
 
     # 3. Unsupported requirements check: Question must not contain additional unsupported entities
+    # 4. Unsupported requirements check: Question must not contain additional unsupported entities
     unsupported_terms = _find_unsupported_query_terms(question, rule_chunk)
     if unsupported_terms:
         return AuthoritativeDecision(
             is_authoritative=False,
+            is_decision_request=True,
             rule=rule,
             rule_id=rule.rule_id,
             reason=f"Query introduces unsupported terms [{', '.join(unsupported_terms)}] not established by rule evidence.",
@@ -1451,6 +1709,7 @@ def evaluate_authoritative_rule_decision(
 
     return AuthoritativeDecision(
         is_authoritative=True,
+        is_decision_request=True,
         rule=rule,
         answer=answer_text,
         citation_chunk_id=rule.chunk_id,

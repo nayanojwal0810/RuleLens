@@ -732,6 +732,29 @@ def answer_question(
             provider_latency_ms=None,
         )
 
+    # Step G.1c: Fail-safe handling of unresolved conditions for decision requests
+    # If the question asks a concrete policy decision and the condition cannot be evaluated
+    # or the evidence is incomplete, refuse safely with insufficient without Groq.
+    if authoritative_dec.is_unresolved or any(c.get("cannot_evaluate") for c in extracted_conds):
+        total_latency = (time.perf_counter() - start_total_time) * 1000.0
+        return GenerationResult(
+            question=cleaned_question,
+            role=role,
+            query_date=date_str,
+            answer="The provided corporate policies do not contain sufficient evidence to establish an authoritative decision for this condition.",
+            status=AnswerStatus.INSUFFICIENT.value,
+            reason=authoritative_dec.reason or "Relevant policy rule condition is unresolved or cannot be evaluated safely.",
+            citations=[],
+            citation_metadata=[],
+            referenced_rule_ids=[],
+            model=GENERATION_MODEL,
+            corpus_fingerprint=corpus_fp,
+            evidence_fingerprint=ev_fingerprint,
+            latency_ms=round(total_latency, 2),
+            provider_calls_attempted=0,
+            provider_latency_ms=None,
+        )
+
     # Step G.2: If the query introduced unsupported terms for a numerical approval/decision rule,
     # the approval threshold cannot establish whether that expense category or purpose is eligible.
     # Refuse safely without sending unsupported evidence to Groq for an affirmative decision.

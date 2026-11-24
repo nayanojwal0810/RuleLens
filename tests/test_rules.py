@@ -23,6 +23,8 @@ from rulelens.rules import (
     ConditionExtractionResult,
     RuleEvaluationResult,
     RuleRecord,
+    clear_rules_cache,
+    evaluate_authoritative_rule_decision,
     evaluate_rule_condition,
     extract_condition_result,
     extract_conditions_from_query,
@@ -1126,4 +1128,448 @@ def test_boundary_tuition_claim_at_75k(repo_root: Path):
     d6 = evaluate_authoritative_rule_decision(q6, mock_chunks, r6, c6)
     assert d6.is_authoritative is False
     assert d6.is_boundary_crossing is True
+
+
+# ==============================================================================
+# 9. Stale-Rule Cache Invalidation, Reload, and Repository Isolation Tests
+# ==============================================================================
+
+
+def test_rules_cache_invalidation_on_content_change(repo_root: Path, tmp_path: Path):
+    """Rules cache is invalidated when rules.jsonl content changes on disk."""
+    import shutil
+    import json
+
+    tmp_processed = tmp_path / "data" / "processed"
+    tmp_processed.mkdir(parents=True, exist_ok=True)
+    orig_rules = repo_root / "data" / "processed" / "rules.jsonl"
+    target_rules = tmp_processed / "rules.jsonl"
+    shutil.copy2(orig_rules, target_rules)
+
+    # Initial load
+    rules1 = load_rules(base_dir=tmp_path)
+    assert len(rules1) == 32
+    r_trv3 = next(r for r in rules1 if r.rule_id == "R-TRV-003")
+    assert r_trv3.threshold_value == 50000
+
+    # Modify rules.jsonl on disk (change threshold to 55000 for R-TRV-003)
+    lines = target_rules.read_text(encoding="utf-8").splitlines()
+    new_lines = []
+    for line in lines:
+        if not line.strip():
+            continue
+        data = json.loads(line)
+        if data["rule_id"] == "R-TRV-003":
+            data["threshold_value"] = 55000
+        new_lines.append(json.dumps(data))
+    target_rules.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    # Second load WITHOUT reload=True: must detect content fingerprint change and reload
+    rules2 = load_rules(base_dir=tmp_path, reload=False)
+    assert len(rules2) == 32
+    r_trv3_mod = next(r for r in rules2 if r.rule_id == "R-TRV-003")
+    assert r_trv3_mod.threshold_value == 55000
+
+
+def test_rules_cache_validation_failure_on_invalid_file(repo_root: Path, tmp_path: Path):
+    """Corrupted or incomplete rules.jsonl fails validation rather than reusing old cache."""
+    import shutil
+
+    tmp_processed = tmp_path / "data" / "processed"
+    tmp_processed.mkdir(parents=True, exist_ok=True)
+    orig_rules = repo_root / "data" / "processed" / "rules.jsonl"
+    target_rules = tmp_processed / "rules.jsonl"
+    shutil.copy2(orig_rules, target_rules)
+
+    # Initial valid load
+    rules1 = load_rules(base_dir=tmp_path)
+    assert len(rules1) == 32
+
+    # Truncate file so it has only 31 rules
+    lines = target_rules.read_text(encoding="utf-8").splitlines()
+    target_rules.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+
+    # Next load must raise ValueError and NOT reuse old 32-rule cache
+    with pytest.raises(ValueError, match="Expected 32 canonical rules"):
+        load_rules(base_dir=tmp_path, reload=False)
+
+
+def test_explicit_reload_flag_reloads_from_disk(repo_root: Path):
+    """Explicit reload=True reloads rules successfully and resets cache."""
+    clear_rules_cache()
+    rules = load_rules(base_dir=repo_root, reload=True)
+    assert len(rules) == 32
+
+
+# ==============================================================================
+# 10. Mandatory 10 Travel Policy v2 Checks (Prompt Specification Table)
+# ==============================================================================
+
+
+def test_mandatory_travel_v2_all_10_checks(repo_root: Path):
+    """Test all 10 conditions specified in the Travel Policy v2 mandatory table."""
+    mock_chunks = [{
+        "chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04",
+        "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager.",
+    }]
+
+    # 1. Exactly INR 50,000 -> Standard approval
+    q1 = "Can a direct manager approve travel expenses of exactly INR 50,000 under Travel Policy v2?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "standard_approval"
+    assert d1.rule_id == "R-TRV-003"
+
+    # 2. INR 50,001 -> Additional approval
+    q2 = "Can a direct manager approve travel expenses of INR 50,001 under Travel Policy v2?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "additional_approval"
+    assert d2.rule_id == "R-TRV-004"
+
+    # 3. Exceeding INR 50,000 -> Additional approval
+    q3 = "Can a direct manager approve travel expenses exceeding INR 50,000 under Travel Policy v2?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c3)
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is True
+    assert d3.outcome == "additional_approval"
+    assert d3.rule_id == "R-TRV-004"
+
+    # 4. Below INR 50,000 -> Standard approval
+    q4 = "Can a direct manager approve travel expenses below INR 50,000 under Travel Policy v2?"
+    c4 = extract_conditions_from_query(q4)
+    r4 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c4)
+    d4 = evaluate_authoritative_rule_decision(q4, mock_chunks, r4, c4)
+    assert d4.is_authoritative is True
+    assert d4.outcome == "standard_approval"
+    assert d4.rule_id == "R-TRV-003"
+
+    # 5. Up to INR 50,000 -> Standard approval
+    q5 = "Can a direct manager approve travel expenses up to INR 50,000 under Travel Policy v2?"
+    c5 = extract_conditions_from_query(q5)
+    r5 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c5)
+    d5 = evaluate_authoritative_rule_decision(q5, mock_chunks, r5, c5)
+    assert d5.is_authoritative is True
+    assert d5.outcome == "standard_approval"
+    assert d5.rule_id == "R-TRV-003"
+
+    # 6. More than INR 40,000 -> Mixed outcomes (safe refusal)
+    q6 = "Can a direct manager approve travel expenses of more than INR 40,000 under Travel Policy v2?"
+    c6 = extract_conditions_from_query(q6)
+    r6 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c6)
+    assert c6[0]["is_boundary_crossing"] is True
+    d6 = evaluate_authoritative_rule_decision(q6, mock_chunks, r6, c6)
+    assert d6.is_authoritative is False
+    assert d6.is_boundary_crossing is True
+
+    # 7. Up to INR 60,000 -> Mixed outcomes (safe refusal)
+    q7 = "Can a direct manager approve travel expenses up to INR 60,000 under Travel Policy v2?"
+    c7 = extract_conditions_from_query(q7)
+    r7 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c7)
+    assert c7[0]["is_boundary_crossing"] is True
+    d7 = evaluate_authoritative_rule_decision(q7, mock_chunks, r7, c7)
+    assert d7.is_authoritative is False
+    assert d7.is_boundary_crossing is True
+
+    # 8. At least INR 45,000 -> Mixed outcomes (safe refusal)
+    q8 = "Can a direct manager approve travel expenses of at least INR 45,000 under Travel Policy v2?"
+    c8 = extract_conditions_from_query(q8)
+    r8 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c8)
+    assert c8[0]["is_boundary_crossing"] is True
+    d8 = evaluate_authoritative_rule_decision(q8, mock_chunks, r8, c8)
+    assert d8.is_authoritative is False
+    assert d8.is_boundary_crossing is True
+
+    # 9. Between INR 40,000 and 50,000 -> Standard approval
+    q9 = "Can a direct manager approve travel expenses between INR 40,000 and 50,000 under Travel Policy v2?"
+    c9 = extract_conditions_from_query(q9)
+    r9 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c9)
+    d9 = evaluate_authoritative_rule_decision(q9, mock_chunks, r9, c9)
+    assert d9.is_authoritative is True
+    assert d9.outcome == "standard_approval"
+    assert d9.rule_id == "R-TRV-003"
+
+    # 10. Between INR 40,000 and 60,000 -> Mixed outcomes (safe refusal)
+    q10 = "Can a direct manager approve travel expenses between INR 40,000 and 60,000 under Travel Policy v2?"
+    c10 = extract_conditions_from_query(q10)
+    r10 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c10)
+    assert c10[0]["is_boundary_crossing"] is True
+    d10 = evaluate_authoritative_rule_decision(q10, mock_chunks, r10, c10)
+    assert d10.is_authoritative is False
+    assert d10.is_boundary_crossing is True
+
+
+# ==============================================================================
+# 11. Multi-Department Boundary Decisions Across All Five Departments
+# ==============================================================================
+
+
+def test_procurement_order_amount_boundaries(repo_root: Path):
+    """Procurement order amount (150,000 INR boundary from DOC-PRC-001)."""
+    mock_chunks = [{"chunk_id": "DOC-PRC-001_PRC-P02", "doc_id": "DOC-PRC-001", "clause_id": "PRC-P02", "text": "Purchase orders up to INR 150,000 require a single supplier quote."}]
+
+    # Exactly 150,000 -> single_quote_permitted
+    q1 = "Can procurement issue a purchase order of INR 150,000 with a single quote?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "single_quote_permitted"
+    assert d1.rule_id == "R-PRC-001"
+
+    # 150,001 -> three_competitive_quotes_required
+    q2 = "Can procurement issue a purchase order of INR 150,001 with a single quote?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "three_competitive_quotes_required"
+    assert d2.rule_id == "R-PRC-002"
+
+    # Up to 150,000 -> single_quote_permitted
+    q3 = "Can procurement issue a purchase order up to INR 150,000 with a single quote?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is True
+    assert d3.outcome == "single_quote_permitted"
+    assert d3.rule_id == "R-PRC-001"
+
+    # Exceeding 150,000 -> three_competitive_quotes_required
+    q4 = "Are three quotes required for purchase orders exceeding INR 150,000?"
+    c4 = extract_conditions_from_query(q4)
+    r4 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c4)
+    d4 = evaluate_authoritative_rule_decision(q4, mock_chunks, r4, c4)
+    assert d4.is_authoritative is True
+    assert d4.outcome == "three_competitive_quotes_required"
+    assert d4.rule_id == "R-PRC-002"
+
+    # More than 100,000 -> crosses 150k boundary
+    q5 = "Are three quotes required for purchase orders of more than INR 100,000?"
+    c5 = extract_conditions_from_query(q5)
+    r5 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c5)
+    assert c5[0]["is_boundary_crossing"] is True
+    d5 = evaluate_authoritative_rule_decision(q5, mock_chunks, r5, c5)
+    assert d5.is_authoritative is False
+    assert d5.is_boundary_crossing is True
+
+    # Between 100,000 and 150,000 -> single_quote_permitted
+    q6 = "Is a single quote permitted for purchase orders between INR 100,000 and 150,000?"
+    c6 = extract_conditions_from_query(q6)
+    r6 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c6)
+    d6 = evaluate_authoritative_rule_decision(q6, mock_chunks, r6, c6)
+    assert d6.is_authoritative is True
+    assert d6.outcome == "single_quote_permitted"
+
+    # Between 100,000 and 200,000 -> crosses boundary
+    q7 = "Is a single quote permitted for purchase orders between INR 100,000 and 200,000?"
+    c7 = extract_conditions_from_query(q7)
+    r7 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c7)
+    assert c7[0]["is_boundary_crossing"] is True
+    d7 = evaluate_authoritative_rule_decision(q7, mock_chunks, r7, c7)
+    assert d7.is_authoritative is False
+    assert d7.is_boundary_crossing is True
+
+
+def test_procurement_contract_duration_boundaries(repo_root: Path):
+    """Procurement vendor contract duration (12 months boundary from DOC-PRC-003)."""
+    mock_chunks = [{"chunk_id": "DOC-PRC-003_PRC-C02", "doc_id": "DOC-PRC-003", "clause_id": "PRC-C02", "text": "Vendor contracts up to 12 months duration require department lead signoff."}]
+
+    # Exactly 12 months -> department_lead_signoff
+    q1 = "Can a department lead sign off on a vendor contract duration of 12 months?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "department_lead_signoff"
+    assert d1.rule_id == "R-PRC-003"
+
+    # 13 months -> legal_and_procurement_signoff
+    q2 = "Is legal signoff required for a vendor contract duration of 13 months?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "legal_and_procurement_signoff"
+    assert d2.rule_id == "R-PRC-004"
+
+    # Exceeding 12 months -> legal_and_procurement_signoff
+    q3 = "Is legal signoff required for vendor contracts exceeding 12 months?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is True
+    assert d3.outcome == "legal_and_procurement_signoff"
+
+
+def test_people_ops_sick_leave_boundaries(repo_root: Path):
+    """People Operations consecutive sick days (3 days boundary from DOC-PPO-001)."""
+    mock_chunks = [{"chunk_id": "DOC-PPO-001_PPO-L02", "doc_id": "DOC-PPO-001", "clause_id": "PPO-L02", "text": "Sick leave up to 3 consecutive days permits self-certification."}]
+
+    # 3 days -> self_certification
+    q1 = "Can an employee use self-certification for sick leave of 3 consecutive days?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "self_certification"
+    assert d1.rule_id == "R-PPO-001"
+
+    # 4 days -> medical_certificate_required
+    q2 = "Is a medical certificate required for sick leave of 4 consecutive days?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "medical_certificate_required"
+    assert d2.rule_id == "R-PPO-002"
+
+    # More than 2 days -> crosses 3 days boundary
+    q3 = "Is a medical certificate required for sick leave of more than 2 days?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    assert c3[0]["is_boundary_crossing"] is True
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is False
+    assert d3.is_boundary_crossing is True
+
+
+def test_people_ops_internet_speed_boundaries(repo_root: Path):
+    """People Operations remote setup internet speed (50 Mbps boundary from DOC-PPO-002)."""
+    mock_chunks = [{"chunk_id": "DOC-PPO-002_PPO-R02", "doc_id": "DOC-PPO-002", "clause_id": "PPO-R02", "text": "Remote work internet speed minimum requirement is 50 mbps."}]
+
+    # Exactly 50 Mbps -> remote_setup_compliant
+    q1 = "Does an internet speed of 50 Mbps comply with remote work setup policy?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "remote_setup_compliant"
+    assert d1.rule_id == "R-PPO-003"
+
+    # 49 Mbps -> remediation_required
+    q2 = "Does an internet speed of 49 Mbps require remediation under remote policy?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "remediation_required"
+    assert d2.rule_id == "R-PPO-004"
+
+    # At least 50 Mbps -> remote_setup_compliant
+    q3 = "Is an internet speed of at least 50 Mbps compliant with remote work policy?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
+    assert d3.is_authoritative is True
+    assert d3.outcome == "remote_setup_compliant"
+
+    # Below 50 Mbps -> remediation_required
+    q4 = "Does an internet speed below 50 Mbps require remediation?"
+    c4 = extract_conditions_from_query(q4)
+    r4 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c4)
+    d4 = evaluate_authoritative_rule_decision(q4, mock_chunks, r4, c4)
+    assert d4.is_authoritative is True
+    assert d4.outcome == "remediation_required"
+
+    # More than 40 Mbps -> crosses 50 Mbps boundary
+    q5 = "Is an internet speed of more than 40 Mbps compliant?"
+    c5 = extract_conditions_from_query(q5)
+    r5 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c5)
+    assert c5[0]["is_boundary_crossing"] is True
+    d5 = evaluate_authoritative_rule_decision(q5, mock_chunks, r5, c5)
+    assert d5.is_authoritative is False
+    assert d5.is_boundary_crossing is True
+
+
+def test_infosec_privileged_review_and_p1_sla_boundaries(repo_root: Path):
+    """InfoSec privileged role review (90 days) and P1 SLA (1 hour)."""
+    mock_sec2 = [{"chunk_id": "DOC-SEC-002_SEC-A02", "doc_id": "DOC-SEC-002", "clause_id": "SEC-A02", "text": "Privileged access recertification interval up to 90 days is compliant."}]
+    mock_sec3 = [{"chunk_id": "DOC-SEC-003_SEC-I02", "doc_id": "DOC-SEC-003", "clause_id": "SEC-I02", "text": "Priority 1 incident response time SLA is 1 hour."}]
+
+    # 90 days -> access_recertification_compliant
+    q1 = "Is privileged access review compliant within 90 days interval?"
+    c1 = extract_conditions_from_query(q1)
+    r1 = resolve_rules_for_evidence(mock_sec2, "security", "2026-11-22", repo_root, c1)
+    d1 = evaluate_authoritative_rule_decision(q1, mock_sec2, r1, c1)
+    assert d1.is_authoritative is True
+    assert d1.outcome == "access_recertification_compliant"
+    assert d1.rule_id == "R-SEC-003"
+
+    # 91 days -> automatic_account_suspension
+    q2 = "Does a privileged access review interval of 91 days trigger automatic suspension?"
+    c2 = extract_conditions_from_query(q2)
+    r2 = resolve_rules_for_evidence(mock_sec2, "security", "2026-11-22", repo_root, c2)
+    d2 = evaluate_authoritative_rule_decision(q2, mock_sec2, r2, c2)
+    assert d2.is_authoritative is True
+    assert d2.outcome == "automatic_account_suspension"
+    assert d2.rule_id == "R-SEC-004"
+
+    # P1 1 hour -> sla_met
+    q3 = "Is a Priority 1 incident response time of 1 hour compliant with SLA?"
+    c3 = extract_conditions_from_query(q3)
+    r3 = resolve_rules_for_evidence(mock_sec3, "security", "2026-11-22", repo_root, c3)
+    d3 = evaluate_authoritative_rule_decision(q3, mock_sec3, r3, c3)
+    assert d3.is_authoritative is True
+    assert d3.outcome == "sla_met"
+    assert d3.rule_id == "R-SEC-005"
+
+    # P1 2 hours -> sla_breach_escalation
+    q4 = "Does a Priority 1 incident response time of 2 hours require escalation?"
+    c4 = extract_conditions_from_query(q4)
+    r4 = resolve_rules_for_evidence(mock_sec3, "security", "2026-11-22", repo_root, c4)
+    d4 = evaluate_authoritative_rule_decision(q4, mock_sec3, r4, c4)
+    assert d4.is_authoritative is True
+    assert d4.outcome == "sla_breach_escalation"
+    assert d4.rule_id == "R-SEC-006"
+
+
+# ==============================================================================
+# 12. Fail-Safe Handling of Unresolved Conditions
+# ==============================================================================
+
+
+def test_failsafe_negative_values_cannot_evaluate(repo_root: Path):
+    """Negative values cannot be evaluated and trigger is_unresolved=True."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "Can a direct manager approve travel expenses of -50,000 INR?"
+    conds = extract_conditions_from_query(q)
+    assert len(conds) == 1
+    assert conds[0]["value"] < 0
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    # resolve_rules_for_evidence catches ValueError and marks is_error
+    assert any(r.is_error for r in rules)
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is False
+    assert dec.is_unresolved is True
+
+
+def test_failsafe_incomplete_retrieval_evidence_marks_unresolved(repo_root: Path):
+    """When decision question's rule chunk is missing from authorized evidence, mark is_unresolved=True."""
+    # Chunk provided is from Information Security, but question asks about travel expenses
+    mock_chunks = [{"chunk_id": "DOC-SEC-001_SEC-D02", "doc_id": "DOC-SEC-001", "clause_id": "SEC-D02", "text": "Security data classification tier."}]
+    q = "Can a direct manager approve travel expenses of INR 50,000?"
+    conds = extract_conditions_from_query(q)
+    rules = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, conds)
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is False
+    assert dec.is_unresolved is True
+    assert "Incomplete retrieval evidence" in dec.reason
+
+
+def test_explanatory_questions_preserve_non_decision_status(repo_root: Path):
+    """Explanatory questions must not be classified as decision requests or marked is_unresolved."""
+    mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
+    q = "What is the maximum travel expense threshold that a direct manager can approve under Travel Policy v2?"
+    conds = extract_conditions_from_query(q)
+    rules = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, conds)
+    dec = evaluate_authoritative_rule_decision(q, mock_chunks, rules, conds)
+    assert dec.is_authoritative is False
+    assert dec.is_decision_request is False
+    assert dec.is_unresolved is False
 

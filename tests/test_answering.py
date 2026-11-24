@@ -1572,3 +1572,150 @@ def test_integration_tuition_claim_up_to_100k_crosses_boundary_safe_refusal(mock
     assert res.status == "insufficient"
     assert res.provider_calls_attempted == 0
     mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_cannot_evaluate_condition_refuses_safely_without_groq(mock_retriever, canonical_chunks_by_id):
+    """Negative values cannot be evaluated safely and must refuse with insufficient and 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
+    c04_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [c04_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    q = "Can a direct manager approve travel expenses of -50,000 INR?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_incomplete_retrieval_evidence_decision_refuses_without_groq(mock_retriever, canonical_chunks_by_id):
+    """Decision query when relevant rule chunk is absent from retrieved evidence refuses safely without Groq."""
+    c = canonical_chunks_by_id["DOC-SEC-001_SEC-D02"]
+    sec_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [sec_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    # Question is about travel approval, but retriever returned InfoSec
+    q = "Can a direct manager approve travel expenses of INR 50,000?"
+    res = answer_question(
+        question=q, role="manager", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res.status == "insufficient"
+    assert res.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_procurement_single_quote_and_crossing_refusal(mock_retriever, canonical_chunks_by_id):
+    """Procurement purchase order boundaries evaluated end-to-end with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-PRC-001_PRC-P02"]
+    prc_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [prc_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    # Deterministic approval at 150,000 INR
+    q1 = "Can procurement issue a purchase order of INR 150,000 with a single quote?"
+    res1 = answer_question(
+        question=q1, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res1.status == "answered"
+    assert "single supplier quote" in res1.answer.lower()
+    assert res1.referenced_rule_ids == ["R-PRC-001"]
+    assert res1.provider_calls_attempted == 0
+
+    # Boundary crossing safe refusal for more than 100,000 INR
+    q2 = "Are three quotes required for purchase orders of more than INR 100,000?"
+    res2 = answer_question(
+        question=q2, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res2.status == "insufficient"
+    assert res2.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_infosec_privileged_review_and_crossing_refusal(mock_retriever, canonical_chunks_by_id):
+    """InfoSec privileged review boundaries evaluated end-to-end with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-SEC-002_SEC-A02"]
+    sec_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [sec_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    # Deterministic compliance at 90 days
+    q1 = "Is privileged access review compliant within 90 days interval?"
+    res1 = answer_question(
+        question=q1, role="security", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res1.status == "answered"
+    assert "compliant" in res1.answer.lower()
+    assert res1.referenced_rule_ids == ["R-SEC-003"]
+    assert res1.provider_calls_attempted == 0
+
+    # Boundary crossing safe refusal for more than 60 days
+    q2 = "Does privileged access review interval of more than 60 days require suspension?"
+    res2 = answer_question(
+        question=q2, role="security", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res2.status == "insufficient"
+    assert res2.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
+
+
+def test_integration_remote_work_internet_speed_and_crossing_refusal(mock_retriever, canonical_chunks_by_id):
+    """People Ops remote setup internet speed evaluated end-to-end with 0 Groq calls."""
+    c = canonical_chunks_by_id["DOC-PPO-002_PPO-R02"]
+    ppo_res = RetrievalResult(
+        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
+        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
+        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
+        allowed_roles=list(c["allowed_roles"]),
+    )
+    mock_retriever.search.return_value = [ppo_res]
+    mock_llm = MagicMock(spec=GroqClientWrapper)
+
+    # Deterministic compliance at 50 Mbps
+    q1 = "Does an internet speed of 50 Mbps comply with remote work setup policy?"
+    res1 = answer_question(
+        question=q1, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res1.status == "answered"
+    assert "remote setup compliant" in res1.answer.lower() or "meets the remote work setup" in res1.answer.lower()
+    assert res1.referenced_rule_ids == ["R-PPO-003"]
+    assert res1.provider_calls_attempted == 0
+
+    # Boundary crossing safe refusal for more than 40 Mbps
+    q2 = "Is an internet speed of more than 40 Mbps compliant?"
+    res2 = answer_question(
+        question=q2, role="employee", query_date="2026-11-22",
+        retriever=mock_retriever, llm_client=mock_llm,
+    )
+    assert res2.status == "insufficient"
+    assert res2.provider_calls_attempted == 0
+    mock_llm.generate_answer.assert_not_called()
