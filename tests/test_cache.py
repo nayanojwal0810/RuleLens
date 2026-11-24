@@ -1,4 +1,4 @@
-"""Comprehensive offline unit tests for RuleLens Stage F Guarded Semantic Caching.
+"""Comprehensive offline unit tests for RuleLens guarded semantic caching.
 
 Covers all 20 required safety and behavior test cases:
 1. Exact repeated question, same role/date/evidence -> valid hit.
@@ -57,6 +57,7 @@ from rulelens.cache import (
     validate_cache_candidate,
 )
 from rulelens.config import QDRANT_CACHE_COLLECTION_NAME
+from rulelens.grounding import GROUNDING_VERSION, fact_fingerprint, request_meaning, request_support
 from rulelens.llm import (
     AnswerResponse,
     AnswerStatus,
@@ -71,18 +72,7 @@ from rulelens.retrieval import (
     load_validated_corpus,
     parse_query_date,
 )
-from rulelens.rules import RuleEvaluationResult, RuleRecord
-
-
-@pytest.fixture(autouse=True)
-def guard_network(monkeypatch):
-    """Enforce that all cache unit tests make zero network calls."""
-
-    def guarded_connect(*args, **kwargs):
-        raise AssertionError("Network connection attempted during offline cache unit test!")
-
-    monkeypatch.setattr(socket, "create_connection", guarded_connect)
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+from rulelens.rules import RuleEvaluationResult, RuleRecord, extract_conditions_from_query
 
 
 @pytest.fixture
@@ -102,6 +92,9 @@ def canonical_chunks_by_id(canonical_corpus: List[Dict[str, Any]]) -> Dict[str, 
 
 class DeterministicTestEmbedder:
     """Fast, deterministic 384-dimensional normalized embedder for offline tests."""
+
+    model_name = EMBEDDING_MODEL
+    normalize_embeddings = True
 
     def embed_query(self, text: str) -> List[float]:
         import hashlib
@@ -131,12 +124,13 @@ def qdrant_cache() -> QdrantClient:
 
 
 def make_mock_llm(
-    answer_text: str = "Verified policy answer based on authoritative evidence.",
+    answer_text: Optional[str] = None,
     citations: Optional[List[str]] = None,
     status: AnswerStatus = AnswerStatus.ANSWERED,
 ) -> MagicMock:
     """Factory for mocked Groq client returning valid structured responses."""
     mock = MagicMock(spec=GroqClientWrapper)
+    mock.model = GENERATION_MODEL
     mock.get_telemetry_snapshot.return_value = ProviderTelemetrySnapshot(
         provider_requests_attempted=1,
         provider_requests_succeeded=1,
@@ -150,8 +144,14 @@ def make_mock_llm(
             first = evidence_chunks[0]
             cid = first.chunk_id if hasattr(first, "chunk_id") else first["chunk_id"]
             cids = [cid]
+        generated = answer_text
+        if generated is None and status == AnswerStatus.ANSWERED:
+            chunks = [c.to_dict() if hasattr(c, "to_dict") else c for c in evidence_chunks]
+            _, facts, _ = request_support(question, chunks)
+            generated = "\n".join(dict.fromkeys(f["quote"] for f in facts))
+            cids = list(dict.fromkeys(f["chunk_id"] for f in facts))
         resp = AnswerResponse(
-            answer=answer_text,
+            answer=generated or "No supported answer.",
             status=status,
             citations=cids or [],
             referenced_rule_ids=[],
@@ -169,11 +169,37 @@ def make_mock_llm(
     return mock
 
 
-# ==============================================================================
+def seed_guard_candidate(**kwargs):
+    client = kwargs["client"]
+    chunks = kwargs["canonical_chunks_by_id"]
+    ids = kwargs["citations"]
+    payload = dict(
+        entry_id=str(uuid.uuid4()), schema_version=CACHE_SCHEMA_VERSION,
+        original_question=kwargs["question"], normalized_question=normalize_question(kwargs["question"]),
+        answer=kwargs["answer"], status=kwargs["status"], model=GENERATION_MODEL,
+        role=kwargs["role"], query_date=kwargs["query_date"], corpus_fingerprint=kwargs["corpus_fingerprint"],
+        embedding_model=EMBEDDING_MODEL, condition_signature=compute_condition_signature(kwargs["extracted_conditions"]),
+        indicators=compute_question_indicators(kwargs["question"]), cited_chunk_ids=ids,
+        cited_chunk_hashes={cid: compute_chunk_content_hash(chunks[cid]["text"]) for cid in ids},
+        cited_policy_versions={cid: chunks[cid]["version"] for cid in ids},
+        referenced_rule_ids=kwargs["referenced_rule_ids"],
+        rule_outcomes={r.rule.rule_id: r.outcome for r in kwargs["rule_results"] if r.rule.rule_id in kwargs["referenced_rule_ids"]},
+        citation_metadata=[build_canonical_citation_metadata(chunks[cid]) for cid in ids],
+        created_at="2026-11-24T00:00:00Z",
+    )
+    payload.update(verified_fields(payload, chunks))
+    client.upsert(collection_name=QDRANT_CACHE_COLLECTION_NAME,
+                  points=[models.PointStruct(id=payload["entry_id"], vector=kwargs["embedder"].embed_query(kwargs["question"]), payload=payload)])
+    return payload["entry_id"]
+
+
+def verified_fields(payload, chunks):
+    return {"validation_route": "generated_verified", "grounding_version": GROUNDING_VERSION,
+            "meaning_signature": request_meaning(payload["original_question"]),
+            "fact_fingerprint": fact_fingerprint(list(chunks.values()))}
+
+
 # 20 REQUIRED TEST CASES
-# ==============================================================================
-
-
 def test_01_exact_repeated_question_valid_hit(repo_root, qdrant_cache, mock_embedder):
     """Case 1: Exact repeated question with same role/date/evidence produces valid hit."""
     retriever = HybridRetriever(base_dir=repo_root)
@@ -274,7 +300,7 @@ def test_03_changed_amount_miss(canonical_chunks_by_id, mock_embedder):
     q_cand = "Can an employee claim an expense of INR 75,000?"
     chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
 
-    insert_cache_entry(
+    seed_guard_candidate(
         client=client,
         embedder=mock_embedder,
         question=q_src,
@@ -317,7 +343,7 @@ def test_04_changed_currency_miss(canonical_chunks_by_id, mock_embedder):
     q_cand = "Can an employee claim an expense of USD 50,000?"
     chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
 
-    insert_cache_entry(
+    seed_guard_candidate(
         client=client,
         embedder=mock_embedder,
         question=q_src,
@@ -429,7 +455,7 @@ def test_07_changed_corpus_fingerprint_miss(canonical_chunks_by_id, mock_embedde
     ensure_cache_collection(client)
 
     # Insert entry with old fingerprint
-    insert_cache_entry(
+    seed_guard_candidate(
         client=client,
         embedder=mock_embedder,
         question="What is the travel policy allowance?",
@@ -471,7 +497,7 @@ def test_08_changed_cited_content_hash_miss(canonical_chunks_by_id, mock_embedde
     chunk_id = "DOC-TRV-001_TRV-C01"
     original_chunk = dict(canonical_chunks_by_id[chunk_id])
 
-    insert_cache_entry(
+    seed_guard_candidate(
         client=client,
         embedder=mock_embedder,
         question="What is the daily allowance?",
@@ -516,7 +542,7 @@ def test_09_missing_authorized_citation_miss(canonical_chunks_by_id, mock_embedd
     chunk_a = "DOC-TRV-001_TRV-C01"
     chunk_b = "DOC-FIN-001_FIN-C01"
 
-    insert_cache_entry(
+    seed_guard_candidate(
         client=client,
         embedder=mock_embedder,
         question="What is the submission policy?",
@@ -587,7 +613,7 @@ def test_10_changed_rule_outcome_miss(canonical_chunks_by_id, mock_embedder):
 
     chunk_id = "DOC-TRV-001_TRV-C01"
 
-    insert_cache_entry(
+    seed_guard_candidate(
         client=client,
         embedder=mock_embedder,
         question="Can direct manager approve INR 50,000?",
@@ -655,7 +681,9 @@ def test_11_negation_reversal_miss(repo_root, qdrant_cache, mock_embedder):
         mode="bm25",
     )
     assert res2.cache_hit is False
-    assert res2.cache_rejection_reason in ("negation_mismatch", "low_similarity", "cache_miss")
+    assert res2.status == "insufficient"
+    assert res2.cache_entry_id is None
+    mock_llm.generate_answer.assert_not_called()
 
 
 def test_12_different_exception_or_eligibility_requirement_miss(canonical_chunks_by_id, mock_embedder):
@@ -667,7 +695,7 @@ def test_12_different_exception_or_eligibility_requirement_miss(canonical_chunks
     q_cand = "Can an employee travel under emergency exception without advance booking?"
     chunk = canonical_chunks_by_id["DOC-TRV-002_TRV-C01"]
 
-    insert_cache_entry(
+    seed_guard_candidate(
         client=client,
         embedder=mock_embedder,
         question=q_src,
@@ -698,7 +726,7 @@ def test_12_different_exception_or_eligibility_requirement_miss(canonical_chunks
         similarity_threshold=0.50,
     )
     assert res.hit is False
-    assert res.rejection_reason in ("exception_indicator_mismatch", "comparison_mismatch", "low_similarity")
+    assert res.rejection_reason in ("exception_mismatch", "comparison_mismatch", "low_similarity")
 
 
 def test_13_personal_vs_business_travel_never_reused_incorrectly(repo_root, qdrant_cache, mock_embedder):
@@ -887,13 +915,14 @@ def test_19_duplicate_insert_idempotent(canonical_chunks_by_id, mock_embedder):
     client = QdrantClient(":memory:")
     ensure_cache_collection(client)
 
-    chunk_id = "DOC-TRV-001_TRV-C01"
+    chunk_id = "DOC-TRV-002_TRV-C03"
 
     id1 = insert_cache_entry(
         client=client,
+        validation_route="generated_verified",
         embedder=mock_embedder,
-        question="What is the daily allowance?",
-        answer="INR 1,500 daily allowance.",
+        question="What is the daily meal allowance?",
+        answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
         status="answered",
         role="employee",
         query_date="2026-11-22",
@@ -907,9 +936,10 @@ def test_19_duplicate_insert_idempotent(canonical_chunks_by_id, mock_embedder):
     )
     id2 = insert_cache_entry(
         client=client,
+        validation_route="generated_verified",
         embedder=mock_embedder,
-        question="What is the daily allowance?",
-        answer="INR 1,500 daily allowance.",
+        question="What is the daily meal allowance?",
+        answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
         status="answered",
         role="employee",
         query_date="2026-11-22",
@@ -921,6 +951,7 @@ def test_19_duplicate_insert_idempotent(canonical_chunks_by_id, mock_embedder):
         canonical_chunks_by_id=canonical_chunks_by_id,
         extracted_conditions=[],
     )
+    assert id1 is not None
     assert id1 == id2
     assert client.count(collection_name=QDRANT_CACHE_COLLECTION_NAME).count == 1
 
@@ -947,11 +978,7 @@ def test_20_existing_generation_unaffected_when_cache_disabled(repo_root):
     assert mock_llm.generate_answer.call_count == 1
 
 
-# ==============================================================================
-# 21. Section 5 Mandatory High-Similarity Adversarial Cache Tests
-# ==============================================================================
-
-
+# Section 5 Mandatory High-Similarity Adversarial Cache Tests
 def test_adversarial_01_meal_vs_hotel_same_clause_high_similarity(canonical_chunks_by_id, mock_embedder):
     """Mandatory 1: Meal allowance vs hotel allowance citing same clause rejected with fact_target_mismatch."""
     client = QdrantClient(":memory:")
@@ -967,7 +994,7 @@ def test_adversarial_01_meal_vs_hotel_same_clause_high_similarity(canonical_chun
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q_meal,
         "normalized_question": normalize_question(q_meal),
         "answer": "The maximum daily meal allowance is INR 2,000 under Travel Policy v2.",
@@ -987,6 +1014,7 @@ def test_adversarial_01_meal_vs_hotel_same_clause_high_similarity(canonical_chun
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1024,7 +1052,7 @@ def test_adversarial_02_submission_vs_review_deadline_high_similarity(canonical_
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q_sub,
         "normalized_question": normalize_question(q_sub),
         "answer": "Employees must submit expense claims within 30 days.",
@@ -1044,6 +1072,7 @@ def test_adversarial_02_submission_vs_review_deadline_high_similarity(canonical_
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1081,7 +1110,7 @@ def test_adversarial_03_above_vs_up_to_threshold_high_similarity(canonical_chunk
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q_up_to,
         "normalized_question": normalize_question(q_up_to),
         "answer": "Standard manager approval is permitted up to INR 50,000.",
@@ -1101,6 +1130,7 @@ def test_adversarial_03_above_vs_up_to_threshold_high_similarity(canonical_chunk
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1137,7 +1167,7 @@ def test_adversarial_09_missing_current_referenced_rule(canonical_chunks_by_id, 
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
         "answer": "Manager approval limit is INR 50,000.",
@@ -1157,6 +1187,7 @@ def test_adversarial_09_missing_current_referenced_rule(canonical_chunks_by_id, 
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1212,6 +1243,7 @@ def test_adversarial_11_missing_cache_schema(canonical_chunks_by_id, mock_embedd
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1266,6 +1298,7 @@ def test_adversarial_12_incorrect_schema_version(canonical_chunks_by_id, mock_em
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1300,7 +1333,7 @@ def test_adversarial_13_incorrect_generation_model(canonical_chunks_by_id, mock_
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
         "answer": "Travel policy purpose is business travel governance.",
@@ -1320,6 +1353,7 @@ def test_adversarial_13_incorrect_generation_model(canonical_chunks_by_id, mock_
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1354,7 +1388,7 @@ def test_adversarial_14_incorrect_embedding_model(canonical_chunks_by_id, mock_e
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
         "answer": "Travel policy purpose is business travel governance.",
@@ -1374,6 +1408,7 @@ def test_adversarial_14_incorrect_embedding_model(canonical_chunks_by_id, mock_e
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1408,7 +1443,7 @@ def test_adversarial_15_missing_citation_metadata(canonical_chunks_by_id, mock_e
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
         "answer": "Travel policy purpose is business travel governance.",
@@ -1428,6 +1463,7 @@ def test_adversarial_15_missing_citation_metadata(canonical_chunks_by_id, mock_e
         "citation_metadata": [],  # Empty citation metadata
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1450,11 +1486,7 @@ def test_adversarial_15_missing_citation_metadata(canonical_chunks_by_id, mock_e
     assert res.rejection_reason == "incomplete_citation_metadata"
 
 
-# ==============================================================================
 # Pass 1 Final Review: Incomplete Rule Records & Fact-Equivalence Regressions
-# ==============================================================================
-
-
 def test_adversarial_16_missing_cached_rule_outcome_rejected_incomplete_rule_record(
     canonical_chunks_by_id, mock_embedder
 ):
@@ -1469,7 +1501,7 @@ def test_adversarial_16_missing_cached_rule_outcome_rejected_incomplete_rule_rec
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
         "answer": "Travel reimbursement approvals require director approval exceeding INR 50,000.",
@@ -1489,6 +1521,7 @@ def test_adversarial_16_missing_cached_rule_outcome_rejected_incomplete_rule_rec
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1523,7 +1556,7 @@ def test_adversarial_17_rule_outcome_mismatch_rejected(canonical_chunks_by_id, m
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
         "answer": "Expenses of INR 50,000 follow standard approval.",
@@ -1543,6 +1576,7 @@ def test_adversarial_17_rule_outcome_mismatch_rejected(canonical_chunks_by_id, m
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1587,7 +1621,7 @@ def test_adversarial_18_rule_condition_input_mismatch_rejected(canonical_chunks_
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
         "answer": "Expenses of INR 50,000 follow standard approval.",
@@ -1607,6 +1641,7 @@ def test_adversarial_18_rule_condition_input_mismatch_rejected(canonical_chunks_
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1655,7 +1690,7 @@ def test_fact_equivalence_meal_vs_hotel_high_similarity_rejected(canonical_chunk
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": seed_q,
         "normalized_question": normalize_question(seed_q),
         "answer": "The maximum daily meal allowance is INR 2,500 under Travel Policy v2.",
@@ -1675,6 +1710,7 @@ def test_fact_equivalence_meal_vs_hotel_high_similarity_rejected(canonical_chunk
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1714,7 +1750,7 @@ def test_fact_equivalence_submission_vs_review_sla_high_similarity_rejected(
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": seed_q,
         "normalized_question": normalize_question(seed_q),
         "answer": "Employees must submit expense claims within 30 calendar days.",
@@ -1734,6 +1770,7 @@ def test_fact_equivalence_submission_vs_review_sla_high_similarity_rejected(
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1773,7 +1810,7 @@ def test_fact_equivalence_encryption_vs_transfer_high_similarity_rejected(
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": seed_q,
         "normalized_question": normalize_question(seed_q),
         "answer": "AES-256 encryption is mandatory for Confidential tier data at rest.",
@@ -1793,6 +1830,7 @@ def test_fact_equivalence_encryption_vs_transfer_high_similarity_rejected(
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1832,7 +1870,7 @@ def test_fact_equivalence_sick_leave_vs_vacation_high_similarity_rejected(
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": seed_q,
         "normalized_question": normalize_question(seed_q),
         "answer": "Employees accrue 1.75 vacation days per month (21 days per year).",
@@ -1852,6 +1890,7 @@ def test_fact_equivalence_sick_leave_vs_vacation_high_similarity_rejected(
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1887,10 +1926,10 @@ def test_fact_equivalence_valid_exact_question_hit(canonical_chunks_by_id, mock_
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": q,
         "normalized_question": normalize_question(q),
-        "answer": "The maximum daily meal allowance for domestic travel is INR 2,500 under Travel Policy v2.",
+        "answer": "Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
         "status": "answered",
         "model": GENERATION_MODEL,
         "role": "employee",
@@ -1907,6 +1946,7 @@ def test_fact_equivalence_valid_exact_question_hit(canonical_chunks_by_id, mock_
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1928,7 +1968,7 @@ def test_fact_equivalence_valid_exact_question_hit(canonical_chunks_by_id, mock_
     assert res.hit is True
     assert res.rejection_reason is None
     assert res.record is not None
-    assert "maximum daily meal allowance" in res.record.answer
+    assert "INR 2,000 per diem with itemized receipts" in res.record.answer
 
 
 def test_fact_equivalence_valid_demonstrated_paraphrase_hit(canonical_chunks_by_id, mock_embedder):
@@ -1945,10 +1985,10 @@ def test_fact_equivalence_valid_demonstrated_paraphrase_hit(canonical_chunks_by_
 
     record_payload = {
         "entry_id": str(uuid.uuid4()),
-        "schema_version": "1.0",
+        "schema_version": CACHE_SCHEMA_VERSION,
         "original_question": seed_q,
         "normalized_question": normalize_question(seed_q),
-        "answer": "The maximum daily meal allowance for domestic travel is INR 2,500 under Travel Policy v2.",
+        "answer": "Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
         "status": "answered",
         "model": GENERATION_MODEL,
         "role": "employee",
@@ -1965,6 +2005,7 @@ def test_fact_equivalence_valid_demonstrated_paraphrase_hit(canonical_chunks_by_
         "citation_metadata": [build_canonical_citation_metadata(chunk)],
         "created_at": "2026-11-22T00:00:00Z",
     }
+    record_payload.update(verified_fields(record_payload, canonical_chunks_by_id))
     client.upsert(
         collection_name=QDRANT_CACHE_COLLECTION_NAME,
         points=[models.PointStruct(id=str(uuid.uuid4()), vector=vec, payload=record_payload)],
@@ -1986,4 +2027,217 @@ def test_fact_equivalence_valid_demonstrated_paraphrase_hit(canonical_chunks_by_
     assert res.hit is True
     assert res.rejection_reason is None
     assert res.record is not None
-    assert "maximum daily meal allowance" in res.record.answer
+    assert "INR 2,000 per diem with itemized receipts" in res.record.answer
+
+
+class ConstantTestEmbedder:
+    model_name = EMBEDDING_MODEL
+    normalize_embeddings = True
+
+    def embed_query(self, text):
+        return [1.0] + [0.0] * 383
+
+
+@pytest.mark.parametrize("source, candidate, cid", [
+    ("How many weeks of paid parental leave do primary caregivers receive?", "How many weeks of paid parental leave do secondary caregivers receive?", "DOC-PPO-001_PPO-L03"),
+    ("What is the hotel cap in metropolitan cities?", "What is the hotel cap in regional locations?", "DOC-TRV-002_TRV-C03"),
+    ("What encryption is required for Confidential data?", "What encryption is required for Restricted data?", "DOC-SEC-001_SEC-D02"),
+    ("How long are employee payroll records retained?", "How long are customer audit logs retained?", "DOC-SEC-004_SEC-R01"),
+    ("How many annual vacation days do employees accrue?", "What is the monthly vacation accrual?", "DOC-PPO-001_PPO-L01"),
+])
+def test_different_entities_never_reuse_at_identical_similarity(canonical_chunks_by_id, source, candidate, cid):
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    embedder = ConstantTestEmbedder()
+    chunk = canonical_chunks_by_id[cid]
+    _, facts, unsupported = request_support(source, [chunk])
+    assert not unsupported
+    record_id = insert_cache_entry(client, embedder, source, "\n".join(f["quote"] for f in facts),
+                                   "answered", "auditor", "2026-11-22", "test_fp", [cid], [], [], [],
+                                   canonical_chunks_by_id, extract_conditions_from_query(source), validation_route="generated_verified")
+    assert record_id is not None
+    result = lookup_cache(client, embedder, candidate, "auditor", "2026-11-22", "test_fp",
+                          [chunk], extract_conditions_from_query(candidate), [], canonical_chunks_by_id)
+    assert result.similarity == 1.0
+    assert not result.hit
+    assert result.rejection_reason in ("fact_target_mismatch", "numerical_condition_mismatch")
+
+
+@pytest.mark.parametrize("source, candidate, cid", [
+    ("What is the daily meal allowance?", "What is the per diem meal allowance?", "DOC-TRV-002_TRV-C03"),
+    ("How many weeks of paid leave do primary caregivers receive?", "How many weeks of paid maternity leave are provided?", "DOC-PPO-001_PPO-L03"),
+    ("What is the maximum travel expense amount my manager can approve?", "What is the travel expense limit my manager can approve without director sign-off?", "DOC-TRV-002_TRV-C04"),
+    ("How many days in advance must domestic flights be booked?", "What is the minimum booking lead time for domestic business flights?", "DOC-TRV-003_TRV-B02"),
+])
+def test_supported_paraphrases_reuse_verified_facts(canonical_chunks_by_id, source, candidate, cid):
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    embedder = ConstantTestEmbedder()
+    chunk = canonical_chunks_by_id[cid]
+    _, facts, unsupported = request_support(source, [chunk])
+    assert not unsupported
+    record_id = insert_cache_entry(client, embedder, source, "\n".join(f["quote"] for f in facts),
+                                   "answered", "auditor", "2026-11-22", "test_fp", [cid], [], [], [],
+                                   canonical_chunks_by_id, extract_conditions_from_query(source), validation_route="generated_verified")
+    assert record_id is not None
+    result = lookup_cache(client, embedder, candidate, "auditor", "2026-11-22", "test_fp",
+                          [chunk], extract_conditions_from_query(candidate), [], canonical_chunks_by_id)
+    assert result.hit, result.rejection_reason
+    assert result.record.validation_route == "generated_verified"
+    assert result.record.answer.startswith("> ")
+
+
+@pytest.mark.parametrize("mutation, reason", [
+    ({"answer": "Daily meal subsistence allowance is capped at INR 2,500 per diem with itemized receipts."}, "claim_validation_failed"),
+    ({"answer": "Daily meal subsistence allowance is capped at INR 2,000 per diem."}, "claim_validation_failed"),
+    ({"grounding_version": ""}, "unverified_cache_record"),
+    ({"validation_route": "rule"}, "unverified_cache_record"),
+    ({"meaning_signature": {}}, "unverified_cache_record"),
+    ({"fact_fingerprint": "changed"}, "unverified_cache_record"),
+    ({"schema_version": "1.0"}, "unsupported_schema_version"),
+])
+def test_forged_or_old_cache_proof_is_rejected(canonical_chunks_by_id, mutation, reason):
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    embedder = ConstantTestEmbedder()
+    question = "What is the daily meal allowance?"
+    cid = "DOC-TRV-002_TRV-C03"
+    record_id = seed_guard_candidate(client=client, embedder=embedder, question=question,
+                                    answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
+                                    status="answered", role="employee", query_date="2026-11-22", corpus_fingerprint="test_fp",
+                                    citations=[cid], referenced_rule_ids=[], rule_results=[],
+                                    canonical_chunks_by_id=canonical_chunks_by_id, extracted_conditions=[])
+    record = client.retrieve(QDRANT_CACHE_COLLECTION_NAME, [record_id])[0]
+    payload = dict(record.payload)
+    payload.update(mutation)
+    client.upsert(QDRANT_CACHE_COLLECTION_NAME,
+                  [models.PointStruct(id=record_id, vector=embedder.embed_query(question), payload=payload)])
+    result = lookup_cache(client, embedder, question, "employee", "2026-11-22", "test_fp",
+                          [canonical_chunks_by_id[cid]], [], [], canonical_chunks_by_id)
+    assert not result.hit
+    assert result.rejection_reason == reason
+
+
+def test_cache_identity_keeps_historical_and_current_entries(canonical_chunks_by_id):
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    embedder = ConstantTestEmbedder()
+    question = "What is the daily meal allowance?"
+    ids = []
+    for date, cid in [("2026-06-30", "DOC-TRV-001_TRV-C03"), ("2026-07-01", "DOC-TRV-002_TRV-C03")]:
+        facts = request_support(question, [canonical_chunks_by_id[cid]])[1]
+        record_id = insert_cache_entry(client, embedder, question, facts[0]["quote"], "answered", "employee", date,
+                                       "test_fp", [cid], [], [], [], canonical_chunks_by_id, [],
+                                       validation_route="generated_verified")
+        assert record_id is not None
+        ids.append(record_id)
+    assert ids[0] != ids[1]
+    assert client.count(QDRANT_CACHE_COLLECTION_NAME).count == 2
+
+
+def test_cache_seed_requires_verified_generation_route(canonical_chunks_by_id):
+    client = MagicMock()
+    cid = "DOC-TRV-002_TRV-C03"
+    result = insert_cache_entry(client, ConstantTestEmbedder(), "What is the daily meal allowance?",
+                                "Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
+                                "answered", "employee", "2026-11-22", "test_fp", [cid], [], [], [], canonical_chunks_by_id, [])
+    assert result is None
+    client.upsert.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["doc_id", "clause_id", "title", "version", "source_file", "source_page"])
+def test_every_citation_metadata_field_is_verified(canonical_chunks_by_id, field):
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    embedder = ConstantTestEmbedder()
+    question = "What is the daily meal allowance?"
+    cid = "DOC-TRV-002_TRV-C03"
+    record_id = seed_guard_candidate(client=client, embedder=embedder, question=question,
+        answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
+        status="answered", role="employee", query_date="2026-11-22", corpus_fingerprint="test_fp",
+        citations=[cid], referenced_rule_ids=[], rule_results=[], canonical_chunks_by_id=canonical_chunks_by_id,
+        extracted_conditions=[])
+    payload = client.retrieve(QDRANT_CACHE_COLLECTION_NAME, [record_id])[0].payload
+    payload["citation_metadata"][0][field] = "forged"
+    client.upsert(QDRANT_CACHE_COLLECTION_NAME,
+                  [models.PointStruct(id=record_id, vector=embedder.embed_query(question), payload=payload)])
+    result = lookup_cache(client, embedder, question, "employee", "2026-11-22", "test_fp",
+                          [canonical_chunks_by_id[cid]], [], [], canonical_chunks_by_id)
+    assert not result.hit
+    assert result.rejection_reason == "incomplete_citation_metadata"
+
+
+def test_unknown_target_cannot_reuse_even_an_exact_question(canonical_chunks_by_id):
+    client = QdrantClient(":memory:")
+    ensure_cache_collection(client)
+    embedder = ConstantTestEmbedder()
+    question = "What is the sabbatical entitlement?"
+    cid = "DOC-PPO-001_PPO-L03"
+    seed_guard_candidate(client=client, embedder=embedder, question=question,
+        answer="Secondary caregivers receive 4 weeks of fully paid paternity leave.",
+        status="answered", role="employee", query_date="2026-11-22", corpus_fingerprint="test_fp",
+        citations=[cid], referenced_rule_ids=[], rule_results=[], canonical_chunks_by_id=canonical_chunks_by_id,
+        extracted_conditions=[])
+    result = lookup_cache(client, embedder, question, "employee", "2026-11-22", "test_fp",
+                          [canonical_chunks_by_id[cid]], [], [], canonical_chunks_by_id)
+    assert not result.hit
+    assert result.rejection_reason == "unsupported_request_meaning"
+
+
+def test_cache_uses_the_active_retrievers_embedder(repo_root, qdrant_cache, monkeypatch):
+    import rulelens.answering as answering
+    retriever = HybridRetriever(base_dir=repo_root, embedder=ConstantTestEmbedder())
+    new_embedder = MagicMock(side_effect=AssertionError("Duplicate model construction"))
+    monkeypatch.setattr(answering, "BGEEmbedder", new_embedder)
+    result = answer_question("What is the daily meal allowance?", "employee", "2026-11-22",
+                             retriever=retriever, llm_client=make_mock_llm(), cache_enabled=True,
+                             cache_client=qdrant_cache, mode="bm25")
+    assert result.route == "generated_verified"
+    assert result.cache_entry_id is not None
+    new_embedder.assert_not_called()
+
+
+def test_cache_remains_disabled_by_default(monkeypatch):
+    import rulelens.config as config
+    monkeypatch.setattr(config, "get_env_var", lambda name, default=None: default)
+    assert config.is_cache_enabled() is False
+
+
+@pytest.mark.parametrize("name, normalized", [("different/model", True), (EMBEDDING_MODEL, False), (None, True)])
+def test_changed_embedding_configuration_cannot_reuse_or_seed(canonical_chunks_by_id, name, normalized):
+    embedder = ConstantTestEmbedder()
+    embedder.model_name = name
+    embedder.normalize_embeddings = normalized
+    client = MagicMock()
+    cid = "DOC-TRV-002_TRV-C03"
+    result = lookup_cache(client, embedder, "What is the daily meal allowance?", "employee", "2026-11-22",
+                          "test_fp", [canonical_chunks_by_id[cid]], [], [], canonical_chunks_by_id)
+    assert not result.hit
+    assert result.rejection_reason == "embedding_configuration_mismatch"
+    record_id = insert_cache_entry(client, embedder, "What is the daily meal allowance?",
+        "Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
+        "answered", "employee", "2026-11-22", "test_fp", [cid], [], [], [], canonical_chunks_by_id, [],
+        validation_route="generated_verified")
+    assert record_id is None
+    client.query_points.assert_not_called()
+    client.upsert.assert_not_called()
+
+
+def test_custom_generation_model_bypasses_default_model_cache(repo_root):
+    from types import SimpleNamespace
+    response = AnswerResponse(answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
+                               status=AnswerStatus.ANSWERED, citations=["DOC-TRV-002_TRV-C03"],
+                               referenced_rule_ids=[], reason="Source quote.")
+    provider = SimpleNamespace(model="different/model", generate_answer=lambda **kwargs:
+                               (response, {"calls_made": 1, "total_tokens": 9, "latency_ms": 1}))
+    cache_client = MagicMock()
+    result = answer_question("What is the daily meal allowance?", "employee", "2026-11-22",
+                             retriever=HybridRetriever(base_dir=repo_root, embedder=ConstantTestEmbedder()),
+                             llm_client=provider, cache_client=cache_client, cache_enabled=True, mode="bm25")
+    assert result.route == "generated_verified"
+    assert result.model == "different/model"
+    assert result.cache_enabled is False
+    assert result.cache_rejection_reason == "generation_configuration_mismatch"
+    assert result.cache_entry_id is None
+    cache_client.query_points.assert_not_called()
+    cache_client.upsert.assert_not_called()

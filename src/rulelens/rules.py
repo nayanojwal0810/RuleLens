@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from rulelens.dataset import ROLES
-from rulelens.retrieval import ALLOWED_ROLES_SET, parse_query_date
+from rulelens.grounding import request_meaning
+from rulelens.ingestion import CorpusSnapshot, assert_snapshot_current, get_corpus_snapshot
+from rulelens.retrieval import ALLOWED_ROLES_SET, is_chunk_eligible, parse_query_date
 
 
 @dataclass(frozen=True)
@@ -103,8 +105,6 @@ class AuthoritativeDecision:
     is_decision_request: bool = False
 
 
-# Cache loaded rules keyed by base_dir to avoid cross-corpus pollution
-_RULES_CACHE: Dict[Path, List[RuleRecord]] = {}
 @dataclass(frozen=True)
 class _RulesCacheEntry:
     fingerprint: str
@@ -274,12 +274,16 @@ def evaluate_rule_condition(
     try:
         clean_thresh_str = str(threshold).strip().replace(",", "")
         numeric_threshold = Decimal(clean_thresh_str)
+        if not numeric_threshold.is_finite():
+            raise ValueError("Non-finite rule threshold.")
 
         if comp == "range":
             c_min = min_value if min_value is not None else (value[0] if isinstance(value, (list, tuple)) else value)
             c_max = max_value if max_value is not None else (value[1] if isinstance(value, (list, tuple)) else value)
             numeric_min = Decimal(str(c_min).strip().replace(",", ""))
             numeric_max = Decimal(str(c_max).strip().replace(",", ""))
+            if not numeric_min.is_finite() or not numeric_max.is_finite():
+                raise ValueError("Non-finite range.")
             if numeric_min > numeric_max:
                 numeric_min, numeric_max = numeric_max, numeric_min
             if numeric_min < 0:
@@ -287,6 +291,8 @@ def evaluate_rule_condition(
         else:
             clean_val_str = str(value).strip().replace(",", "")
             numeric_val = Decimal(clean_val_str)
+            if not numeric_val.is_finite():
+                raise ValueError("Non-finite condition.")
             if numeric_val < 0:
                 raise ValueError(f"Negative values ({numeric_val}) are unsupported for policy rules.")
     except (InvalidOperation, ValueError, TypeError) as exc:
@@ -357,6 +363,7 @@ def resolve_rules_for_evidence(
     query_date: Optional[Union[str, datetime.date]] = None,
     base_dir: Optional[Union[Path, str]] = None,
     extracted_conditions: Optional[Sequence[Dict[str, Any]]] = None,
+    corpus_snapshot: Optional[CorpusSnapshot] = None,
 ) -> List[RuleEvaluationResult]:
     """Resolve applicable structured rules for authorized evidence chunks.
 
@@ -379,10 +386,21 @@ def resolve_rules_for_evidence(
         raise ValueError(f"Unknown role '{role}'. Allowed roles are: {sorted(ALLOWED_ROLES_SET)}")
 
     q_date = parse_query_date(query_date)
-    all_rules = load_rules(base_dir=base_dir)
+    snapshot = corpus_snapshot or get_corpus_snapshot(base_dir)
+    assert_snapshot_current(snapshot)
+    all_rules = load_rules(base_dir=snapshot.base_dir)
+    rule_data = [{k: v for k, v in rule.to_dict().items() if k != "chunk_id"} for rule in all_rules]
+    if rule_data != snapshot.rules:
+        raise ValueError("Rules do not match the validated corpus snapshot.")
+    canonical = {chunk["chunk_id"]: chunk for chunk in snapshot.chunks}
 
     # Set of chunk IDs in authorized evidence
     authorized_cids = {c["chunk_id"] for c in authorized_chunks}
+    for chunk_id in authorized_cids:
+        if chunk_id not in canonical:
+            raise ValueError("Unknown rule evidence.")
+    authorized_cids = {cid for cid in authorized_cids if is_chunk_eligible(canonical[cid], role, q_date)}
+    assert_snapshot_current(snapshot)
 
     # Map conditions by field for evaluation
     cond_map: Dict[str, Dict[str, Any]] = {}
@@ -590,34 +608,30 @@ def resolve_rules_for_evidence(
 
 
 # Regular expressions for conservative condition extraction from natural language questions
+_CURRENCY_MARKERS = r"inr|rs\.?|₹|usd|\$|eur|€|gbp|£"
 _CURRENCY_PATTERN = re.compile(
-    r"(?P<neg1>-)?\s*(?P<prefix>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*(?P<neg2>-)?\s*(?P<num>[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?P<suffix>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)?",
+    rf"(?<![\w.])(?P<sign>-)?\s*(?P<prefix>{_CURRENCY_MARKERS})?\s*"
+    r"(?P<num>-?(?:[0-9][0-9,.]*(?:[eE][+-]?[0-9]+)?|nan|infinity|inf))"
+    r"(?P<attached>[a-z]+)?"
+    r"(?:\s+(?P<scale>k|lakhs?|crores?|million|billion|mn|cr)\b)?"
+    r"(?:\s*(?P<suffix>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)\b)?",
     re.IGNORECASE,
 )
-_RANGE_CURRENCY_PATTERN = re.compile(
-    r"\b(?:between|from)\s+(?:(?P<neg1>-)?\s*(?P<pre1>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*(?P<neg2>-)?\s*(?P<num1>[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?))\s*(?:(?P<suf1>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?)\s*)?(?:and|to)\s+(?:(?P<neg3>-)?\s*(?P<pre2>inr|rs\.?|₹|\$|usd|€|eur|£|gbp)?\s*(?P<neg4>-)?\s*(?P<num2>[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?))\s*(?:(?P<suf2>inr|rupees?|usd|dollars?|eur|euros?|gbp|pounds?))?\b",
-    re.IGNORECASE,
+_VALID_AMOUNT = re.compile(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})(?:\.[0-9]+)?")
+_CURRENCY_UNITS = {"inr":"INR", "rs":"INR", "rs.":"INR", "₹":"INR", "rupee":"INR", "rupees":"INR",
+                   "usd":"USD", "$":"USD", "dollar":"USD", "dollars":"USD",
+                   "eur":"EUR", "€":"EUR", "euro":"EUR", "euros":"EUR",
+                   "gbp":"GBP", "£":"GBP", "pound":"GBP", "pounds":"GBP"}
+_AMOUNT_SCALES = {"k":Decimal("1000"), "lakh":Decimal("100000"), "lakhs":Decimal("100000"),
+                  "crore":Decimal("10000000"), "crores":Decimal("10000000")}
+
+
+_UNIT_PATTERN = re.compile(
+    r"(?<![\w.])(?P<num>-?(?:[0-9][0-9,.]*(?:[eE][+-]?[0-9]+)?|nan|infinity|inf))\s*"
+    r"(?:(?P<kind>consecutive|business|working|calendar)\s*)?"
+    r"(?P<unit>days?|months?|hours?|mbps|years?|weeks?|minutes?|seconds?)\b", re.IGNORECASE,
 )
-_DAYS_PATTERN = re.compile(
-    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
-    re.IGNORECASE,
-)
-_RANGE_DAYS_PATTERN = re.compile(
-    r"\b(?:between|from)\s+(?:(?P<neg1>-)?\s*(?P<num1>[0-9]+))\s+(?:and|to)\s+(?:(?P<neg2>-)?\s*(?P<num2>[0-9]+))\s*(?:consecutive\s*)?(?:business\s*|working\s*|calendar\s*)?days?\b",
-    re.IGNORECASE,
-)
-_MONTHS_PATTERN = re.compile(
-    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*months?\b",
-    re.IGNORECASE,
-)
-_MBPS_PATTERN = re.compile(
-    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*mbps\b",
-    re.IGNORECASE,
-)
-_HOURS_PATTERN = re.compile(
-    r"(?P<neg>-)?\s*\b(?P<num>[0-9]+)\s*hours?\b",
-    re.IGNORECASE,
-)
+
 
 def _detect_comparison_operator(query: str, match_start: int, match_end: int) -> str:
     """Detect directional comparison modifiers in the vicinity of a numerical match."""
@@ -911,6 +925,156 @@ def _determine_currency_field(query_lower: str, span_lower: str) -> Optional[str
     return None
 
 
+def _extract_currency_conditions(query: str) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+    amounts = []
+    unit_decision = bool(re.match(r"\s*(?:can|could|may|is|are|does|do)\b", query, re.I)
+                         and re.search(r"\b(?:internet speed|contract duration|sick leave|flight booking|review interval|incident response)\b", query, re.I))
+    date_spans = [match.span() for match in re.finditer(r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}\b", query)]
+    for match in _CURRENCY_PATTERN.finditer(query):
+        if any(start <= match.start() < end for start, end in date_spans):
+            continue
+        prefix = (match.group("prefix") or "").lower()
+        suffix = (match.group("suffix") or "").lower()
+        attached = (match.group("attached") or "").lower()
+        scale = (match.group("scale") or "").lower()
+        if not prefix and not suffix and re.search(r"\b(?:priority|severity|tier)\s*$", query[:match.start()], re.I):
+            continue
+        if attached in _CURRENCY_UNITS:
+            suffix, attached = attached, ""
+        if not prefix and not suffix and re.match(r"\s*(?:consecutive\s+|working\s+|business\s+|calendar\s+)?(?:days?|months?|hours?|weeks?|years?|mbps|percent)\b", query[match.end():], re.I):
+            continue
+        if not prefix and not suffix and not attached and not scale and not unit_decision and not re.search(r"\b(?:amounts?|expenses?|spend|spending|costs?|price|claims?|purchase orders?|tuition|credit|cap|limit)\b", query, re.I):
+            continue
+        if not prefix and not suffix and re.match(r"\s*(?:and|to)\s*-?[0-9][0-9,.]*\s*(?:days?|months?|hours?|mbps)\b", query[match.end():], re.I):
+            continue
+        raw = match.group("num")
+        if raw.endswith(","):
+            raw = raw[:-1]
+        if raw.endswith(".") and raw.count(".") == 1:
+            raw = raw[:-1]
+        negative = bool(match.group("sign")) or raw.startswith("-")
+        digits = raw.lstrip("-")
+        if digits.isdigit() and 2000 <= int(digits) <= 2099 and not (prefix or suffix or attached or scale):
+            continue
+        field = _determine_currency_field(query.lower(), match.group().lower()) or "unresolved_amount"
+        units = {_CURRENCY_UNITS[item] for item in (prefix, suffix) if item in _CURRENCY_UNITS}
+        unit = next(iter(units)) if len(units) == 1 else ""
+        error = None
+        value = None
+        multiplier = attached or scale
+        if (attached and scale) or (multiplier and multiplier not in _AMOUNT_SCALES) or not _VALID_AMOUNT.fullmatch(digits):
+            error = "Invalid monetary expression. Provide a complete amount with valid grouping and a supported suffix."
+        else:
+            value = Decimal(digits.replace(",", "")) * _AMOUNT_SCALES.get(multiplier, Decimal(1))
+            if negative:
+                value = -value
+                error = "Negative amounts cannot be evaluated."
+        if len(units) > 1:
+            error = "Conflicting currencies cannot be evaluated."
+        amounts.append({"field":field, "value":value, "unit":unit,
+                        "comparison":_detect_comparison_operator(query, match.start(), match.end()),
+                        "min_value":None, "max_value":None, "is_boundary_crossing":False,
+                        "cannot_evaluate":bool(error), "cannot_evaluate_reason":error,
+                        "span":match.span()})
+    conditions = []
+    spans = []
+    index = 0
+    while index < len(amounts):
+        amount = amounts[index]
+        start, end = amount.pop("span")
+        spans.append((start, end))
+        if index + 1 < len(amounts):
+            other = amounts[index + 1]
+            other_start, other_end = other["span"]
+            before = query[max(0, start - 12):start]
+            between = query[end:other_start]
+            if re.search(r"\b(?:between|from)\s*$", before, re.I) and re.fullmatch(r"\s*(?:and|to)\s*", between, re.I):
+                spans.append((other_start, other_end))
+                unit = amount["unit"] or other["unit"]
+                error = amount["cannot_evaluate_reason"] or other["cannot_evaluate_reason"]
+                if amount["unit"] and other["unit"] and amount["unit"] != other["unit"]:
+                    error = "Incompatible units in the amount range."
+                lower, upper = amount["value"], other["value"]
+                if lower is None or upper is None or lower > upper:
+                    error = error or "Provide the range in increasing order."
+                amount.update(value=(lower, upper), unit=unit, comparison="range", min_value=lower, max_value=upper,
+                              cannot_evaluate=bool(error), cannot_evaluate_reason=error)
+                index += 1
+        if not amount["unit"]:
+            amount.update(cannot_evaluate=True, cannot_evaluate_reason="Specify the currency or measurement unit for the value.")
+        conditions.append(amount)
+        index += 1
+    return conditions, spans
+
+
+def _extract_unit_conditions(query: str, covered_spans: Sequence[Tuple[int, int]]) -> List[Dict[str, Any]]:
+    q_lower = query.lower()
+    entries = []
+    for match in _UNIT_PATTERN.finditer(query):
+        if any(start <= match.start() < end for start, end in covered_spans):
+            continue
+        unit = match.group("unit").lower()
+        unit = unit if unit == "mbps" else unit.rstrip("s") + "s"
+        field = None
+        if unit == "mbps":
+            field = "internet_speed_mbps"
+        elif any(k in q_lower for k in ("contract", "agreement")):
+            field = "contract_duration_months"
+        elif any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
+            field = "advance_booking_days"
+        elif any(k in q_lower for k in ("submit", "submission", "delay", "expense claim", "reimbursement")):
+            field = "submission_delay_days"
+        elif any(k in q_lower for k in ("sick", "illness", "medical")):
+            field = "consecutive_sick_days"
+        elif any(k in q_lower for k in ("recertification", "access review", "privileged")):
+            field = "privileged_role_review_interval_days"
+        elif any(k in q_lower for k in ("incident", "p1", "severity", "sla")):
+            field = "incident_severity_p1_response_hours"
+        if field is None:
+            continue
+        raw = match.group("num")
+        value = Decimal(raw.replace(",", "")) if _VALID_AMOUNT.fullmatch(raw.lstrip("-")) else None
+        error = None
+        if value is None or value < 0:
+            error = "Provide a valid non-negative duration or speed with its unit."
+        if match.group("kind") in ("business", "working"):
+            error = "The structured rule does not define a working-day conversion. Please clarify the day unit."
+        entry = {"field":field, "value":value, "unit":unit,
+                 "comparison":_detect_comparison_operator(query, match.start(), match.end()),
+                 "min_value":None, "max_value":None, "is_boundary_crossing":False,
+                 "cannot_evaluate":bool(error), "cannot_evaluate_reason":error, "span":match.span()}
+        entries.append(entry)
+    conditions = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        start, end = entry.pop("span")
+        lower = upper = None
+        range_found = False
+        before = query[:start]
+        bare_range = re.search(r"\b(?:between|from)\s+(-?[0-9][0-9,.]*)\s+(?:and|to)\s*$", before, re.I)
+        if bare_range:
+            raw = bare_range.group(1)
+            lower = Decimal(raw.replace(",", "")) if _VALID_AMOUNT.fullmatch(raw.lstrip("-")) else None
+            upper = entry["value"]
+            range_found = True
+        elif index + 1 < len(entries) and re.search(r"\b(?:between|from)\s*$", before, re.I):
+            other = entries[index + 1]
+            if re.fullmatch(r"\s*(?:and|to)\s*", query[end:other["span"][0]], re.I):
+                lower, upper = entry["value"], other["value"]
+                range_found = True
+                if entry["unit"] != other["unit"] or other["cannot_evaluate"]:
+                    entry.update(cannot_evaluate=True, cannot_evaluate_reason="Clarify the units in the range.")
+                index += 1
+        if range_found:
+            if lower is None or upper is None or lower < 0 or upper < lower:
+                entry.update(cannot_evaluate=True, cannot_evaluate_reason="Provide a non-negative range in increasing order.")
+            entry.update(value=(lower, upper), comparison="range", min_value=lower, max_value=upper)
+        conditions.append(entry)
+        index += 1
+    return conditions
+
+
 def extract_conditions_from_query(
     query: str,
     relevant_fields: Optional[Set[str]] = None,
@@ -971,256 +1135,11 @@ def extract_conditions_from_query(
             "is_boundary_crossing": False,
         })
 
-    # Check for currency ranges: "between INR 40,000 and 60,000" / "from 40000 to 60000 INR"
-    for match in _RANGE_CURRENCY_PATTERN.finditer(query):
-        raw_num1 = match.group("num1").replace(",", "")
-        raw_num2 = match.group("num2").replace(",", "")
-        try:
-            val1 = Decimal(raw_num1)
-            if match.group("neg1") or match.group("neg2"):
-                val1 = -val1
-            val2 = Decimal(raw_num2)
-            if match.group("neg3") or match.group("neg4"):
-                val2 = -val2
-        except (InvalidOperation, ValueError):
-            continue
+    money_conditions, money_spans = _extract_currency_conditions(query)
+    raw_candidates.extend(money_conditions)
+    covered_spans.extend(money_spans)
 
-        min_val = min(val1, val2)
-        max_val = max(val1, val2)
-        cannot_eval = (min_val < 0 or max_val < 0)
-        span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
-
-        # Determine currency unit
-        p1 = (match.group("pre1") or "").lower()
-        s1 = (match.group("suf1") or "").lower()
-        p2 = (match.group("pre2") or "").lower()
-        s2 = (match.group("suf2") or "").lower()
-
-        if any(p in ("$", "usd") or s in ("usd", "dollar", "dollars") for p, s in ((p1, s1), (p2, s2))) or any(k in span for k in ("usd", "$", "dollar")):
-            curr_unit = "USD"
-        elif any(p in ("€", "eur") or s in ("eur", "euro", "euros") for p, s in ((p1, s1), (p2, s2))) or any(k in span for k in ("eur", "€", "euro")):
-            curr_unit = "EUR"
-        elif any(p in ("£", "gbp") or s in ("gbp", "pound", "pounds") for p, s in ((p1, s1), (p2, s2))) or any(k in span for k in ("gbp", "£", "pound")):
-            curr_unit = "GBP"
-        else:
-            curr_unit = "INR"
-
-        field = _determine_currency_field(q_lower, span)
-        if field:
-            raw_candidates.append({
-                "field": field,
-                "value": (min_val, max_val),
-                "unit": curr_unit,
-                "comparison": "range",
-                "min_value": min_val,
-                "max_value": max_val,
-                "is_boundary_crossing": False,
-                "cannot_evaluate": cannot_eval,
-                "cannot_evaluate_reason": "Negative values are unsupported for policy rules." if cannot_eval else None,
-            })
-            covered_spans.append((match.start(), match.end()))
-
-    # Check for days ranges: "between 10 and 20 days"
-    for match in _RANGE_DAYS_PATTERN.finditer(query):
-        try:
-            d1 = int(match.group("num1"))
-            if match.group("neg1"):
-                d1 = -d1
-            d2 = int(match.group("num2"))
-            if match.group("neg2"):
-                d2 = -d2
-        except (ValueError, IndexError):
-            continue
-        min_d = min(d1, d2)
-        max_d = max(d1, d2)
-        cannot_eval = (min_d < 0 or max_d < 0)
-        field = None
-        if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
-            field = "advance_booking_days"
-        elif any(k in q_lower for k in ("submit", "submission", "delay", "expense claim", "reimbursement")):
-            field = "submission_delay_days"
-        elif any(k in q_lower for k in ("sick", "illness", "medical")):
-            field = "consecutive_sick_days"
-        elif any(k in q_lower for k in ("recertification", "access review", "privileged")):
-            field = "privileged_role_review_interval_days"
-
-        if field:
-            raw_candidates.append({
-                "field": field,
-                "value": (min_d, max_d),
-                "unit": "days",
-                "comparison": "range",
-                "min_value": min_d,
-                "max_value": max_d,
-                "is_boundary_crossing": False,
-                "cannot_evaluate": cannot_eval,
-                "cannot_evaluate_reason": "Negative values are unsupported for policy rules." if cannot_eval else None,
-            })
-            covered_spans.append((match.start(), match.end()))
-
-    # Check for single currency amounts using Decimal precision directly from string
-    for match in _CURRENCY_PATTERN.finditer(query):
-        # Skip if within an already-extracted range
-        if any(start <= match.start() < end for start, end in covered_spans):
-            continue
-
-        raw_num = match.group("num").replace(",", "")
-        try:
-            val = Decimal(raw_num)
-            if match.group("neg1") or match.group("neg2"):
-                val = -val
-        except (InvalidOperation, ValueError):
-            continue
-        prefix = (match.group("prefix") or "").lower()
-        suffix = (match.group("suffix") or "").lower()
-        span = query[max(0, match.start() - 10) : min(len(query), match.end() + 10)].lower()
-
-        # Determine explicit currency unit
-        if prefix in ("$", "usd") or suffix in ("usd", "dollar", "dollars") or any(k in span for k in ("usd", "$", "dollar")):
-            curr_unit = "USD"
-        elif prefix in ("€", "eur") or suffix in ("eur", "euro", "euros") or any(k in span for k in ("eur", "€", "euro")):
-            curr_unit = "EUR"
-        elif prefix in ("£", "gbp") or suffix in ("gbp", "pound", "pounds") or any(k in span for k in ("gbp", "£", "pound")):
-            curr_unit = "GBP"
-        elif prefix in ("₹", "inr", "rs", "rs.") or suffix in ("inr", "rupee", "rupees") or any(k in span for k in ("inr", "rs", "₹", "rupee")):
-            curr_unit = "INR"
-        else:
-            # Check global query currency markers
-            if any(k in q_lower for k in ("usd", "$", "dollar")):
-                curr_unit = "USD"
-            elif any(k in q_lower for k in ("eur", "€", "euro")):
-                curr_unit = "EUR"
-            elif any(k in q_lower for k in ("gbp", "£", "pound")):
-                curr_unit = "GBP"
-            else:
-                curr_unit = "INR"
-
-        has_curr_mark = (
-            prefix != ""
-            or suffix != ""
-            or any(k in span for k in ("inr", "rs", "₹", "rupee", "$", "usd", "dollar", "€", "eur", "euro", "£", "gbp", "pound", "cost", "amount", "spend", "claim", "price"))
-        )
-        if 2000 <= val <= 2099 and not (prefix or suffix or any(k in span for k in ("inr", "rs", "₹", "$", "usd", "€", "eur", "£", "gbp"))):
-            continue
-        if has_curr_mark:
-            field = _determine_currency_field(q_lower, span)
-            if field:
-                comp = _detect_comparison_operator(query, match.start(), match.end())
-                cannot_eval = (val < 0)
-                raw_candidates.append({
-                    "field": field,
-                    "value": val,
-                    "unit": curr_unit,
-                    "comparison": comp,
-                    "min_value": None,
-                    "max_value": None,
-                    "is_boundary_crossing": False,
-                    "cannot_evaluate": cannot_eval,
-                    "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
-                })
-
-    # Check for days
-    for match in _DAYS_PATTERN.finditer(query):
-        if any(start <= match.start() < end for start, end in covered_spans):
-            continue
-        try:
-            val = int(match.group("num"))
-            if match.group("neg"):
-                val = -val
-        except (ValueError, IndexError):
-            continue
-        field = None
-        if any(k in q_lower for k in ("advance", "booking", "departure", "flight")):
-            field = "advance_booking_days"
-        elif any(k in q_lower for k in ("submit", "submission", "delay", "expense claim", "reimbursement")):
-            field = "submission_delay_days"
-        elif any(k in q_lower for k in ("sick", "illness", "medical")):
-            field = "consecutive_sick_days"
-        elif any(k in q_lower for k in ("recertification", "access review", "privileged")):
-            field = "privileged_role_review_interval_days"
-
-        if field:
-            comp = _detect_comparison_operator(query, match.start(), match.end())
-            cannot_eval = (val < 0)
-            raw_candidates.append({
-                "field": field,
-                "value": val,
-                "unit": "days",
-                "comparison": comp,
-                "min_value": None,
-                "max_value": None,
-                "is_boundary_crossing": False,
-                "cannot_evaluate": cannot_eval,
-                "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
-            })
-
-    # Check for months
-    for match in _MONTHS_PATTERN.finditer(query):
-        try:
-            val = int(match.group("num"))
-            if match.group("neg"):
-                val = -val
-        except (ValueError, IndexError):
-            continue
-        if any(k in q_lower for k in ("contract", "duration", "agreement")):
-            comp = _detect_comparison_operator(query, match.start(), match.end())
-            cannot_eval = (val < 0)
-            raw_candidates.append({
-                "field": "contract_duration_months",
-                "value": val,
-                "unit": "months",
-                "comparison": comp,
-                "min_value": None,
-                "max_value": None,
-                "is_boundary_crossing": False,
-                "cannot_evaluate": cannot_eval,
-                "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
-            })
-
-    # Check for mbps
-    for match in _MBPS_PATTERN.finditer(query):
-        try:
-            val = int(match.group("num"))
-            if match.group("neg"):
-                val = -val
-        except (ValueError, IndexError):
-            continue
-        comp = _detect_comparison_operator(query, match.start(), match.end())
-        cannot_eval = (val < 0)
-        raw_candidates.append({
-            "field": "internet_speed_mbps",
-            "value": val,
-            "unit": "mbps",
-            "comparison": comp,
-            "min_value": None,
-            "max_value": None,
-            "is_boundary_crossing": False,
-            "cannot_evaluate": cannot_eval,
-            "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
-        })
-
-    # Check for hours
-    for match in _HOURS_PATTERN.finditer(query):
-        try:
-            val = int(match.group("num"))
-            if match.group("neg"):
-                val = -val
-        except (ValueError, IndexError):
-            continue
-        if any(k in q_lower for k in ("incident", "p1", "severity", "sla")):
-            comp = _detect_comparison_operator(query, match.start(), match.end())
-            cannot_eval = (val < 0)
-            raw_candidates.append({
-                "field": "incident_severity_p1_response_hours",
-                "value": val,
-                "unit": "hours",
-                "comparison": comp,
-                "min_value": None,
-                "max_value": None,
-                "is_boundary_crossing": False,
-                "cannot_evaluate": cannot_eval,
-                "cannot_evaluate_reason": f"Negative value '{val}' is unsupported for policy rules." if cannot_eval else None,
-            })
+    raw_candidates.extend(_extract_unit_conditions(query, covered_spans))
 
     # Filter to relevant fields if specified
     if relevant_fields is not None:
@@ -1300,6 +1219,8 @@ def extract_condition_result(
         return ConditionExtractionResult(status="missing", conditions=[])
 
     conds = extract_conditions_from_query(query, relevant_fields=relevant_fields)
+    if any(c.get("cannot_evaluate") for c in conds):
+        return ConditionExtractionResult(status="invalid", conditions=conds, reason="; ".join(c.get("cannot_evaluate_reason") or "Invalid condition." for c in conds if c.get("cannot_evaluate")))
     if any(c.get("is_ambiguous") for c in conds):
         ambig_reasons = [c.get("error") for c in conds if c.get("is_ambiguous")]
         return ConditionExtractionResult(
@@ -1364,7 +1285,7 @@ def _format_canonical_decision_answer(
     elif outcome == "cfo_approval":
         return f"Chief Financial Officer (CFO) approval is required for travel exception expenses {val_phrase} (exceeding {thresh} {rule.unit})."
     elif outcome == "eligible_reimbursement":
-        return f"The expense claim submitted {days_phrase} is eligible for standard reimbursement (within the {thresh}-day limit)."
+        return f"The expense claim submitted {days_phrase} meets the {thresh}-day submission deadline. Other reimbursement requirements still apply."
     elif outcome == "requires_late_exception":
         return f"A late submission exception approval is required for expense claims submitted after {cond_val} days (exceeding the {thresh}-day deadline)."
     elif outcome == "no_receipt_required":
@@ -1384,7 +1305,7 @@ def _format_canonical_decision_answer(
     elif outcome == "remediation_required":
         return f"Internet speed remediation is required because {cond_val} Mbps does not meet the minimum requirement of {thresh} {rule.unit}."
     elif outcome == "standard_tuition_grant":
-        return f"The tuition claim {val_phrase} is eligible for a standard tuition grant (within {thresh} {rule.unit})."
+        return f"The tuition claim {val_phrase} is within the standard tuition grant amount of {thresh} {rule.unit}. This amount check does not establish eligibility."
     elif outcome == "committee_review_required":
         return f"Tuition reimbursement committee review is required for claims {val_phrase} exceeding the standard {thresh} {rule.unit} grant."
     elif outcome == "single_quote_permitted":
@@ -1392,7 +1313,7 @@ def _format_canonical_decision_answer(
     elif outcome == "three_competitive_quotes_required":
         return f"Three competitive supplier quotes are required for purchase orders {val_phrase} (exceeding {thresh} {rule.unit})."
     elif outcome == "department_lead_signoff":
-        return f"Department lead signoff is sufficient for vendor contracts {months_phrase} duration (up to {thresh} months)."
+        return f"Department lead signoff is the required duration-based approval for vendor contracts {months_phrase} (up to {thresh} months). Other contract requirements still apply."
     elif outcome == "legal_and_procurement_signoff":
         return f"Both Legal and Procurement signoff are required for vendor contracts {months_phrase} duration (exceeding {thresh} months)."
     elif outcome == "director_emergency_approval":
@@ -1416,6 +1337,7 @@ def _format_canonical_decision_answer(
 
 
 _DECISION_BENIGN_TERMS: Set[str] = {
+    "authorized", "otherwise", "already", "lakh", "lakhs", "crore", "crores",
     # Functional / grammatical terms
     "what", "is", "are", "was", "were", "can", "could", "does", "do", "did", "may", "might",
     "have", "has", "had", "will", "would", "shall", "should",
@@ -1523,7 +1445,6 @@ def evaluate_authoritative_rule_decision(
     7. Query is not an open-ended definition question or multi-clause question.
     """
     if not question or not question.strip():
-        return AuthoritativeDecision(is_authoritative=False)
         return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     q_lower = question.lower()
@@ -1532,12 +1453,10 @@ def evaluate_authoritative_rule_decision(
     explanatory_markers = (
         "what is the maximum", "what is the threshold", "what is the limit",
         "what are the tiers", "into what four", "what four severity",
-        "and what timeframe", "and who", "and when", "and within what"
         "and what timeframe", "and who", "and when", "and within what",
         "what are the rules", "explain ", "describe ", "how does", "how do", "overview of"
     )
     if any(em in q_lower for em in explanatory_markers):
-        return AuthoritativeDecision(is_authoritative=False)
         return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     # Must contain a decision indicator
@@ -1547,13 +1466,11 @@ def evaluate_authoritative_rule_decision(
         "compliant", "exceed", "escalat"
     )
     if not any(m in q_lower for m in decision_markers):
-        return AuthoritativeDecision(is_authoritative=False)
         return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     # Must have exactly one valid condition, and no ambiguous conditions
     # Check for ambiguous or conflicting condition inputs
     if any(c.get("is_ambiguous") for c in extracted_conditions):
-        return AuthoritativeDecision(is_authoritative=False)
         ambig_reasons = [c.get("error") for c in extracted_conditions if c.get("is_ambiguous")]
         return AuthoritativeDecision(
             is_authoritative=False,
@@ -1564,14 +1481,35 @@ def evaluate_authoritative_rule_decision(
 
     valid_conds = [c for c in extracted_conditions if c.get("value") is not None and not c.get("is_ambiguous")]
     if len(valid_conds) != 1:
-        return AuthoritativeDecision(is_authoritative=False)
+        if re.match(r"\s*(?:can|could|may)\b", q_lower) and (
+            extracted_conditions or re.search(r"\b(?:travel expense|purchase order|tuition claim|internet speed|sick leave|flight booking)\b", q_lower)
+        ):
+            return AuthoritativeDecision(is_authoritative=False, is_decision_request=True, is_unresolved=True,
+                                         reason="Provide one complete numerical condition, including its currency or unit.")
         return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     target_cond = valid_conds[0]
     cond_field = target_cond["field"]
+    field_targets = {
+        "expense_amount": "travel.approval", "advance_booking_days": "travel.advance_booking",
+        "receipt_amount": "expense.receipts", "order_amount": "procurement.bids",
+        "monthly_spend": "card.limit", "consecutive_sick_days": "leave.sick",
+        "internet_speed_mbps": "remote.speed", "annual_tuition_claim": "tuition.allowance",
+        "contract_duration_months": "contract.duration", "privileged_role_review_interval_days": "security.recertification",
+        "incident_severity_p1_response_hours": "incident.response", "data_classification_tier": "security.encryption",
+        "submission_delay_days": "expense.submission", "exception_amount": "travel.exceptions",
+        "emergency_purchase_amount": "procurement.emergency",
+    }
+    targets = set(request_meaning(question)["targets"])
+    if targets and targets != {field_targets.get(cond_field)}:
+        return AuthoritativeDecision(is_authoritative=False, is_decision_request=True, is_unresolved=True,
+                                     reason="Please ask each policy decision separately so all requirements can be checked.")
     cond_val = target_cond["value"]
     cond_unit = target_cond.get("unit", "")
     cond_comp = target_cond.get("comparison", "exact")
+    if re.search(r"\bnot\b(?!\s+(?:exceed|exceeds|exceeding|more\s+than|less\s+than|above|below|over|under)\b)", q_lower):
+        return AuthoritativeDecision(is_authoritative=False, is_decision_request=True, is_unresolved=True,
+                                     reason="Please clarify the negated decision before applying the numerical rule.")
 
     # Find rules evaluated against this condition field with input_value
     evaluated_for_field = [
@@ -1607,13 +1545,6 @@ def evaluate_authoritative_rule_decision(
             )
         if boundary_analysis.status != "single_outcome":
             return AuthoritativeDecision(is_authoritative=False)
-    elif target_cond.get("is_boundary_crossing"):
-            return AuthoritativeDecision(
-                is_authoritative=False,
-                is_decision_request=True,
-                is_unresolved=True,
-                reason="Condition does not fit completely within any single active rule outcome.",
-            )
     else:
         if target_cond.get("is_boundary_crossing"):
             return AuthoritativeDecision(
@@ -1671,7 +1602,6 @@ def evaluate_authoritative_rule_decision(
     # 2. Subject match verification: Question must be about the matched rule's policy subject
     subject_terms = _RULE_FIELD_SUBJECT_TERMS.get(cond_field)
     if subject_terms and not any(st in q_lower for st in subject_terms):
-        return AuthoritativeDecision(is_authoritative=False)
         return AuthoritativeDecision(is_authoritative=False, is_decision_request=False)
 
     # 2. Verify rule's linked chunk is present in authorized chunks
@@ -1684,7 +1614,6 @@ def evaluate_authoritative_rule_decision(
             break
 
     if not rule_chunk:
-        return AuthoritativeDecision(is_authoritative=False)
         return AuthoritativeDecision(
             is_authoritative=False,
             is_decision_request=True,

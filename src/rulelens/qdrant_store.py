@@ -184,6 +184,7 @@ def get_qdrant_client(
         url=target_url.strip(),
         api_key=target_key.strip() if target_key else None,
         timeout=timeout,
+        check_compatibility=False,
     )
 
 

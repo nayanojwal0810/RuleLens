@@ -38,10 +38,7 @@ def copy_source_dataset(dataset_root: Path, target_dir: Path) -> Path:
     return target_dir
 
 
-# ---------------------------------------------------------------------------
 # Committed Dataset Integrity Tests
-# ---------------------------------------------------------------------------
-
 def test_committed_dataset_passes_validation(dataset_root):
     """Verify the existing committed dataset passes full strengthened validation."""
     assert validate_dataset(dataset_root) is True
@@ -218,10 +215,7 @@ def test_pdf_text_extraction_all_documents(dataset_root):
             assert norm_clause_text in all_text
 
 
-# ---------------------------------------------------------------------------
 # Fresh Generation & Determinism Tests (in temporary directories only)
-# ---------------------------------------------------------------------------
-
 def test_deterministic_generation_file_hashes():
     """Verify running generation twice in temporary directories yields identical SHA-256 hashes."""
     with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2:
@@ -251,10 +245,7 @@ def test_dataset_generation_offline(monkeypatch):
         assert is_valid is True
 
 
-# ---------------------------------------------------------------------------
 # Negative Tests: Deliberate Corruptions Must Fail Validation
-# ---------------------------------------------------------------------------
-
 def test_negative_corrupt_csv_rule(dataset_root, tmp_path):
     """Confirm validation fails when a CSV rule field or threshold is corrupted."""
     copy_source_dataset(dataset_root, tmp_path)

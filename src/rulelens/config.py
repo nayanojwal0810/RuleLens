@@ -1,6 +1,7 @@
 """Configuration constants and environment variable helpers for RuleLens."""
 
 import os
+import sys
 from pathlib import Path
 from typing import Optional, Union
 
@@ -90,9 +91,8 @@ def load_dotenv_if_present(env_path: Optional[Union[Path, str]] = None) -> None:
 
 
 # Automatically load local .env on import if not already set in environment and not under pytest
-if "PYTEST_CURRENT_TEST" not in os.environ:
+if "PYTEST_CURRENT_TEST" not in os.environ and "pytest" not in sys.modules:
     load_dotenv_if_present()
-
 
 
 def is_invalid_qdrant_url(url: Optional[str]) -> bool:

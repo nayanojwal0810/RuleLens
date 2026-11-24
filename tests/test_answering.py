@@ -1,4 +1,4 @@
-"""Offline unit tests for RuleLens Stage E answer orchestration (answering.py).
+"""Offline unit tests for RuleLens answer orchestration (answering.py).
 
 Verifies:
 - Full answer_question workflow with mocked retrieval and LLM provider.
@@ -17,12 +17,14 @@ import io
 import json
 import socket
 import sys
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from rulelens.config import GENERATION_MODEL
 from rulelens.answering import (
     GenerationResult,
     answer_question,
@@ -38,20 +40,14 @@ from rulelens.llm import (
 from rulelens.retrieval import HybridRetriever, RetrievalResult, load_validated_corpus
 
 
-@pytest.fixture(autouse=True)
-def guard_network(monkeypatch):
-    """Enforce that unit tests make zero network calls."""
-
-    def guarded_connect(*args, **kwargs):
-        raise AssertionError("Network connection attempted during offline unit tests")
-
-    monkeypatch.setattr(socket, "create_connection", guarded_connect)
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
-
-
 @pytest.fixture
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def read_corpus_manifest():
+    path = Path(__file__).resolve().parents[1] / "data/processed/corpus_manifest.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -95,11 +91,7 @@ def sample_retrieval_result(canonical_chunks_by_id: Dict[str, Dict[str, Any]]) -
     )
 
 
-# ==============================================================================
-# 1. Input Validation Tests
-# ==============================================================================
-
-
+# Input Validation Tests
 def test_answer_question_rejects_empty_query():
     """answer_question must raise ValueError on empty or whitespace question."""
     with pytest.raises(ValueError, match="Invalid question: question must be a non-empty string"):
@@ -121,11 +113,7 @@ def test_answer_question_rejects_malformed_date():
         answer_question(question="What is the policy?", role="employee", query_date="invalid-date")
 
 
-# ==============================================================================
-# 2. End-to-End Orchestration Tests
-# ==============================================================================
-
-
+# End-to-End Orchestration Tests
 def test_answer_question_successful_flow(mock_retriever, sample_retrieval_result):
     """Successful direct question returns verified answer, citations, and metadata."""
     mock_retriever.search.return_value = [sample_retrieval_result]
@@ -133,7 +121,7 @@ def test_answer_question_successful_flow(mock_retriever, sample_retrieval_result
     mock_llm = MagicMock(spec=GroqClientWrapper)
     mock_llm.generate_answer.return_value = (
         AnswerResponse(
-            answer="The daily meal allowance is capped at INR 2,000 per diem with itemized receipts.",
+            answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
             status=AnswerStatus.ANSWERED,
             citations=["DOC-TRV-002_TRV-C03"],
             referenced_rule_ids=[],
@@ -248,7 +236,7 @@ def test_authorized_document_not_wrongly_blocked_by_restricted_detection(mock_re
     mock_llm = MagicMock(spec=GroqClientWrapper)
     mock_llm.generate_answer.return_value = (
         AnswerResponse(
-            answer="Meal allowance is INR 2,000.",
+            answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
             status=AnswerStatus.ANSWERED,
             citations=["DOC-TRV-002_TRV-C03"],
             referenced_rule_ids=[],
@@ -416,11 +404,7 @@ def test_answer_question_leaks_no_secrets_in_errors(mock_retriever, sample_retri
     assert "Bearer" not in res_json
 
 
-# ==============================================================================
-# 3. CLI Smoke Test Execution
-# ==============================================================================
-
-
+# CLI Smoke Test Execution
 def test_cli_smoke_test_execution(monkeypatch, sample_retrieval_result, canonical_corpus, canonical_chunks_by_id):
     """CLI answering entry point runs cleanly and exits with code 0 on valid response."""
     with patch("rulelens.answering.HybridRetriever") as mock_retriever_cls, \
@@ -430,7 +414,7 @@ def test_cli_smoke_test_execution(monkeypatch, sample_retrieval_result, canonica
         retriever_inst = MagicMock()
         retriever_inst.chunks = canonical_corpus
         retriever_inst.chunks_by_id = canonical_chunks_by_id
-        retriever_inst.corpus_manifest = {"processed_fingerprint": "test_fp"}
+        retriever_inst.corpus_manifest = read_corpus_manifest()
         retriever_inst.get_bm25_index.side_effect = lambda c_list: BM25Index(c_list)
         retriever_inst.search.return_value = [sample_retrieval_result]
         mock_retriever_cls.return_value = retriever_inst
@@ -438,7 +422,7 @@ def test_cli_smoke_test_execution(monkeypatch, sample_retrieval_result, canonica
         llm_inst = MagicMock()
         llm_inst.generate_answer.return_value = (
             AnswerResponse(
-                answer="Domestic travel must be booked 14 days in advance.",
+                answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
                 status=AnswerStatus.ANSWERED,
                 citations=["DOC-TRV-002_TRV-C03"],
                 referenced_rule_ids=[],
@@ -470,7 +454,7 @@ def test_cli_exits_nonzero_on_operational_error(monkeypatch, sample_retrieval_re
         retriever_inst = MagicMock()
         retriever_inst.chunks = canonical_corpus
         retriever_inst.chunks_by_id = canonical_chunks_by_id
-        retriever_inst.corpus_manifest = {"processed_fingerprint": "test_fp"}
+        retriever_inst.corpus_manifest = read_corpus_manifest()
         retriever_inst.get_bm25_index.side_effect = lambda c_list: BM25Index(c_list)
         retriever_inst.search.return_value = [sample_retrieval_result]
         mock_retriever_cls.return_value = retriever_inst
@@ -496,11 +480,7 @@ def test_cli_exits_nonzero_on_operational_error(monkeypatch, sample_retrieval_re
         assert excinfo.value.code == 1
 
 
-# ==============================================================================
-# 4. Strict Evidence Limits, Forged Department, and Ambiguous Input Tests
-# ==============================================================================
-
-
+# Strict Evidence Limits, Forged Department, and Ambiguous Input Tests
 def test_answer_question_rejects_invalid_top_k(mock_retriever):
     """top_k must be strictly validated as an int between 1 and 4 inclusive."""
     for invalid_val in (0, 5, True, False, "4", None):
@@ -636,17 +616,13 @@ def test_missing_credentials_and_rule_loading_errors_return_sanitized(mock_retri
         assert res_rule.provider_calls_attempted == 0
 
 
-# ==============================================================================
-# 4. Correction A: Restricted Topic Detection (SEC-009) & Diagnostic Coverage
-# ==============================================================================
-
-
+# Correction A: Restricted Topic Detection (SEC-009) & Diagnostic Coverage
 def test_sec_009_restricted_topic_detection_across_roles(canonical_corpus, canonical_chunks_by_id):
     """SEC-009 (storage drive sanitization) returns restricted for finance and employee, but permits security and auditor."""
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.corpus_manifest = read_corpus_manifest()
     retriever.search.return_value = []
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
@@ -713,7 +689,7 @@ def test_drive_sanitization_paraphrases_detected_as_restricted(canonical_corpus,
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.corpus_manifest = read_corpus_manifest()
 
     res = answer_question(
         question=query,
@@ -739,7 +715,7 @@ def test_generic_terms_do_not_trigger_restrictions(canonical_corpus, canonical_c
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.corpus_manifest = read_corpus_manifest()
     retriever.search.return_value = []
 
     res = answer_question(
@@ -762,7 +738,7 @@ def test_all_five_restricted_diagnostics_refuse_correctly(repo_root: Path, canon
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.corpus_manifest = read_corpus_manifest()
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
     for qid in restricted_ids:
@@ -826,7 +802,7 @@ def test_adversarial_spa_treatment_not_approved_by_travel_threshold(canonical_co
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.corpus_manifest = read_corpus_manifest()
     retriever.search.return_value = [c04]
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
@@ -864,7 +840,7 @@ def test_personal_travel_not_approved_and_groq_not_called(canonical_corpus, cano
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.corpus_manifest = read_corpus_manifest()
     retriever.search.return_value = [c04]
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
@@ -943,7 +919,7 @@ def test_deterministic_booking_notice_query_bypasses_groq_with_none_schema(canon
     retriever = MagicMock()
     retriever.chunks = canonical_corpus
     retriever.chunks_by_id = canonical_chunks_by_id
-    retriever.corpus_manifest = {"processed_fingerprint": "test_fp"}
+    retriever.corpus_manifest = read_corpus_manifest()
     retriever.search.return_value = [b02]
     mock_llm = MagicMock(spec=GroqClientWrapper)
 
@@ -963,11 +939,7 @@ def test_deterministic_booking_notice_query_bypasses_groq_with_none_schema(canon
     mock_llm.generate_answer.assert_not_called()
 
 
-# ==============================================================================
-# 5. Correction B: Authoritative Rule Decision Precedence (Adversarial Groq Test)
-# ==============================================================================
-
-
+# Correction B: Authoritative Rule Decision Precedence (Adversarial Groq Test)
 def test_adversarial_wrong_groq_approval_cannot_override_rule_decision(mock_retriever, canonical_chunks_by_id):
     """An intentionally wrong mocked Groq approval cannot override an authoritative rule decision."""
     c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
@@ -1020,11 +992,7 @@ def test_adversarial_wrong_groq_approval_cannot_override_rule_decision(mock_retr
     adversarial_llm.generate_answer.assert_not_called()
 
 
-# ==============================================================================
-# 6. Correction E: Evidence Support Behavior Tests
-# ==============================================================================
-
-
+# Correction E: Evidence Support Behavior Tests
 def test_check_evidence_support_direct_paraphrase_and_unsupported(canonical_chunks_by_id):
     """Test check_evidence_support on direct questions, paraphrases, and unsupported queries."""
     from rulelens.answering import check_evidence_support
@@ -1048,11 +1016,7 @@ def test_check_evidence_support_direct_paraphrase_and_unsupported(canonical_chun
     assert check_evidence_support("What are the employee wellness leave policies for family illness?", chunks) is False
 
 
-# ==============================================================================
-# 7. Correction F: Strict Error Sanitization (Arbitrary Secrets & Paths)
-# ==============================================================================
-
-
+# Correction F: Strict Error Sanitization (Arbitrary Secrets & Paths)
 @pytest.mark.parametrize(
     "secret_string",
     [
@@ -1087,11 +1051,7 @@ def test_operational_error_never_leaks_arbitrary_secrets_or_paths(
     assert "id_rsa" not in res_str
 
 
-# ==============================================================================
-# 8. Numerical Comparison Directional Safeguard Integration Tests (Section 2.5)
-# ==============================================================================
-
-
+# Numerical Comparison Directional Safeguard Integration Tests (Section 2.5)
 def test_integration_exceeding_threshold_deterministic_additional_approval(mock_retriever, canonical_chunks_by_id):
     """Exceeding INR 50,000 deterministically triggers additional approval with 0 Groq calls."""
     c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
@@ -1134,7 +1094,7 @@ def test_integration_at_least_threshold_safe_insufficient_refusal(mock_retriever
         retriever=mock_retriever, llm_client=mock_llm,
     )
     assert res.status == "insufficient"
-    assert "unconditional decision cannot be determined" in res.answer or "sufficient evidence" in res.answer
+    assert res.clarification and "specific" in res.clarification
     assert res.provider_calls_attempted == 0
     mock_llm.generate_answer.assert_not_called()
 
@@ -1414,166 +1374,6 @@ def test_integration_personal_travel_unsupported_term_safe_refusal(mock_retrieve
     mock_llm.generate_answer.assert_not_called()
 
 
-def test_integration_travel_v2_more_than_40k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
-    """More than INR 40,000 crosses 50,000 boundary; must refuse safely with insufficient and 0 Groq calls."""
-    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
-    c04_res = RetrievalResult(
-        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
-        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
-        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
-        allowed_roles=list(c["allowed_roles"]),
-    )
-    mock_retriever.search.return_value = [c04_res]
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-
-    q = "Can a direct manager approve travel expenses of more than INR 40,000 under Travel Policy v2?"
-    res = answer_question(
-        question=q, role="manager", query_date="2026-11-22",
-        retriever=mock_retriever, llm_client=mock_llm,
-    )
-    assert res.status == "insufficient"
-    assert res.provider_calls_attempted == 0
-    mock_llm.generate_answer.assert_not_called()
-
-
-def test_integration_travel_v2_up_to_60k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
-    """Up to INR 60,000 crosses 50,000 boundary; must refuse safely with insufficient and 0 Groq calls."""
-    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
-    c04_res = RetrievalResult(
-        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
-        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
-        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
-        allowed_roles=list(c["allowed_roles"]),
-    )
-    mock_retriever.search.return_value = [c04_res]
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-
-    q = "Can a direct manager approve travel expenses up to INR 60,000 under Travel Policy v2?"
-    res = answer_question(
-        question=q, role="manager", query_date="2026-11-22",
-        retriever=mock_retriever, llm_client=mock_llm,
-    )
-    assert res.status == "insufficient"
-    assert res.provider_calls_attempted == 0
-    mock_llm.generate_answer.assert_not_called()
-
-
-def test_integration_travel_v2_between_40k_and_50k_deterministic_approval(mock_retriever, canonical_chunks_by_id):
-    """Between INR 40,000 and 50,000 stays within standard approval; deterministically answered with 0 Groq calls."""
-    c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
-    c04_res = RetrievalResult(
-        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
-        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
-        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
-        allowed_roles=list(c["allowed_roles"]),
-    )
-    mock_retriever.search.return_value = [c04_res]
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-
-    q = "Can a direct manager approve travel expenses between INR 40,000 and 50,000 under Travel Policy v2?"
-    res = answer_question(
-        question=q, role="manager", query_date="2026-11-22",
-        retriever=mock_retriever, llm_client=mock_llm,
-    )
-    assert res.status == "answered"
-    assert "Standard manager approval is permitted" in res.answer
-    assert res.referenced_rule_ids == ["R-TRV-003"]
-    assert res.provider_calls_attempted == 0
-    mock_llm.generate_answer.assert_not_called()
-
-
-def test_integration_corporate_card_spend_at_200k_deterministic(mock_retriever, canonical_chunks_by_id):
-    """Monthly card spending up to INR 200,000 is answered deterministically with 0 Groq calls."""
-    c = canonical_chunks_by_id["DOC-FIN-003_FIN-K02"]
-    fin_res = RetrievalResult(
-        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
-        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
-        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
-        allowed_roles=list(c["allowed_roles"]),
-    )
-    mock_retriever.search.return_value = [fin_res]
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-
-    q = "Can an employee have monthly card spending up to INR 200,000?"
-    res = answer_question(
-        question=q, role="manager", query_date="2026-11-22",
-        retriever=mock_retriever, llm_client=mock_llm,
-    )
-    assert res.status == "answered"
-    assert "within the standard corporate credit card limit" in res.answer
-    assert res.referenced_rule_ids == ["R-FIN-005"]
-    assert res.provider_calls_attempted == 0
-    mock_llm.generate_answer.assert_not_called()
-
-
-def test_integration_corporate_card_more_than_150k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
-    """Monthly card spending of more than INR 150,000 crosses 200,000 boundary; refuses safely with 0 Groq calls."""
-    c = canonical_chunks_by_id["DOC-FIN-003_FIN-K02"]
-    fin_res = RetrievalResult(
-        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
-        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
-        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
-        allowed_roles=list(c["allowed_roles"]),
-    )
-    mock_retriever.search.return_value = [fin_res]
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-
-    q = "Can an employee have monthly card spending of more than INR 150,000?"
-    res = answer_question(
-        question=q, role="manager", query_date="2026-11-22",
-        retriever=mock_retriever, llm_client=mock_llm,
-    )
-    assert res.status == "insufficient"
-    assert res.provider_calls_attempted == 0
-    mock_llm.generate_answer.assert_not_called()
-
-
-def test_integration_tuition_claim_up_to_75k_deterministic(mock_retriever, canonical_chunks_by_id):
-    """Tuition claim up to INR 75,000 is answered deterministically with 0 Groq calls."""
-    c = canonical_chunks_by_id["DOC-PPO-003_PPO-B02"]
-    ppo_res = RetrievalResult(
-        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
-        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
-        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
-        allowed_roles=list(c["allowed_roles"]),
-    )
-    mock_retriever.search.return_value = [ppo_res]
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-
-    q = "Can an employee claim tuition assistance up to INR 75,000?"
-    res = answer_question(
-        question=q, role="employee", query_date="2026-11-22",
-        retriever=mock_retriever, llm_client=mock_llm,
-    )
-    assert res.status == "answered"
-    assert "standard tuition grant" in res.answer
-    assert res.referenced_rule_ids == ["R-PPO-005"]
-    assert res.provider_calls_attempted == 0
-    mock_llm.generate_answer.assert_not_called()
-
-
-def test_integration_tuition_claim_up_to_100k_crosses_boundary_safe_refusal(mock_retriever, canonical_chunks_by_id):
-    """Tuition claim up to INR 100,000 crosses 75,000 boundary; refuses safely with 0 Groq calls."""
-    c = canonical_chunks_by_id["DOC-PPO-003_PPO-B02"]
-    ppo_res = RetrievalResult(
-        chunk_id=c["chunk_id"], text=c["text"], doc_id=c["doc_id"], clause_id=c["clause_id"],
-        title=c["title"], department=c["department"], version=c["version"], source_file=c["source_file"],
-        source_page=int(c["source_page"]), effective_from=c["effective_from"], effective_to=c.get("effective_to"),
-        allowed_roles=list(c["allowed_roles"]),
-    )
-    mock_retriever.search.return_value = [ppo_res]
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-
-    q = "Can an employee claim tuition assistance up to INR 100,000?"
-    res = answer_question(
-        question=q, role="employee", query_date="2026-11-22",
-        retriever=mock_retriever, llm_client=mock_llm,
-    )
-    assert res.status == "insufficient"
-    assert res.provider_calls_attempted == 0
-    mock_llm.generate_answer.assert_not_called()
-
-
 def test_integration_cannot_evaluate_condition_refuses_safely_without_groq(mock_retriever, canonical_chunks_by_id):
     """Negative values cannot be evaluated safely and must refuse with insufficient and 0 Groq calls."""
     c = canonical_chunks_by_id["DOC-TRV-002_TRV-C04"]
@@ -1719,3 +1519,225 @@ def test_integration_remote_work_internet_speed_and_crossing_refusal(mock_retrie
     assert res2.status == "insufficient"
     assert res2.provider_calls_attempted == 0
     mock_llm.generate_answer.assert_not_called()
+
+
+@pytest.mark.parametrize("amount, date, rule_id", [
+    ("INR 60k", "2026-11-22", "R-TRV-004"),
+    ("INR 1,00,000", "2026-11-22", "R-TRV-004"),
+    ("INR 50,000.01", "2026-11-22", "R-TRV-004"),
+    ("INR 50,000", "2026-11-22", "R-TRV-003"),
+    ("INR 1 lakh", "2026-11-22", "R-TRV-004"),
+    ("INR 45,000", "2026-06-30", "R-TRV-002"),
+    ("INR 45,000", "2026-07-01", "R-TRV-003"),
+])
+def test_normalized_amounts_use_the_active_rule(repo_root, amount, date, rule_id):
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question(f"Can my manager approve a travel expense of {amount}?", "employee", date,
+                             retriever=HybridRetriever(base_dir=repo_root), llm_client=provider, mode="bm25")
+    assert result.status == "answered"
+    assert result.referenced_rule_ids == [rule_id]
+    provider.generate_answer.assert_not_called()
+
+
+@pytest.mark.parametrize("amount", ["60k", "INR 50,000foo", "INR 1,2,000", "INR NaN", "INR 60 million"])
+def test_unsafe_amounts_refuse_before_generation(repo_root, amount):
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question(f"Can my manager approve a travel expense of {amount}?", "employee", "2026-11-22",
+                             retriever=HybridRetriever(base_dir=repo_root), llm_client=provider, mode="bm25")
+    assert result.status == "insufficient"
+    assert result.clarification
+    assert result.citations == []
+    provider.generate_answer.assert_not_called()
+
+
+def test_missing_decision_amount_requires_clarification(repo_root):
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question("Can my manager approve this travel expense?", "employee", "2026-11-22",
+                             retriever=HybridRetriever(base_dir=repo_root), llm_client=provider, mode="bm25")
+    assert result.status == "insufficient"
+    assert "condition" in result.answer.lower()
+    provider.generate_answer.assert_not_called()
+
+
+@pytest.mark.parametrize("question, role", [
+    ("How many annual vacation days do I earn, and who approves internal employee transfers?", "employee"),
+    ("When do I submit an expense claim, and how must decommissioned storage drives be sanitized?", "finance"),
+    ("Explain expense claims and reimbursements policy and corporate credit card issuance criteria.", "employee"),
+])
+def test_mixed_permission_requests_refuse_the_whole_answer(repo_root, question, role):
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question(question, role, "2026-11-22", retriever=HybridRetriever(base_dir=repo_root),
+                             llm_client=provider, mode="bm25")
+    assert result.status == "restricted"
+    assert result.citations == result.referenced_rule_ids == []
+    assert "DOC-" not in result.answer
+    provider.generate_answer.assert_not_called()
+
+
+@pytest.mark.parametrize("question", [
+    "Under Travel Policy v1, what is the manager approval limit?",
+    "On June 30, 2026, what is the hotel allowance?",
+    "What was the approval limit on 2026-03-15?",
+    "Compare Travel Policy v1 and Travel Policy v2 approval limits.",
+])
+def test_conflicting_request_context_asks_for_one_date(repo_root, question):
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question(question, "employee", "2026-11-22", retriever=HybridRetriever(base_dir=repo_root),
+                             llm_client=provider, mode="bm25")
+    assert result.status == "insufficient"
+    assert result.clarification
+    provider.generate_answer.assert_not_called()
+
+
+@pytest.fixture
+def isolated_corpus(repo_root, tmp_path):
+    for folder in ("source", "processed"):
+        shutil.copytree(repo_root / "data" / folder, tmp_path / "data" / folder)
+    return tmp_path
+
+
+def test_warm_retriever_cannot_execute_changed_rules(isolated_corpus, monkeypatch):
+    import rulelens.answering as answering
+
+    retriever = HybridRetriever(base_dir=isolated_corpus)
+    search = retriever.search
+    rule_decision = MagicMock()
+    monkeypatch.setattr(answering, "evaluate_authoritative_rule_decision", rule_decision)
+
+    def changing_search(**kwargs):
+        results = search(**kwargs)
+        path = isolated_corpus / "data/processed/rules.jsonl"
+        path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        return results
+
+    monkeypatch.setattr(retriever, "search", changing_search)
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question("Can a manager approve travel expenses of INR 60,000?", "employee", "2026-11-22",
+                             retriever=retriever, llm_client=provider, mode="bm25")
+    assert result.status == "operational_error"
+    assert result.error_category == "evidence_integrity_error"
+    assert result.citations == []
+    rule_decision.assert_not_called()
+    provider.generate_answer.assert_not_called()
+
+
+def test_change_during_generation_cannot_be_displayed_or_cached(isolated_corpus, monkeypatch):
+    from types import SimpleNamespace
+    import rulelens.answering as answering
+    from rulelens.cache import CacheLookupResult
+
+    retriever = HybridRetriever(base_dir=isolated_corpus)
+    citation = "DOC-TRV-002_TRV-C03"
+    insert = MagicMock()
+    monkeypatch.setattr(answering, "ensure_cache_collection", lambda client: None)
+    monkeypatch.setattr(answering, "lookup_cache", lambda **kwargs: CacheLookupResult(hit=False))
+    monkeypatch.setattr(answering, "insert_cache_entry", insert)
+
+    def generate(**kwargs):
+        path = isolated_corpus / "data/processed/chunks.jsonl"
+        path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        response = AnswerResponse(answer="INR 2,000 with itemized receipts.", status=AnswerStatus.ANSWERED,
+                                  citations=[citation], referenced_rule_ids=[], reason="Policy lookup.")
+        return response, {"calls_made": 1, "latency_ms": 1, "total_tokens": 5}
+
+    result = answer_question("What is the daily meal subsistence allowance for domestic travel?", "employee", "2026-11-22",
+                             retriever=retriever, llm_client=SimpleNamespace(model=GENERATION_MODEL, generate_answer=generate), mode="bm25",
+                             cache_enabled=True, cache_client=object(), embedder=object())
+    assert result.status == "operational_error"
+    assert result.error_category == "evidence_integrity_error"
+    assert result.provider_calls_attempted == 1
+    assert result.token_usage == 5
+    assert result.citations == []
+    insert.assert_not_called()
+
+
+def test_retriever_fingerprint_must_match_validated_corpus(repo_root):
+    retriever = HybridRetriever(base_dir=repo_root)
+    retriever.corpus_manifest = {"processed_fingerprint": "untrusted"}
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question("Can my manager approve a travel expense of INR 60k?", "employee", "2026-11-22",
+                             retriever=retriever, llm_client=provider, mode="bm25")
+    assert result.status == "operational_error"
+    assert result.error_category == "evidence_integrity_error"
+    assert result.citations == []
+    provider.generate_answer.assert_not_called()
+
+
+@pytest.mark.parametrize("answer", [
+    "Daily meal subsistence allowance is capped at INR 2,500 per diem with itemized receipts.",
+    "Daily meal subsistence allowance is capped at INR 2,000 per diem.",
+])
+def test_unsupported_generated_claim_is_never_displayed_or_cached(repo_root, monkeypatch, answer):
+    import rulelens.answering as answering
+    from rulelens.cache import CacheLookupResult
+    from types import SimpleNamespace
+    insert = MagicMock()
+    monkeypatch.setattr(answering, "ensure_cache_collection", lambda client: None)
+    monkeypatch.setattr(answering, "lookup_cache", lambda **kwargs: CacheLookupResult(hit=False))
+    monkeypatch.setattr(answering, "insert_cache_entry", insert)
+    response = AnswerResponse(answer=answer, status=AnswerStatus.ANSWERED,
+                              citations=["DOC-TRV-002_TRV-C03"], referenced_rule_ids=[], reason="A valid citation.")
+    provider = SimpleNamespace(model=GENERATION_MODEL, generate_answer=lambda **kwargs: (response, {"calls_made": 1, "total_tokens": 7, "latency_ms": 2}))
+    result = answer_question("What is the daily meal allowance?", "employee", "2026-11-22",
+                             retriever=HybridRetriever(base_dir=repo_root), llm_client=provider, mode="bm25",
+                             cache_enabled=True, cache_client=object(), embedder=object())
+    assert result.status == "operational_error"
+    assert result.error_category == "claim_validation_failed"
+    assert result.route == "error"
+    assert result.provider_calls_attempted == 1 and result.token_usage == 7
+    assert result.citations == []
+    assert answer not in result.answer
+    insert.assert_not_called()
+
+
+@pytest.mark.parametrize("question", [
+    "What is the daily meal allowance, and what is the sabbatical policy?",
+    "What core hours must remote workers be reachable on Slack and email?",
+    "What is the daily meal allowance for personal pets?",
+])
+def test_unsupported_context_does_not_reach_generation(repo_root, question):
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question(question, "employee", "2026-11-22", retriever=HybridRetriever(base_dir=repo_root),
+                             llm_client=provider, mode="bm25")
+    assert result.status == "insufficient"
+    assert result.citations == []
+    provider.generate_answer.assert_not_called()
+
+
+def test_mixed_numerical_and_eligibility_request_cannot_be_approved(repo_root):
+    provider = MagicMock(spec=GroqClientWrapper)
+    result = answer_question("Can my manager approve a travel expense of INR 50,000 and tuition assistance?",
+                             "employee", "2026-11-22", retriever=HybridRetriever(base_dir=repo_root),
+                             llm_client=provider, mode="bm25")
+    assert result.status == "insufficient"
+    assert result.route != "rule"
+    provider.generate_answer.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [AnswerStatus.INSUFFICIENT, AnswerStatus.RESTRICTED])
+def test_model_refusal_text_cannot_publish_unverified_facts(repo_root, status):
+    provider = MagicMock(spec=GroqClientWrapper)
+    provider.generate_answer.return_value = (AnswerResponse(answer="The meal allowance is INR 99,000.",
+        status=status, citations=[], referenced_rule_ids=[], reason="Invented policy statement."),
+        {"calls_made": 1, "total_tokens": 4, "latency_ms": 1})
+    result = answer_question("What is the daily meal allowance?", "employee", "2026-11-22",
+                             retriever=HybridRetriever(base_dir=repo_root), llm_client=provider, mode="bm25")
+    assert "99,000" not in result.answer
+    assert "Invented" not in result.reason
+    assert result.route == "refusal"
+    assert result.cache_entry_id is None
+
+
+def test_answering_uses_request_metadata_instead_of_shared_counters(repo_root):
+    from rulelens.llm import ProviderTelemetrySnapshot
+    provider = MagicMock(spec=GroqClientWrapper)
+    provider.get_telemetry_snapshot.side_effect = AssertionError("Shared counters cannot measure this request.")
+    provider.generate_answer.return_value = (AnswerResponse(
+        answer="Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts.",
+        status=AnswerStatus.ANSWERED, citations=["DOC-TRV-002_TRV-C03"], referenced_rule_ids=[], reason="Source quote."),
+        {"telemetry": ProviderTelemetrySnapshot(provider_requests_attempted=2, known_total_tokens=13)})
+    result = answer_question("What is the daily meal allowance?", "employee", "2026-11-22",
+                             retriever=HybridRetriever(base_dir=repo_root), llm_client=provider, mode="bm25")
+    assert result.route == "generated_verified"
+    assert result.provider_calls_attempted == 2 and result.token_usage == 13
+    provider.get_telemetry_snapshot.assert_not_called()

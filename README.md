@@ -1,209 +1,89 @@
 # RuleLens
 
-Enterprise Policy Intelligence Engine with Hybrid Retrieval and Grounded Answer Generation.
+RuleLens answers questions about a fictional company's policies using role and date
+filters, hybrid retrieval, deterministic rules and verified source quotations.
 
-## Project Purpose
+The sample corpus contains 20 policy PDFs, five rule tables, 64 clause chunks and
+32 rules. The roles are demonstration inputs, not a production identity system.
+Semantic caching is disabled by default. Final performance results are not yet
+published.
 
-RuleLens is an enterprise policy question-answering system designed to deliver verified, clause-grounded policy answers with role-based access control, deterministic rule execution, and strict citation validation. When uncertain or when policy evidence is insufficient, RuleLens safely refuses unsupported questions rather than generating unverified responses.
+## Installation
 
-## Implementation Status & Roadmap
+Use Python 3.11 and an activated virtual environment:
 
-### Implemented Functionality (Stages A–F)
-- **Corpus & Rule Ingestion**: 20 canonical policy documents across 5 departments, 64 validated clauses, and 32 structured rules with SHA-256 fingerprint verification.
-- **Hybrid Retrieval**: Okapi BM25 lexical search combined with `BAAI/bge-small-en-v1.5` dense embeddings (384-dimensional) via Reciprocal Rank Fusion (RRF, $k=60$).
-- **Dual Vector Backends**: 100% offline local in-memory cosine similarity and Qdrant Cloud vector search with server-side payload filtering.
-- **Role & Temporal Filtering**: Deterministic pre-retrieval filtering enforcing 6 employee roles and active temporal version windows.
-- **Restricted Topic Detection**: Non-sensitive public policy topic catalog ensuring role-restricted queries (such as storage media disposal) fail closed before retrieval.
-- **Authoritative Rule Decisions**: Deterministic Python rule evaluation (`Decimal` comparisons) for single-condition decision queries without LLM hallucination.
-- **Grounded Answer Generation**: `openai/gpt-oss-20b` via the Groq SDK with strict Pydantic JSON schema structured output.
-- **Citation & Safety Verification**: Verifies every citation against supplied evidence; rejects fabricated or unauthorized references.
-- **Guarded Semantic Caching (Stage F)**: Evidence-bound semantic cache in Qdrant (`rulelens_answer_cache_v1`, isolated from `rulelens_policies`) using `BAAI/bge-small-en-v1.5` embeddings (384-dimensional Cosine). Features strict pre-lookup and candidate safeguards (role match, date match, corpus fingerprint match, numerical condition signature match, negation/comparison/exception indicator match, citation authorization and content hash verification). Bypasses LLM generation with 0 provider calls, 0 tokens, and verified 100% safe reuse precision.
-- **Development Evaluations**: Comprehensive retrieval, generation, and guarded caching evaluation harnesses.
-
-### Planned / Not Yet Implemented
-- **Stage G**: Interactive Streamlit web application.
-- **Final Evaluation**: Independent end-to-end benchmark evaluation.
-
-> **Scope Note:** RuleLens is an enterprise policy intelligence prototype. It does not provide production-grade enterprise authentication, identity management, or security hardening, nor does it claim infallible natural language understanding.
-
-## Architecture
-
-```text
-User Query + Role + Effective Date
-       │
-       ▼
- ┌────────────────────────────────────────────────────────┐
- │ Deterministic Pre-Filtering                           │
- │ (Role-Based Permissions & Temporal Version Boundaries)  │
- └───────────────────────┬────────────────────────────────┘
-                         │
-        ┌────────────────┴────────────────┐
-        ▼                                 ▼
- ┌──────────────┐                 ┌──────────────┐
- │ BM25 Lexical │                 │ BGE-small-v1 │
- │ Search Engine│                 │ Dense Vector │
- └──────┬───────┘                 └──────┬───────┘
-        │                                 │
-        └────────────────┬────────────────┘
-                         ▼
- ┌────────────────────────────────────────────────────────┐
- │ Reciprocal Rank Fusion (RRF, k=60)                     │
- └───────────────────────┬────────────────────────────────┘
-                         ▼
-        Top-K Clause-Grounded Evidence Chunks
-                         │
-        ┌────────────────┴────────────────┐
-        ▼                                 ▼
- ┌──────────────┐                 ┌──────────────┐
- │ Authoritative│                 │ Safe Refusal │
- │ Rule Engine  │                 │ (Early Gate) │
- └──────┬───────┘                 └──────────────┘
-        │                                 │
-        └────────────────┬────────────────┘
-                         ▼
- ┌────────────────────────────────────────────────────────┐
- │ Groq Generation (openai/gpt-oss-20b)                   │
- │ Strict JSON Schema + Citation & Rule Validation       │
- └────────────────────────────────────────────────────────┘
-```
-
-- **Hybrid as Primary Retrieval Architecture:** RuleLens uses Hybrid Retrieval as its standard mode, combining lexical precision (BM25) with semantic recall (`BAAI/bge-small-en-v1.5`, 384-dimensional normalized embeddings) fused via Reciprocal Rank Fusion (RRF, $k=60$).
-- **Supported Retrieval Modes:**
-  - `hybrid` (default): Fuses BM25 lexical candidates and BGE dense vector candidates via RRF.
-  - `bm25`: Fast lexical-only retrieval based on Okapi BM25 scoring.
-  - `dense`: Dense semantic vector retrieval using cosine similarity.
-- **Dual Dense Backends:**
-  - `local`: High-performance local in-memory cosine similarity over cached document embeddings (100% offline).
-  - `qdrant`: Vector database retrieval utilizing server-side payload filtering for permissions, dates, and corpus fingerprints.
-- **Security & Version Integrity:** Role-based permissions (across `employee`, `manager`, `hr`, `finance`, `security`, `auditor`) and temporal version windows are enforced via deterministic pre-filtering before scoring.
-- **Deterministic Rule Engine:** Evaluates 32 canonical structured policy rules in Python for boundary conditions and numeric comparisons (`<`, `<=`, `>`, `>=`, `==`) to eliminate arithmetic hallucinations. For concrete single-condition decision queries, authoritative decisions are returned directly with linked citations without calling the LLM.
-- **Evidence-Grounded Generation:** Uses `openai/gpt-oss-20b` via the Groq SDK with strict Pydantic JSON schema structured output.
-- **Logical Answer Statuses (Model Layer):**
-  - `answered`: Query is directly and unambiguously supported by authorized policy evidence.
-  - `insufficient`: Evidence is missing, out-of-scope, or insufficient to answer the query safely.
-  - `restricted`: Requesting role lacks authorization to access the target policy area.
-- **Application Result Layer:**
-  - In addition to the three logical model statuses, the application layer (`GenerationResult`) reports `status="operational_error"` for infrastructure, provider, or validation errors (e.g. rate limits, network timeouts, invalid citations, or integrity failures).
-- **Strict Citation Validation:** Every citation is verified against authorized evidence chunks; fabricated, unretrieved, unauthorized, or expired chunk IDs are rejected. When evidence is insufficient or the role lacks permission, the system safely refuses without generating unverified claims.
-- **Evaluation Distinction:** Gold-evidence generation evaluation measures model grounding and citation validity given verified gold chunks; it does not measure end-to-end retrieval recall.
-
-## Installation & Setup
-
-### Prerequisites
-- Python >= 3.11, < 3.12
-
-### Setup Environment
 ```bash
-# Clone the repository
-git clone https://github.com/nayanojwal0810/RuleLens.git
-cd RuleLens
-
-# Create and activate virtual environment
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install package in editable mode with development dependencies
-python -m pip install -e ".[dev]"
 ```
 
-### Environment Configuration
-Copy `.env.example` to `.env` to configure optional external services:
+Activate with `.venv\Scripts\Activate.ps1` in PowerShell or
+`source .venv/bin/activate` on Linux/macOS. Install the base package:
+
 ```bash
-cp .env.example .env
+python -m pip install -e .
 ```
-Supported variables:
-- `GROQ_API_KEY`: API key for Groq LLM generation.
-- `QDRANT_URL`: Cluster endpoint URL for Qdrant Cloud (e.g. `https://<cluster-id>.<region>.gcp.cloud.qdrant.io:6333`). Note: The marketing website `https://qdrant.io` is rejected.
-- `QDRANT_API_KEY`: API key for Qdrant Cloud.
 
-Local `.env` values are automatically loaded when environment variables are not set. Explicitly configured environment variables take precedence.
+Dense and hybrid retrieval additionally require the semantic extra. It installs
+the embedding libraries; the model weights are downloaded on first use.
 
-## CLI Commands
-
-### 1. Validate Dataset Integrity
-Verify canonical policy PDFs and CSV rule matrices:
 ```bash
-python -m rulelens.dataset validate
+python -m pip install -e ".[semantic]"
 ```
 
-### 2. Validate Processed Corpus
-Verify clause extraction, chunking, and content hashes:
+Set `GROQ_API_KEY`, `QDRANT_URL` and `QDRANT_API_KEY` in a local `.env`, using
+`.env.example` as the template. Keep existing credentials when updating the project.
+The `.env` file is excluded from Git.
+
+## Usage
+
+Validate the included corpus without calling external services:
+
 ```bash
 python -m rulelens.ingestion validate
 ```
 
-### 3. Validate Development Evaluation Dataset
-Verify the public 50-question evaluation dataset without loading the embedding model:
-```bash
-python -m rulelens.retrieval_eval validate --questions data/evaluation/dev_questions.json
+An amount-based decision can run with the base install and lexical retrieval:
+
+```python
+from rulelens.answering import answer_question
+
+result = answer_question(
+    "Can my manager approve a travel expense of INR 50,000?",
+    role="employee",
+    query_date="2026-11-22",
+    mode="bm25",
+)
+print(result.answer)
 ```
 
-### 4. Run Offline Test Suite
-Run unit tests completely offline with network sockets blocked:
-```bash
-python -m pytest -q
-```
+With the semantic extra and API configuration available:
 
-### 5. Qdrant Collection Management
-Synchronize the 64 policy chunks to Qdrant:
 ```bash
 python -m rulelens.qdrant_store sync
-```
-
-Verify Qdrant collection configuration, point UUIDs, and payload fields:
-```bash
 python -m rulelens.qdrant_store verify
+python -m rulelens.answering --question "What is the daily meal allowance?" --role employee --date 2026-11-22 --backend qdrant
 ```
 
-### 6. Run Development Retrieval Evaluation
-Run evaluation across BM25, Dense, and Hybrid modes:
+Generated answers must match complete authorized source spans. Ambiguous inputs,
+unsupported requests and conflicting policy contexts can require clarification or
+produce a refusal.
+
+## Tests
+
+The test install omits the semantic extra and model weights:
+
 ```bash
-# Using local dense backend (default)
-python -m rulelens.retrieval_eval run --questions data/evaluation/dev_questions.json --backend local
-
-# Using Qdrant Cloud backend (requires active cluster credentials)
-python -m rulelens.retrieval_eval run --questions data/evaluation/dev_questions.json --backend qdrant
-```
-Detailed results and markdown summaries are generated in `local_eval/development_results.json` and `local_eval/development_summary.md` (ignored by version control).
-
-### 7. Evidence-Grounded Answer Generation
-Ask policy questions with role-based access control, temporal version windows, and deterministic rule evaluation:
-```bash
-python -m rulelens.answering --question "How many days in advance must domestic flights be booked?" --role employee --date 2026-11-22 --backend local
+python -m pip install -r requirements_test.txt
+python -m pip install --no-build-isolation -e .
+python -m pytest -q -p no:cacheprovider --basetemp=.pytest_tmp
 ```
 
-### 8. Run Generation Evaluation
-Evaluate grounded answer generation against the development evaluation dataset:
-```bash
-# Evaluate development questions (e.g., balanced 30-question subset)
-python -m rulelens.generation_eval --questions data/evaluation/dev_questions.json --limit 30 --backend local
+Tests block outbound connections and use deterministic embedding doubles. They
+check functionality and safeguards; they do not measure live answer quality or
+cache performance. CI runs the public suite on Windows and Linux.
 
-# Run 5-question smoke test
-python -m rulelens.generation_eval --smoke --backend local
-```
-
-### 9. Guarded Semantic Cache Evaluation & Answering
-Validate the 40-pair evaluation dataset:
-```bash
-python -m rulelens.cache_eval validate
-```
-
-Run the 40-pair benchmark comparison (No Cache vs. Similarity-Only vs. Guarded Semantic Cache):
-```bash
-python -m rulelens.cache_eval benchmark --threshold 0.88
-```
-
-Run a similarity threshold sweep across candidate thresholds:
-```bash
-python -m rulelens.cache_eval sweep
-```
-
-Ask policy questions with guarded caching enabled:
-```bash
-python -m rulelens.answering --question "What is the standard daily meal subsistence allowance for employees on domestic travel assignments under Travel Policy v2?" --role employee --date 2026-11-22 --enable-cache --cache-threshold 0.88
-```
-
-> **Development Evaluation Notes:**
-> - **Evaluation Modes:** Evaluates answerable questions in `gold_evidence_generation` mode with strict authorization, temporal validity, verbatim quote, and 4-chunk limit checks before calling Groq. Evaluates diagnostic probes (`application_diagnostic` mode) through the end-to-end `answer_question` pipeline using the selected retrieval backend (`local` or `qdrant`).
-> - **Provider Quotas and Pacing:** When evaluating live against the Groq API (`openai/gpt-oss-20b`), sequential requests are paced (2.5s) to stay within per-minute TPM/RPM quotas. If an HTTP 429 rate limit is encountered, the evaluation harness stops gracefully without data loss, marking the run as partial and persisting all completed results to `local_eval/generation_development_results.json` and `local_eval/generation_development_summary.md`.
-> - **Offline Verification:** Full generation evaluation workflows and fail-closed safety behaviors are verified offline with mocked LLM wrappers via `python -m pytest -q`.
+The development question banks are in `data/evaluation/`. Retrieval questions
+include role/date context, expected answer or refusal routes, and source-backed
+facts with material prerequisites. These are development cases, not unseen final
+evaluation results. Structured gold values require source review; matching a quote
+or passing schema validation alone does not prove that an answer is correct.

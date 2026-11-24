@@ -1,795 +1,444 @@
-"""Cache evaluation harness for RuleLens Stage F: Guarded Semantic Caching.
-
-Evaluates and compares:
-1. Mode A: No Cache (baseline) - every request goes through generation.
-2. Mode B: Similarity-Only Cache - reuses on cosine similarity >= threshold alone (shows unsafe risks).
-3. Mode C: Guarded Semantic Cache - candidate discovery via similarity + mandatory validation safeguards.
-
-Supports threshold sweeping, scenario-level safety reporting, and offline mocked execution.
-"""
+"""Comparable cache workloads, explicit outcomes and request accounting."""
 
 from __future__ import annotations
 
-import argparse
+from collections import Counter
+from copy import deepcopy
+from functools import partial
 import datetime
+import hashlib
+from importlib.metadata import PackageNotFoundError, version
 import json
-import statistics
-import sys
-import time
-from dataclasses import asdict, dataclass
+import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
-from unittest.mock import MagicMock
+import platform
+import statistics
+import subprocess
+import time
+from typing import Any, Callable, Dict, Optional, Sequence, Union
 
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 
-from rulelens.answering import answer_question
+from rulelens.answering import GenerationResult, answer_question
 from rulelens.cache import (
-    CACHE_DEFAULT_SIMILARITY_THRESHOLD,
-    CACHE_REQUIRED_PAYLOAD_INDEXES,
-    CACHE_SCHEMA_VERSION,
-    CacheLookupResult,
-    CacheRecord,
-    ensure_cache_collection,
-    insert_cache_entry,
-    lookup_cache,
-    normalize_question,
+    CACHE_SCHEMA_VERSION, CacheRecord, ensure_cache_collection,
+    lookup_cache, validate_cache_candidate,
 )
-from rulelens.config import (
-    EMBEDDING_MODEL,
-    GENERATION_MODEL,
-    QDRANT_CACHE_COLLECTION_NAME,
-)
-from rulelens.dataset import ROLES
-from rulelens.llm import (
-    AnswerResponse,
-    AnswerStatus,
-    GroqClientWrapper,
-    ProviderTelemetrySnapshot,
-)
-from rulelens.retrieval import (
-    ALLOWED_ROLES_SET,
-    BGEEmbedder,
-    HybridRetriever,
-    RetrievalResult,
-    load_validated_corpus,
-    parse_query_date,
-)
-from rulelens.rules import (
-    extract_conditions_from_query,
-    load_rules,
-    resolve_rules_for_evidence,
-)
+from rulelens.config import CACHE_DEFAULT_SIMILARITY_THRESHOLD, QDRANT_CACHE_COLLECTION_NAME
+from rulelens.grounding import GROUNDING_VERSION, validate_grounded_answer
+from rulelens.ingestion import get_corpus_snapshot
+from rulelens.llm import GroqClientWrapper
+from rulelens.retrieval import ALLOWED_ROLES_SET, BGEEmbedder, HybridRetriever, parse_query_date
+from rulelens.rules import extract_conditions_from_query, resolve_rules_for_evidence
 
-DEFAULT_CACHE_DEV_PAIRS_PATH: Path = (
-    Path(__file__).resolve().parent.parent.parent / "data" / "evaluation" / "cache_dev_pairs.json"
-)
 
-EXPECTED_SCENARIO_COUNTS: Dict[str, int] = {
-    "valid_paraphrase": 12,
-    "changed_numerical_condition": 6,
-    "changed_role": 6,
-    "changed_date_or_version": 4,
-    "negation_or_comparison_change": 4,
-    "exception_or_eligibility_change": 4,
-    "unrelated_similar": 4,
+DEFAULT_CACHE_DEV_PAIRS_PATH = Path("data/evaluation/cache_dev_pairs.json")
+MODES = ("no_cache", "similarity_only", "guarded")
+CACHE_ERRORS = {
+    "embedding_error", "cache_service_unavailable", "cache_lookup_error", "cache_insert_error",
+    "generation_configuration_mismatch", "embedding_configuration_mismatch", "invalid_similarity",
 }
 
 
 def validate_cache_dev_dataset(dataset_path: Union[Path, str]) -> Dict[str, Any]:
-    """Validate cache development pairs dataset against schema and distribution requirements.
-
-    Raises ValueError if dataset is invalid.
-    """
-    path = Path(dataset_path).resolve()
-    if not path.is_file():
-        raise ValueError(f"Dataset file does not exist: {path}")
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Failed to parse dataset JSON from {path}: {exc}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError("Dataset root must be a JSON object.")
-
-    if data.get("schema_version") != "1.0":
-        raise ValueError(f"Unsupported schema_version: {data.get('schema_version')}")
-
+    path = Path(dataset_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("schema_version") != "2.0":
+        raise ValueError("Expected cache question schema 2.0.")
     pairs = data.get("pairs")
-    if not isinstance(pairs, list):
-        raise ValueError("Dataset must contain a 'pairs' list.")
-
-    if len(pairs) != 40:
-        raise ValueError(f"Dataset must contain exactly 40 pairs, got {len(pairs)}.")
-
-    scenario_counts: Dict[str, int] = {}
-    pair_ids: Set[str] = set()
-
-    for idx, p in enumerate(pairs, 1):
-        if not isinstance(p, dict):
-            raise ValueError(f"Pair #{idx} must be a JSON object.")
-
-        pid = p.get("pair_id")
-        if not pid or not isinstance(pid, str):
-            raise ValueError(f"Pair #{idx} missing valid 'pair_id'.")
-        if pid in pair_ids:
-            raise ValueError(f"Duplicate pair_id: '{pid}'.")
-        pair_ids.add(pid)
-
-        scenario = p.get("scenario")
-        if scenario not in EXPECTED_SCENARIO_COUNTS:
-            raise ValueError(f"Pair '{pid}' has unknown scenario: '{scenario}'.")
-        scenario_counts[scenario] = scenario_counts.get(scenario, 0) + 1
-
-        for key in (
-            "source_question",
-            "candidate_question",
-            "source_role",
-            "candidate_role",
-            "source_date",
-            "candidate_date",
-            "expected_decision",
-            "policy_subject",
-            "rationale",
-        ):
-            if key not in p or not str(p[key]).strip():
-                raise ValueError(f"Pair '{pid}' missing required field: '{key}'.")
-
-        s_role = p["source_role"]
-        c_role = p["candidate_role"]
-        if s_role not in ALLOWED_ROLES_SET:
-            raise ValueError(f"Pair '{pid}' invalid source_role: '{s_role}'.")
-        if c_role not in ALLOWED_ROLES_SET:
-            raise ValueError(f"Pair '{pid}' invalid candidate_role: '{c_role}'.")
-
-        # Validate dates
-        try:
-            parse_query_date(p["source_date"])
-            parse_query_date(p["candidate_date"])
-        except Exception as exc:
-            raise ValueError(f"Pair '{pid}' has invalid date format: {exc}") from exc
-
-        dec = p["expected_decision"]
-        if dec not in ("safe_hit", "reject"):
-            raise ValueError(f"Pair '{pid}' invalid expected_decision: '{dec}'. Must be 'safe_hit' or 'reject'.")
-
-        if scenario == "valid_paraphrase" and dec != "safe_hit":
-            raise ValueError(f"Pair '{pid}' in 'valid_paraphrase' scenario must have expected_decision 'safe_hit'.")
-        if scenario != "valid_paraphrase" and dec != "reject":
-            raise ValueError(f"Pair '{pid}' in '{scenario}' scenario must have expected_decision 'reject'.")
-
-    for scenario, expected_cnt in EXPECTED_SCENARIO_COUNTS.items():
-        actual_cnt = scenario_counts.get(scenario, 0)
-        if actual_cnt != expected_cnt:
-            raise ValueError(
-                f"Scenario '{scenario}' count mismatch: expected {expected_cnt}, found {actual_cnt}."
-            )
-
-    return {
-        "status": "valid",
-        "total_pairs": len(pairs),
-        "scenarios": scenario_counts,
-        "path": str(path),
-    }
+    if not isinstance(pairs, list) or not pairs:
+        raise ValueError("Expected a non-empty pairs list.")
+    seen = set()
+    for row in pairs:
+        if not isinstance(row, dict):
+            raise ValueError("Each pair must be an object.")
+        for field in ("pair_id", "scenario", "source_question", "candidate_question", "rationale"):
+            if not isinstance(row.get(field), str) or not row[field].strip():
+                raise ValueError(f"Missing required field: {field}.")
+        if row["pair_id"] in seen:
+            raise ValueError("Duplicate pair_id.")
+        seen.add(row["pair_id"])
+        for side in ("source", "candidate"):
+            if row.get(side + "_role") not in ALLOWED_ROLES_SET:
+                raise ValueError(f"Invalid {side}_role.")
+            date = row.get(side + "_date")
+            if not isinstance(date, str) or len(date) != 10:
+                raise ValueError(f"Invalid {side}_date.")
+            parse_query_date(date)
+        if row.get("reuse_label") not in ("allow", "deny"):
+            raise ValueError("reuse_label must be allow or deny.")
+    return {"total_pairs": len(pairs), "scenarios": dict(Counter(p["scenario"] for p in pairs)),
+            "labels": dict(Counter(p["reuse_label"] for p in pairs))}
 
 
-def create_deterministic_mock_embedder() -> BGEEmbedder:
-    """Return an embedder instance with deterministic offline embedding generation.
-
-    If BGEEmbedder weights can load locally without network, uses BGEEmbedder.
-    Otherwise, creates an isolated mock that produces consistent 384-dimensional
-    normalized embeddings based on token hashes.
-    """
-    try:
-        real_emb = BGEEmbedder()
-        # Test a fast local embed
-        real_emb.embed_query("test")
-        return real_emb
-    except Exception:
-        mock_emb = MagicMock(spec=BGEEmbedder)
-
-        def mock_embed_query(text: str) -> List[float]:
-            import math
-            tokens = text.lower().split()
-            vec = [0.0] * 384
-            for i, t in enumerate(tokens):
-                h = hash(t)
-                for dim in range(384):
-                    vec[dim] += math.sin((h + dim * (i + 1)) * 0.01)
-            norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-            return [x / norm for x in vec]
-
-        mock_emb.embed_query.side_effect = mock_embed_query
-        return mock_emb
+def request_usage(result: GenerationResult, execution_mode: str) -> Dict[str, Any]:
+    calls = result.provider_calls_attempted
+    tokens = result.token_usage
+    complete = not result.has_incomplete_tokens and (calls == 0 or tokens is not None)
+    if execution_mode == "offline_mock":
+        return {"provider_calls": 0, "known_total_tokens": None,
+                "has_incomplete_tokens": False, "mock_provider_calls": calls,
+                "simulated_tokens_used": tokens, "simulated_tokens_complete": complete}
+    if execution_mode != "live":
+        raise ValueError("execution_mode must be offline_mock or live.")
+    return {"provider_calls": calls, "known_total_tokens": 0 if calls == 0 else tokens,
+            "has_incomplete_tokens": not complete, "mock_provider_calls": None,
+            "simulated_tokens_used": None, "simulated_tokens_complete": None}
 
 
-def create_mock_llm_for_eval() -> GroqClientWrapper:
-    """Create a mock LLM client that generates valid grounded answers for offline evaluation."""
-    mock_llm = MagicMock(spec=GroqClientWrapper)
-    mock_llm.get_telemetry_snapshot.return_value = ProviderTelemetrySnapshot(
-        provider_requests_attempted=1,
-        provider_requests_succeeded=1,
-        provider_request_latency_ms=120.0,
-        known_total_tokens=250,
-    )
-
-    def mock_generate_answer(
-        question: str,
-        role: str,
-        evidence_chunks: Sequence[Any],
-        query_date: Optional[str] = None,
-        applicable_rule_facts: Optional[Sequence[Any]] = None,
-        max_repair_attempts: int = 1,
-    ) -> Tuple[AnswerResponse, Dict[str, Any]]:
-        cids = []
-        if evidence_chunks:
-            first_chunk = evidence_chunks[0]
-            cid = first_chunk.chunk_id if hasattr(first_chunk, "chunk_id") else first_chunk["chunk_id"]
-            cids = [cid]
-        resp = AnswerResponse(
-            answer=f"Verified authoritative policy answer for: {question.strip()}",
-            status=AnswerStatus.ANSWERED,
-            citations=cids,
-            referenced_rule_ids=[],
-            reason="Answer directly supported by policy evidence.",
-        )
-        meta = {
-            "calls_made": 1,
-            "latency_ms": 120.0,
-            "total_tokens": 250,
-            "schema_valid": True,
-        }
-        return resp, meta
-
-    mock_llm.generate_answer.side_effect = mock_generate_answer
-    return mock_llm
-
-
-def evaluate_cache_pair(
-    pair: Dict[str, Any],
-    retriever: HybridRetriever,
-    embedder: BGEEmbedder,
-    qdrant_client: QdrantClient,
-    canonical_chunks_by_id: Dict[str, Dict[str, Any]],
-    mode: str,  # "no_cache", "similarity_only", "guarded"
-    similarity_threshold: float = CACHE_DEFAULT_SIMILARITY_THRESHOLD,
-    base_dir: Optional[Union[Path, str]] = None,
-) -> Dict[str, Any]:
-    """Evaluate a single pair under the specified caching mode.
-
-    Step 1: Seed the cache with the source question (using mock generator).
-    Step 2: Evaluate the candidate question under the selected mode.
-    """
-    pair_id = pair["pair_id"]
-    scenario = pair["scenario"]
-    expected_decision = pair["expected_decision"]
-
-    src_q = pair["source_question"]
-    src_role = pair["source_role"]
-    src_date = pair["source_date"]
-
-    cand_q = pair["candidate_question"]
-    cand_role = pair["candidate_role"]
-    cand_date = pair["candidate_date"]
-
-    # 1. Seed cache with source question (if not no_cache)
-    # Using mock LLM that generates valid grounded responses
-    mock_llm = create_mock_llm_for_eval()
-
-    # Seed source question into cache
-    if mode != "no_cache":
-        src_res = answer_question(
-            question=src_q,
-            role=src_role,
-            query_date=src_date,
-            retriever=retriever,
-            llm_client=mock_llm,
-            qdrant_client=qdrant_client,
-            cache_client=qdrant_client,
-            cache_enabled=True,
-            cache_threshold=similarity_threshold,
-            embedder=embedder,
-            base_dir=base_dir,
-            mode="bm25",
-        )
-        # If deterministic rule answered, or insufficient, force-insert a verified generation record for source
-        if not src_res.cache_entry_id and src_res.status in ("answered", "insufficient"):
-            src_chunks = retriever.search(src_q, role=src_role, query_date=parse_query_date(src_date), mode="bm25")
-            if src_chunks:
-                first_chunk = src_chunks[0]
-                insert_cache_entry(
-                    client=qdrant_client,
-                    embedder=embedder,
-                    question=src_q,
-                    answer=src_res.answer or f"Verified policy answer for: {src_q}",
-                    status="answered",
-                    role=src_role,
-                    query_date=src_date,
-                    corpus_fingerprint=getattr(retriever, "corpus_manifest", {}).get("processed_fingerprint", "test_fp"),
-                    citations=[first_chunk.chunk_id],
-                    citation_metadata=[{"chunk_id": first_chunk.chunk_id, "title": first_chunk.title}],
-                    referenced_rule_ids=[],
-                    rule_results=[],
-                    canonical_chunks_by_id=canonical_chunks_by_id,
-                    extracted_conditions=extract_conditions_from_query(src_q),
-                )
-
-    # 2. Evaluate candidate question under requested mode
-    start_eval_time = time.perf_counter()
-
+def cache_outcome(result: GenerationResult, mode: str) -> str:
     if mode == "no_cache":
-        # Always run through standard uncached generation
-        res = answer_question(
-            question=cand_q,
-            role=cand_role,
-            query_date=cand_date,
-            retriever=retriever,
-            llm_client=mock_llm,
-            qdrant_client=qdrant_client,
-            cache_enabled=False,
-            base_dir=base_dir,
-            mode="bm25",
-        )
-        latency_ms = (time.perf_counter() - start_eval_time) * 1000.0
-        return {
-            "pair_id": pair_id,
-            "scenario": scenario,
-            "expected_decision": expected_decision,
-            "mode": mode,
-            "cache_hit": False,
-            "cache_similarity": None,
-            "rejection_reason": "cache_disabled",
-            "decision": "miss",
-            "provider_calls": res.provider_calls_attempted or (1 if res.status == "answered" else 0),
-            "token_usage": res.token_usage or (250 if res.status == "answered" else 0),
-            "latency_ms": round(latency_ms, 2),
-            "status": res.status,
-        }
+        return "disabled"
+    if result.cache_hit:
+        return "hit"
+    if result.cache_rejection_reason in CACHE_ERRORS or result.cache_insert_outcome == "error":
+        return "error"
+    if result.route != "generated_verified":
+        return "bypassed"
+    if result.cache_rejection_reason in ("cache_miss", "low_similarity"):
+        return "miss"
+    return "rejected" if result.cache_rejection_reason else "bypassed"
 
-    elif mode == "similarity_only":
-        # Query cache for similarity only, without safety validation checks
-        manifest = getattr(retriever, "corpus_manifest", {}) or {}
-        corpus_fp = manifest.get("processed_fingerprint", "")
-        authorized_chunks = retriever.search(cand_q, role=cand_role, query_date=parse_query_date(cand_date), mode="bm25")
-        extracted_conds = extract_conditions_from_query(cand_q)
 
-        lookup_res = lookup_cache(
-            client=qdrant_client,
-            embedder=embedder,
-            question=cand_q,
-            role=cand_role,
-            query_date=cand_date,
-            corpus_fingerprint=corpus_fp,
-            authorized_chunks=authorized_chunks,
-            extracted_conditions=extracted_conds,
-            rule_results=[],
-            canonical_chunks_by_id=canonical_chunks_by_id,
-            similarity_threshold=similarity_threshold,
-            similarity_only=True,
-        )
-        latency_ms = (time.perf_counter() - start_eval_time) * 1000.0
-        cache_hit = lookup_res.hit
-
-        # Classify decision
-        if cache_hit:
-            if expected_decision == "safe_hit":
-                decision_outcome = "correct_hit"
+def prepare_cache_seed(pair: Dict[str, Any], *, retriever: HybridRetriever, embedder: BGEEmbedder,
+                       llm_client: Any, execution_mode: str, answer_options: Dict[str, Any],
+                       client_factory: Callable[[], QdrantClient]) -> Dict[str, Any]:
+    client = None
+    result = None
+    started = time.perf_counter()
+    try:
+        client = client_factory()
+        result = answer_question(pair["source_question"], pair["source_role"], pair["source_date"],
+                                 retriever=retriever, llm_client=llm_client, embedder=embedder,
+                                 cache_client=client, cache_enabled=True, **answer_options)
+        elapsed = (time.perf_counter() - started) * 1000
+        eligible = result.status == "answered" and result.route == "generated_verified"
+        error = result.status == "operational_error" or cache_outcome(result, "guarded") == "error"
+        point = None
+        if eligible and result.cache_insert_outcome == "stored" and result.cache_entry_id:
+            records = client.retrieve(QDRANT_CACHE_COLLECTION_NAME, [result.cache_entry_id], with_vectors=True)
+            if len(records) == 1:
+                saved = records[0]
+                point = models.PointStruct(id=saved.id, vector=saved.vector, payload=saved.payload)
             else:
-                decision_outcome = "unsafe_hit"  # Unsafe match!
-            provider_calls = 0
-            token_usage = 0
+                error = True
+        elif eligible and result.cache_insert_outcome != "ineligible":
+            error = True
+        reason = ("seed_error" if error else "eligible" if point else
+                  "ineligible_meaning" if eligible else result.route)
+        return {"pair_id": pair["pair_id"], "eligible": bool(point) and not error,
+                "error": error, "reason": reason, "route": result.route, "status": result.status,
+                "error_category": result.error_category, "cache_rejection_reason": result.cache_rejection_reason,
+                "cache_insert_outcome": result.cache_insert_outcome, "cache_insert_reason": result.cache_insert_reason,
+                "answer": result.answer, "citations": result.citations, "e2e_latency_ms": round(elapsed, 3),
+                "usage": request_usage(result, execution_mode), "point": point}
+    except Exception:
+        usage = request_usage(result, execution_mode) if result else {
+            "provider_calls": 0, "known_total_tokens": 0 if execution_mode == "live" else None,
+            "mock_provider_calls": 0 if execution_mode == "offline_mock" else None,
+            "simulated_tokens_used": None, "simulated_tokens_complete": False,
+            "has_incomplete_tokens": False}
+        return {"pair_id": pair["pair_id"], "eligible": False, "error": True, "reason": "seed_setup_error",
+                "route": "error", "status": "operational_error", "usage": usage, "point": None,
+                "e2e_latency_ms": round((time.perf_counter() - started) * 1000, 3)}
+    finally:
+        if client is not None:
+            client.close()
+
+
+def audit_cache_hit(pair: Dict[str, Any], result: GenerationResult, seed: Dict[str, Any],
+                    retriever: HybridRetriever, canonical: Dict[str, Any]) -> Dict[str, Any]:
+    ids = result.evidence_fingerprint.get("chunk_ids", [])
+    chunks = [canonical[cid] for cid in ids if cid in canonical]
+    conditions = extract_conditions_from_query(pair["candidate_question"])
+    rules = resolve_rules_for_evidence(chunks, pair["candidate_role"], pair["candidate_date"],
+                                      base_dir=retriever.base_dir, extracted_conditions=conditions)
+    record = CacheRecord.from_payload(deepcopy(seed["point"].payload))
+    valid, reason = validate_cache_candidate(record, pair["candidate_question"], pair["candidate_role"],
+                                             pair["candidate_date"], result.corpus_fingerprint,
+                                             chunks, conditions, rules, canonical)
+    try:
+        validate_grounded_answer(pair["candidate_question"], result.answer, result.citations, chunks)
+        supported = True
+    except ValueError:
+        supported = False
+    return {"mandatory_guards_passed": valid, "guard_violation": reason, "claims_supported": supported,
+            "correct_reuse": pair["reuse_label"] == "allow" and valid and supported}
+
+
+def evaluate_cache_pair(pair: Dict[str, Any], *, seed: Dict[str, Any], retriever: HybridRetriever,
+                        embedder: BGEEmbedder, llm_client: Any, canonical_chunks_by_id: Dict[str, Any],
+                        mode: str, similarity_threshold: float, execution_mode: str,
+                        answer_options: Dict[str, Any],
+                        client_factory: Callable[[], QdrantClient] = lambda: QdrantClient(":memory:")) -> Dict[str, Any]:
+    if mode not in MODES:
+        raise ValueError("Unknown cache mode.")
+    row = {"pair_id": pair["pair_id"], "scenario": pair["scenario"], "reuse_label": pair["reuse_label"],
+           "mode": mode, "seed_eligible": seed["eligible"], "seed_reason": seed["reason"],
+           "cache_hit": False, "cache_similarity": None, "cache_outcome": "bypassed",
+           "provider_calls": 0, "known_total_tokens": 0 if execution_mode == "live" else None,
+           "has_incomplete_tokens": False, "mock_provider_calls": 0 if execution_mode == "offline_mock" else None,
+           "simulated_tokens_used": 0 if execution_mode == "offline_mock" else None,
+           "simulated_tokens_complete": True if execution_mode == "offline_mock" else None,
+           "e2e_latency_ms": None, "candidate_executed": False,
+           "decision": "seed_error" if seed["error"] else "seed_ineligible"}
+    if not seed["eligible"]:
+        return row
+    client = None
+    try:
+        client = client_factory()
+        if mode != "no_cache":
+            ensure_cache_collection(client)
+            client.upsert(QDRANT_CACHE_COLLECTION_NAME, [deepcopy(seed["point"])])
+        lookup = partial(lookup_cache, similarity_only=True) if mode == "similarity_only" else None
+        started = time.perf_counter()
+        result = answer_question(pair["candidate_question"], pair["candidate_role"], pair["candidate_date"],
+                                 retriever=retriever, llm_client=llm_client, embedder=embedder,
+                                 cache_client=client, cache_enabled=mode != "no_cache",
+                                 cache_threshold=similarity_threshold, cache_lookup_fn=lookup, **answer_options)
+        elapsed = (time.perf_counter() - started) * 1000
+        outcome = cache_outcome(result, mode)
+        row.update(request_usage(result, execution_mode))
+        row.update({"candidate_executed": True, "e2e_latency_ms": round(elapsed, 3), "status": result.status,
+                    "route": result.route, "answer": result.answer, "citations": result.citations,
+                    "error_category": result.error_category, "cache_hit": result.cache_hit,
+                    "cache_similarity": result.cache_similarity, "cache_outcome": outcome,
+                    "rejection_reason": result.cache_rejection_reason,
+                    "cache_insert_outcome": result.cache_insert_outcome, "cache_insert_reason": result.cache_insert_reason})
+        if result.status == "operational_error" or outcome == "error":
+            row["decision"] = "error"
+        elif result.cache_hit:
+            try:
+                row.update(audit_cache_hit(pair, result, seed, retriever, canonical_chunks_by_id))
+                row["decision"] = "correct_hit" if row["correct_reuse"] else "unsafe_hit"
+            except (ValueError, KeyError, OSError):
+                row["decision"] = "audit_error"
+        elif mode == "no_cache":
+            row["decision"] = "baseline"
+        elif outcome == "bypassed":
+            row["decision"] = "bypassed"
         else:
-            if expected_decision == "reject":
-                decision_outcome = "safe_rejection"
-            else:
-                decision_outcome = "false_rejection"
-            provider_calls = 1
-            token_usage = 250
-
-        return {
-            "pair_id": pair_id,
-            "scenario": scenario,
-            "expected_decision": expected_decision,
-            "mode": mode,
-            "cache_hit": cache_hit,
-            "cache_similarity": lookup_res.similarity,
-            "rejection_reason": lookup_res.rejection_reason,
-            "decision": decision_outcome,
-            "provider_calls": provider_calls,
-            "token_usage": token_usage,
-            "latency_ms": round(latency_ms, 2),
-            "status": "answered" if cache_hit else "miss",
-        }
-
-    else:
-        # mode == "guarded"
-        res = answer_question(
-            question=cand_q,
-            role=cand_role,
-            query_date=cand_date,
-            retriever=retriever,
-            llm_client=mock_llm,
-            qdrant_client=qdrant_client,
-            cache_client=qdrant_client,
-            cache_enabled=True,
-            cache_threshold=similarity_threshold,
-            embedder=embedder,
-            base_dir=base_dir,
-            mode="bm25",
-        )
-        latency_ms = (time.perf_counter() - start_eval_time) * 1000.0
-        cache_hit = bool(res.cache_hit)
-
-        if cache_hit:
-            if expected_decision == "safe_hit":
-                decision_outcome = "correct_hit"
-            else:
-                decision_outcome = "unsafe_hit"
-            provider_calls = 0
-            token_usage = 0
-        else:
-            if expected_decision == "reject":
-                decision_outcome = "safe_rejection"
-            else:
-                decision_outcome = "false_rejection"
-            provider_calls = res.provider_calls_attempted or (1 if res.status == "answered" else 0)
-            token_usage = res.token_usage or (250 if res.status == "answered" else 0)
-
-        return {
-            "pair_id": pair_id,
-            "scenario": scenario,
-            "expected_decision": expected_decision,
-            "mode": mode,
-            "cache_hit": cache_hit,
-            "cache_similarity": res.cache_similarity,
-            "rejection_reason": res.cache_rejection_reason,
-            "decision": decision_outcome,
-            "provider_calls": provider_calls,
-            "token_usage": token_usage,
-            "latency_ms": round(latency_ms, 2),
-            "status": res.status,
-        }
+            row["decision"] = "safe_nonreuse" if pair["reuse_label"] == "deny" else "missed_allow"
+        return row
+    except Exception:
+        row.update({"decision": "error", "cache_outcome": "error", "error_category": "evaluation_service_error"})
+        return row
+    finally:
+        if client is not None:
+            client.close()
 
 
-def run_cache_evaluation(
-    dataset_path: Union[Path, str] = DEFAULT_CACHE_DEV_PAIRS_PATH,
-    modes: Sequence[str] = ("no_cache", "similarity_only", "guarded"),
-    similarity_threshold: float = CACHE_DEFAULT_SIMILARITY_THRESHOLD,
-    base_dir: Optional[Union[Path, str]] = None,
-    embedder: Optional[BGEEmbedder] = None,
-) -> Dict[str, Any]:
-    """Execute complete 40-pair evaluation across specified modes.
-
-    Returns structured comparison results, scenario matrices, and telemetry.
-    """
-    val_info = validate_cache_dev_dataset(dataset_path)
-    pairs_data = json.loads(Path(dataset_path).read_text(encoding="utf-8"))["pairs"]
-
-    base_path = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
-    canonical_corpus = load_validated_corpus(base_path)
-    canonical_chunks_by_id = {c["chunk_id"]: c for c in canonical_corpus}
-
-    retriever = HybridRetriever(base_dir=base_path)
-    active_embedder = embedder if embedder is not None else create_deterministic_mock_embedder()
-
-    results_by_mode: Dict[str, Any] = {}
-
-    for mode in modes:
-        pair_eval_records = []
-        latencies = []
-        total_provider_calls = 0
-        total_tokens = 0
-        rejection_reasons_counter: Dict[str, int] = {}
-        scenario_matrix: Dict[str, Dict[str, int]] = {}
-
-        for p in pairs_data:
-            pair_client = QdrantClient(":memory:")
-            ensure_cache_collection(pair_client)
-            rec = evaluate_cache_pair(
-                pair=p,
-                retriever=retriever,
-                embedder=active_embedder,
-                qdrant_client=pair_client,
-                canonical_chunks_by_id=canonical_chunks_by_id,
-                mode=mode,
-                similarity_threshold=similarity_threshold,
-                base_dir=base_path,
-            )
-            pair_eval_records.append(rec)
-            latencies.append(rec["latency_ms"])
-            total_provider_calls += rec["provider_calls"]
-            total_tokens += rec["token_usage"]
-
-            reason = rec.get("rejection_reason")
-            if reason:
-                rejection_reasons_counter[reason] = rejection_reasons_counter.get(reason, 0) + 1
-
-            scen = rec["scenario"]
-            if scen not in scenario_matrix:
-                scenario_matrix[scen] = {
-                    "total": 0,
-                    "correct_hits": 0,
-                    "unsafe_hits": 0,
-                    "safe_rejections": 0,
-                    "false_rejections": 0,
-                }
-            scenario_matrix[scen]["total"] += 1
-            dec = rec["decision"]
-            if dec in scenario_matrix[scen]:
-                scenario_matrix[scen][dec] += 1
-
-        correct_hits = sum(1 for r in pair_eval_records if r["decision"] == "correct_hit")
-        unsafe_hits = sum(1 for r in pair_eval_records if r["decision"] == "unsafe_hit")
-        safe_rejections = sum(1 for r in pair_eval_records if r["decision"] == "safe_rejection")
-        false_rejections = sum(1 for r in pair_eval_records if r["decision"] == "false_rejection")
-        total_hits = correct_hits + unsafe_hits
-
-        # Safe reuse precision = correct_hits / (correct_hits + unsafe_hits)
-        precision = (correct_hits / total_hits) if total_hits > 0 else 1.0
-        # Valid reuse rate = correct_hits / 12 valid paraphrase opportunities
-        valid_reuse_rate = (correct_hits / 12.0)
-        # Cache hit rate = total_hits / 40
-        hit_rate = (total_hits / 40.0)
-
-        lat_sorted = sorted(latencies)
-        median_lat = statistics.median(lat_sorted) if lat_sorted else 0.0
-        p95_lat = lat_sorted[int(0.95 * len(lat_sorted))] if lat_sorted else 0.0
-
-        results_by_mode[mode] = {
-            "mode": mode,
-            "similarity_threshold": similarity_threshold,
-            "total_pairs": len(pairs_data),
-            "total_hits": total_hits,
-            "correct_hits": correct_hits,
-            "unsafe_hits": unsafe_hits,
-            "safe_rejections": safe_rejections,
-            "false_rejections": false_rejections,
-            "safe_reuse_precision": round(precision, 4),
-            "valid_reuse_rate": round(valid_reuse_rate, 4),
-            "cache_hit_rate": round(hit_rate, 4),
-            "provider_calls": total_provider_calls,
-            "tokens_used": total_tokens,
-            "latency_median_ms": round(median_lat, 2),
-            "latency_p95_ms": round(p95_lat, 2),
-            "rejection_reasons": rejection_reasons_counter,
-            "scenario_breakdown": scenario_matrix,
-            "pair_records": pair_eval_records,
-        }
-
-    # Baseline comparisons
-    no_cache_calls = results_by_mode.get("no_cache", {}).get("provider_calls", 40)
-    no_cache_tokens = results_by_mode.get("no_cache", {}).get("tokens_used", 10000)
-
-    for m in modes:
-        if m != "no_cache":
-            calls_avoided = max(0, no_cache_calls - results_by_mode[m]["provider_calls"])
-            tokens_avoided = max(0, no_cache_tokens - results_by_mode[m]["tokens_used"])
-            results_by_mode[m]["provider_requests_avoided"] = calls_avoided
-            results_by_mode[m]["tokens_avoided"] = tokens_avoided
-
-    return {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "dataset_validation": val_info,
-        "similarity_threshold": similarity_threshold,
-        "results_by_mode": results_by_mode,
-    }
+def complete_total(rows: Sequence[Dict[str, Any]], field: str) -> Optional[int]:
+    values = [r.get(field) for r in rows]
+    return sum(values) if all(v is not None for v in values) else None
 
 
-def sweep_candidate_thresholds(
-    dataset_path: Union[Path, str] = DEFAULT_CACHE_DEV_PAIRS_PATH,
-    thresholds: Sequence[float] = (0.70, 0.75, 0.80, 0.85, 0.88, 0.90, 0.92, 0.95),
-    base_dir: Optional[Union[Path, str]] = None,
-    embedder: Optional[BGEEmbedder] = None,
-) -> List[Dict[str, Any]]:
-    """Sweep candidate similarity thresholds comparing Similarity-Only vs Guarded Semantic Cache.
-
-    Verifies that Guarded Semantic Cache maintains 100% safe reuse precision across thresholds,
-    whereas Similarity-Only suffers critical unsafe hits.
-    """
-    active_embedder = embedder if embedder is not None else create_deterministic_mock_embedder()
-    sweep_results = []
-    for thresh in thresholds:
-        res = run_cache_evaluation(
-            dataset_path=dataset_path,
-            modes=("similarity_only", "guarded"),
-            similarity_threshold=thresh,
-            base_dir=base_dir,
-            embedder=active_embedder,
-        )
-        sim_data = res["results_by_mode"]["similarity_only"]
-        grd_data = res["results_by_mode"]["guarded"]
-
-        sweep_results.append({
-            "threshold": thresh,
-            "sim_only_unsafe_hits": sim_data["unsafe_hits"],
-            "sim_only_precision": sim_data["safe_reuse_precision"],
-            "sim_only_hit_rate": sim_data["cache_hit_rate"],
-            "guarded_unsafe_hits": grd_data["unsafe_hits"],
-            "guarded_precision": grd_data["safe_reuse_precision"],
-            "guarded_valid_reuse_rate": grd_data["valid_reuse_rate"],
-            "guarded_hit_rate": grd_data["cache_hit_rate"],
-            "guarded_requests_avoided": grd_data.get("provider_requests_avoided", 0),
-        })
-
-    return sweep_results
+def percentile95(values: Sequence[float]) -> Optional[float]:
+    return sorted(values)[math.ceil(0.95 * len(values)) - 1] if values else None
 
 
-def format_cache_eval_summary(eval_data: Dict[str, Any]) -> str:
-    """Format structured evaluation outcome into a clean GitHub Flavored Markdown report."""
-    results = eval_data.get("results_by_mode", {})
-    thresh = eval_data.get("similarity_threshold", CACHE_DEFAULT_SIMILARITY_THRESHOLD)
-
-    no_cache = results.get("no_cache", {})
-    sim_only = results.get("similarity_only", {})
-    guarded = results.get("guarded", {})
-
-    lines = [
-        "# RuleLens — Stage F Guarded Semantic Cache Evaluation Summary",
-        "",
-        f"- **Evaluation Timestamp:** `{eval_data.get('timestamp')}`",
-        f"- **Evaluated Similarity Threshold:** `{thresh}`",
-        f"- **Dataset:** 40 manually reviewed pairs (`data/evaluation/cache_dev_pairs.json`)",
-        "",
-        "## 1. Overall Performance Comparison",
-        "",
-        "| Metric | Mode A: No Cache | Mode B: Similarity-Only | Mode C: Guarded Semantic Cache |",
-        "|---|---:|---:|---:|",
-        f"| **Total Evaluated Pairs** | {no_cache.get('total_pairs', 40)} | {sim_only.get('total_pairs', 40)} | {guarded.get('total_pairs', 40)} |",
-        f"| **Total Cache Hits** | {no_cache.get('total_hits', 0)} | {sim_only.get('total_hits', 0)} | {guarded.get('total_hits', 0)} |",
-        f"| **Correct Cache Hits** | {no_cache.get('correct_hits', 0)} | {sim_only.get('correct_hits', 0)} | {guarded.get('correct_hits', 0)} |",
-        f"| **Unsafe Cache Hits (Negative Pairs)** | {no_cache.get('unsafe_hits', 0)} | **{sim_only.get('unsafe_hits', 0)}** | **{guarded.get('unsafe_hits', 0)} (Zero Unsafe)** |",
-        f"| **Safe Rejections** | {no_cache.get('safe_rejections', 0)} | {sim_only.get('safe_rejections', 0)} | {guarded.get('safe_rejections', 0)} |",
-        f"| **False Rejections** | {no_cache.get('false_rejections', 0)} | {sim_only.get('false_rejections', 0)} | {guarded.get('false_rejections', 0)} |",
-        f"| **Safe Reuse Precision** | N/A | {sim_only.get('safe_reuse_precision', 0.0) * 100:.1f}% | **{guarded.get('safe_reuse_precision', 0.0) * 100:.1f}%** |",
-        f"| **Valid Reuse Rate (of 12 paraphrases)** | 0.0% | {sim_only.get('valid_reuse_rate', 0.0) * 100:.1f}% | {guarded.get('valid_reuse_rate', 0.0) * 100:.1f}% |",
-        f"| **Total Cache Hit Rate** | 0.0% | {sim_only.get('cache_hit_rate', 0.0) * 100:.1f}% | {guarded.get('cache_hit_rate', 0.0) * 100:.1f}% |",
-        f"| **Provider Requests Avoided** | 0 | {sim_only.get('provider_requests_avoided', 0)} | {guarded.get('provider_requests_avoided', 0)} |",
-        f"| **Known Tokens Avoided** | 0 | {sim_only.get('tokens_avoided', 0)} | {guarded.get('tokens_avoided', 0)} |",
-        f"| **Median Latency** | {no_cache.get('latency_median_ms', 0.0):.2f} ms | {sim_only.get('latency_median_ms', 0.0):.2f} ms | {guarded.get('latency_median_ms', 0.0):.2f} ms |",
-        f"| **P95 Latency** | {no_cache.get('latency_p95_ms', 0.0):.2f} ms | {sim_only.get('latency_p95_ms', 0.0):.2f} ms | {guarded.get('latency_p95_ms', 0.0):.2f} ms |",
-        "",
-        "## 2. Guarded Cache Scenario Breakdown",
-        "",
-        "| Scenario | Total Pairs | Correct Hits | Unsafe Hits | Safe Rejections | False Rejections | Safe Precision |",
-        "|---|---:|---:|---:|---:|---:|---:|",
-    ]
-
-    scen_matrix = guarded.get("scenario_breakdown", {})
-    for scen, counts in sorted(scen_matrix.items()):
-        total = counts.get("total", 0)
-        c_hits = counts.get("correct_hits", 0)
-        u_hits = counts.get("unsafe_hits", 0)
-        s_rej = counts.get("safe_rejections", 0)
-        f_rej = counts.get("false_rejections", 0)
-        p = (c_hits / (c_hits + u_hits)) * 100 if (c_hits + u_hits) > 0 else 100.0
-        lines.append(f"| `{scen}` | {total} | {c_hits} | **{u_hits}** | {s_rej} | {f_rej} | {p:.1f}% |")
-
-    lines.extend([
-        "",
-        "## 3. Rejection Reasons Summary (Guarded Cache)",
-        "",
-        "| Rejection Reason | Count |",
-        "|---|---:|",
-    ])
-    for reason, count in sorted(guarded.get("rejection_reasons", {}).items()):
-        lines.append(f"| `{reason}` | {count} |")
-
-    lines.extend([
-        "",
-        "## 4. Key Takeaway",
-        "",
-        "- **Mode B (Similarity-Only)** produces catastrophic unsafe hits across negative scenarios (changed numerical values, roles, dates, negations, and exceptions), proving that vector similarity alone is candidate discovery, never proof of equivalence.",
-        "- **Mode C (Guarded Semantic Cache)** eliminates 100% of unsafe hits (achieving **zero unsafe reuse events** and **100.0% safe reuse precision**), while safely reusing verified answers for valid paraphrases.",
-    ])
-
-    return "\n".join(lines)
+def summarize_cache_records(rows: Sequence[Dict[str, Any]], execution_mode: str) -> Dict[str, Any]:
+    eligible = [r for r in rows if r["seed_eligible"]]
+    opportunities = sum(r["reuse_label"] == "allow" for r in eligible)
+    hits = [r for r in rows if r["cache_hit"]]
+    correct = sum(r["decision"] == "correct_hit" for r in rows)
+    unsafe = sum(r["decision"] == "unsafe_hit" for r in rows)
+    audits_unknown = sum(r["decision"] not in ("correct_hit", "unsafe_hit") for r in hits)
+    latencies = [r["e2e_latency_ms"] for r in eligible if r["candidate_executed"]]
+    token_complete = (all(not r["has_incomplete_tokens"] and (r["provider_calls"] == 0 or r["known_total_tokens"] is not None)
+                          for r in rows) if execution_mode == "live" else
+                      all(r["simulated_tokens_complete"] and (r["mock_provider_calls"] == 0 or r["simulated_tokens_used"] is not None)
+                          for r in rows))
+    result = {"total_pairs": len(rows), "eligible_pairs": len(eligible), "eligible_allow_opportunities": opportunities,
+              "eligible_coverage": len(eligible) / len(rows) if rows else None,
+              "total_hits": len(hits), "correct_hits": correct, "unsafe_hits": unsafe,
+              "unresolved_hit_audits": audits_unknown,
+              "safe_reuse_precision": correct / len(hits) if hits and not audits_unknown else None,
+              "valid_reuse_rate": correct / opportunities if opportunities else None,
+              "cache_hit_rate": len(hits) / len(eligible) if eligible else None,
+              "all_input_hit_rate": len(hits) / len(rows) if rows else None,
+              "decisions": dict(Counter(r["decision"] for r in rows)),
+              "cache_outcomes": dict(Counter(r["cache_outcome"] for r in rows)),
+              "scenario_breakdown": {}, "token_totals_complete": token_complete,
+              "latency_sample_count": len(latencies),
+              "latency_median_ms": statistics.median(latencies) if latencies else None,
+              "latency_p95_ms": percentile95(latencies),
+              "factual_error_hits": sum(r.get("claims_supported") is False for r in hits),
+              "mandatory_guard_violation_hits": sum(r.get("mandatory_guards_passed") is False for r in hits),
+              "pair_records": list(rows)}
+    for field in ("provider_calls", "known_total_tokens", "mock_provider_calls", "simulated_tokens_used"):
+        result[field] = complete_total(rows, field)
+        result["known_partial_" + field] = sum(r[field] for r in rows if r.get(field) is not None)
+        result["unknown_" + field + "_rows"] = sum(r.get(field) is None for r in rows)
+    if execution_mode == "live" and not token_complete:
+        result["known_total_tokens"] = None
+    if execution_mode == "offline_mock" and not token_complete:
+        result["simulated_tokens_used"] = None
+    for scenario in sorted({r["scenario"] for r in rows}):
+        subset = [r for r in rows if r["scenario"] == scenario]
+        result["scenario_breakdown"][scenario] = {
+            "total": len(subset), "eligible": sum(r["seed_eligible"] for r in subset),
+            "decisions": dict(Counter(r["decision"] for r in subset)),
+            "cache_outcomes": dict(Counter(r["cache_outcome"] for r in subset))}
+    return result
 
 
-def main():
-    """Command-line interface for RuleLens cache evaluation."""
-    parser = argparse.ArgumentParser(description="RuleLens Semantic Cache Evaluation CLI")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def add_paired_savings(baseline: Dict[str, Any], compared: Dict[str, Any], execution_mode: str) -> None:
+    left = baseline["pair_records"]
+    right = compared["pair_records"]
+    if [(r["pair_id"], r["seed_eligible"]) for r in left] != [(r["pair_id"], r["seed_eligible"]) for r in right]:
+        raise ValueError("Savings require identical ordered cohorts.")
+    paired_complete = any(r["seed_eligible"] for r in left) and all(
+        not r["seed_eligible"] or r["candidate_executed"] for r in left + right)
+    compared["paired_execution_complete"] = paired_complete
+    compared["comparison_has_errors"] = any(r["decision"] in ("error", "audit_error", "seed_error") for r in left + right)
+    for field, output in (("provider_calls", "provider_requests_saved"),
+                          ("known_total_tokens", "known_tokens_saved"),
+                          ("mock_provider_calls", "mock_requests_saved"),
+                          ("simulated_tokens_used", "simulated_tokens_saved")):
+        a, b = baseline.get(field), compared.get(field)
+        compared[output] = a - b if paired_complete and a is not None and b is not None else None
 
-    # validate
-    val_p = subparsers.add_parser("validate", help="Validate cache development pairs dataset")
-    val_p.add_argument("--dataset", default=str(DEFAULT_CACHE_DEV_PAIRS_PATH), help="Path to cache_dev_pairs.json")
 
-    # benchmark
-    bm_p = subparsers.add_parser("benchmark", help="Execute 40-pair benchmark comparison")
-    bm_p.add_argument("--dataset", default=str(DEFAULT_CACHE_DEV_PAIRS_PATH), help="Path to cache_dev_pairs.json")
-    bm_p.add_argument("--threshold", type=float, default=CACHE_DEFAULT_SIMILARITY_THRESHOLD, help="Cosine similarity threshold")
-    bm_p.add_argument("--report-json", default=None, help="Optional output JSON path")
-    bm_p.add_argument("--report-md", default=None, help="Optional output Markdown report path")
-
-    # sweep
-    sw_p = subparsers.add_parser("sweep", help="Sweep candidate similarity thresholds")
-    sw_p.add_argument("--dataset", default=str(DEFAULT_CACHE_DEV_PAIRS_PATH), help="Path to cache_dev_pairs.json")
-    sw_p.add_argument("--report-json", default=None, help="Optional output JSON path")
-    sw_p.add_argument("--report-md", "--output", dest="report_md", default=None, help="Optional output Markdown report path")
-
-    args = parser.parse_args()
-
-    if args.command == "validate":
+def evaluation_identity(base: Path, dataset_path: Path, embedder: BGEEmbedder, llm_client: Any,
+                        execution_mode: str, retrieval_mode: str, dense_backend: str) -> Dict[str, Any]:
+    snapshot = get_corpus_snapshot(base)
+    commit = None
+    try:
+        repository = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=base,
+                                    capture_output=True, text=True, check=True).stdout.strip()
+        if Path(repository).resolve() != base.resolve():
+            raise ValueError("The data directory is not a repository root.")
+        files = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+                               cwd=base, capture_output=True, text=True, check=True).stdout.splitlines()
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=base, capture_output=True,
+                                text=True, check=True).stdout.strip()
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        paths = list((base / "src").rglob("*.py")) + list((base / "tests").rglob("*.py"))
+        paths += [p for p in (base / "data").rglob("*") if p.is_file()]
+        paths += list((base / ".github/workflows").glob("*.yml"))
+        paths += [base / name for name in ("README.md", "pyproject.toml", "requirements_test.txt", ".gitignore", ".env.example")]
+        files = [p.relative_to(base).as_posix() for p in paths if p.is_file()]
+    identities = []
+    for name in sorted(set(files)):
+        path = base / name
+        if path.is_file() and (not path.name.startswith(".env") or path.name == ".env.example"):
+            identities.append((name, hashlib.sha256(path.read_bytes()).hexdigest()))
+    dependencies = {}
+    for package in ("qdrant-client", "groq", "sentence-transformers", "pydantic", "rank-bm25", "pymupdf"):
         try:
-            info = validate_cache_dev_dataset(args.dataset)
-            print("=" * 60)
-            print("RuleLens Cache Development Dataset Validation: SUCCESS")
-            print("=" * 60)
-            print(f"Total Pairs: {info['total_pairs']}")
-            for s, cnt in info["scenarios"].items():
-                print(f"  - {s}: {cnt}")
-            print(f"Dataset Path: {info['path']}")
-            print("=" * 60)
-        except Exception as exc:
-            print(f"Dataset validation failed: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-    elif args.command == "benchmark":
-        print(f"Running cache evaluation benchmark on {args.dataset} (threshold={args.threshold})...")
-        eval_data = run_cache_evaluation(
-            dataset_path=args.dataset,
-            similarity_threshold=args.threshold,
-        )
-        md_summary = format_cache_eval_summary(eval_data)
-        print(md_summary)
-
-        if args.report_json:
-            p = Path(args.report_json)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(eval_data, indent=2), encoding="utf-8")
-            print(f"Saved evaluation JSON report to: {p}")
-
-        if args.report_md:
-            p = Path(args.report_md)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(md_summary, encoding="utf-8")
-            print(f"Saved evaluation Markdown report to: {p}")
-
-    elif args.command == "sweep":
-        print(f"Sweeping candidate similarity thresholds on {args.dataset}...")
-        sweep_data = sweep_candidate_thresholds(dataset_path=args.dataset)
-        print("\n" + "=" * 80)
-        print("SIMILARITY THRESHOLD SWEEP: SIMILARITY-ONLY VS. GUARDED SEMANTIC CACHE")
-        print("=" * 80)
-        print(f"{'Threshold':>9} | {'Sim Unsafe':>10} | {'Sim Prec':>8} | {'Grd Unsafe':>10} | {'Grd Prec':>8} | {'Grd Reuse':>9} | {'Req Saved':>9}")
-        print("-" * 80)
-        for row in sweep_data:
-            print(
-                f"{row['threshold']:9.2f} | "
-                f"{row['sim_only_unsafe_hits']:10d} | "
-                f"{row['sim_only_precision']*100:7.1f}% | "
-                f"{row['guarded_unsafe_hits']:10d} | "
-                f"{row['guarded_precision']*100:7.1f}% | "
-                f"{row['guarded_valid_reuse_rate']*100:8.1f}% | "
-                f"{row['guarded_requests_avoided']:9d}"
-            )
-        print("=" * 80 + "\n")
-
-        if args.report_json:
-            p = Path(args.report_json)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(sweep_data, indent=2), encoding="utf-8")
-            print(f"Saved sweep JSON report to: {p}")
-
-        if args.report_md:
-            p = Path(args.report_md)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            lines = [
-                "# RuleLens — Stage F Similarity Threshold Sweep",
-                "",
-                "| Threshold | Sim-Only Unsafe Hits | Sim-Only Precision | Guarded Unsafe Hits | Guarded Precision | Guarded Valid Reuse | Requests Avoided |",
-                "|---:|---:|---:|---:|---:|---:|---:|",
-            ]
-            for row in sweep_data:
-                lines.append(
-                    f"| {row['threshold']:.2f} | {row['sim_only_unsafe_hits']} | {row['sim_only_precision']*100:.1f}% | "
-                    f"**{row['guarded_unsafe_hits']}** | **{row['guarded_precision']*100:.1f}%** | "
-                    f"{row['guarded_valid_reuse_rate']*100:.1f}% | {row['guarded_requests_avoided']} |"
-                )
-            p.write_text("\n".join(lines), encoding="utf-8")
-            print(f"Saved sweep Markdown report to: {p}")
+            dependencies[package] = version(package)
+        except PackageNotFoundError:
+            dependencies[package] = None
+    return {"execution_mode": execution_mode, "cache_backend": "isolated_qdrant_memory",
+            "retrieval_mode": retrieval_mode, "dense_backend": dense_backend,
+            "embedding_implementation": type(embedder).__module__ + "." + type(embedder).__qualname__,
+            "embedding_model": getattr(embedder, "model_name", None),
+            "real_embedding_model": isinstance(embedder, BGEEmbedder),
+            "generation_model": getattr(llm_client, "model", None),
+            "corpus_fingerprint": snapshot.fingerprint, "cache_schema": CACHE_SCHEMA_VERSION,
+            "grounding_schema": GROUNDING_VERSION,
+            "dataset_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
+            "git_commit": commit,
+            "worktree_sha256": hashlib.sha256(json.dumps(identities).encode()).hexdigest(),
+            "python": platform.python_version(), "platform": platform.system(), "dependencies": dependencies,
+            "latency_scope": "complete candidate request, including retrieval, guards and miss regeneration",
+            "seed_cost_included_in_candidate_totals": False,
+            "warmup": "shared retriever and embedder; no synthetic latency subtraction"}
 
 
-if __name__ == "__main__":
-    main()
+def run_cache_evaluation(dataset_path: Union[Path, str] = DEFAULT_CACHE_DEV_PAIRS_PATH, *,
+                         llm_client: Any, embedder: BGEEmbedder, execution_mode: str,
+                         modes: Sequence[str] = MODES, similarity_threshold: float = CACHE_DEFAULT_SIMILARITY_THRESHOLD,
+                         thresholds: Optional[Sequence[float]] = None, base_dir: Optional[Union[Path, str]] = None,
+                         retriever: Optional[HybridRetriever] = None, retrieval_mode: str = "bm25",
+                         dense_backend: str = "local", policy_client: Any = None,
+                         pair_limit: Optional[int] = None,
+                         client_factory: Callable[[], QdrantClient] = lambda: QdrantClient(":memory:")) -> Dict[str, Any]:
+    if execution_mode not in ("offline_mock", "live") or not modes or any(m not in MODES for m in modes):
+        raise ValueError("Invalid execution mode or cache modes.")
+    if execution_mode == "offline_mock" and isinstance(llm_client, GroqClientWrapper):
+        raise ValueError("A live provider cannot be labelled offline_mock.")
+    values = list(thresholds) if thresholds is not None else [similarity_threshold]
+    if not values or len(set(values)) != len(values) or any(not math.isfinite(t) or not 0 <= t <= 1 for t in values):
+        raise ValueError("Thresholds must be unique finite values between zero and one.")
+    if pair_limit is not None and (isinstance(pair_limit, bool) or not isinstance(pair_limit, int) or pair_limit < 1):
+        raise ValueError("pair_limit must be positive.")
+    validation = validate_cache_dev_dataset(dataset_path)
+    base = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+    dataset_path = Path(dataset_path).resolve()
+    pairs = json.loads(dataset_path.read_text(encoding="utf-8"))["pairs"][:pair_limit]
+    snapshot = get_corpus_snapshot(base)
+    declared = json.loads(dataset_path.read_text(encoding="utf-8")).get("corpus_fingerprint")
+    if declared and declared != snapshot.fingerprint:
+        raise ValueError("Question-set corpus fingerprint mismatch.")
+    canonical = {c["chunk_id"]: c for c in snapshot.chunks}
+    active_retriever = retriever or HybridRetriever(base_dir=base, embedder=embedder)
+    options = {"base_dir": base, "mode": retrieval_mode, "dense_backend": dense_backend,
+               "qdrant_client": policy_client}
+    identity = evaluation_identity(base, dataset_path, embedder, llm_client, execution_mode, retrieval_mode, dense_backend)
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    seeds = [prepare_cache_seed(p, retriever=active_retriever, embedder=embedder, llm_client=llm_client,
+                                execution_mode=execution_mode, answer_options=options,
+                                client_factory=client_factory) for p in pairs]
+    common = dict(retriever=active_retriever, embedder=embedder, llm_client=llm_client,
+                  canonical_chunks_by_id=canonical, execution_mode=execution_mode,
+                  answer_options=options, client_factory=client_factory)
+    baseline_rows = [evaluate_cache_pair(p, seed=s, mode="no_cache", similarity_threshold=values[0], **common)
+                     for p, s in zip(pairs, seeds)]
+    baseline = summarize_cache_records(baseline_rows, execution_mode)
+    comparisons = []
+    for threshold in values:
+        measured = {}
+        for mode in dict.fromkeys(modes):
+            if mode == "no_cache":
+                continue
+            rows = [evaluate_cache_pair(p, seed=s, mode=mode, similarity_threshold=threshold, **common)
+                    for p, s in zip(pairs, seeds)]
+            measured[mode] = summarize_cache_records(rows, execution_mode)
+            add_paired_savings(baseline, measured[mode], execution_mode)
+        comparisons.append({"threshold": threshold, "modes": measured})
+    final_identity = evaluation_identity(base, dataset_path, embedder, llm_client, execution_mode, retrieval_mode, dense_backend)
+    identity["input_identity_unchanged"] = all(identity[k] == final_identity[k] for k in
+        ("git_commit", "worktree_sha256", "dataset_sha256", "corpus_fingerprint"))
+    identity["claim_audit"] = "mandatory guards and exact source spans; independent human correctness review is separate"
+    usages = [s["usage"] for s in seeds] + baseline_rows
+    for comparison in comparisons:
+        for measured in comparison["modes"].values():
+            usages.extend(measured["pair_records"])
+    request_totals = {}
+    for field in ("provider_calls", "known_total_tokens", "mock_provider_calls", "simulated_tokens_used"):
+        request_totals[field] = complete_total(usages, field)
+        request_totals["known_partial_" + field] = sum(r[field] for r in usages if r.get(field) is not None)
+    request_totals["has_incomplete_tokens"] = any(r["has_incomplete_tokens"] for r in usages)
+    if request_totals["has_incomplete_tokens"]:
+        request_totals["known_total_tokens"] = None
+    if execution_mode == "offline_mock" and not all(r["simulated_tokens_complete"] for r in usages):
+        request_totals["simulated_tokens_used"] = None
+    has_errors = any(s["error"] for s in seeds) or any(
+        r["decision"] in ("error", "audit_error") for r in usages if "decision" in r)
+    state = "invalidated" if not identity["input_identity_unchanged"] else "completed_with_errors" if has_errors else "completed"
+    return {"schema_version": "2.0", "timestamp": started_at, "execution_state": state, "identity": identity,
+            "dataset_validation": validation, "evaluated_pairs": len(pairs), "pair_limit": pair_limit,
+            "request_totals_including_seeding": request_totals,
+            "seeds": [{k: v for k, v in s.items() if k != "point"} for s in seeds],
+            "baseline": baseline, "comparisons": comparisons}
+
+
+def format_cache_eval_summary(data: Dict[str, Any]) -> str:
+    identity = data["identity"]
+    lines = ["# Cache evaluation", "", f"Execution: {identity['execution_mode']}. Cache backend: {identity['cache_backend']}.",
+             "Seeding is reported separately. Latency covers complete candidate requests.",
+             "Offline mock timings and simulated tokens are not live API performance.", ""]
+    if not identity.get("input_identity_unchanged", True):
+        lines.append("Input identity changed during execution; this run is not comparable evidence.")
+    def display(value):
+        return "undefined" if value is None else str(round(value, 4)) if isinstance(value, float) else str(value)
+    for comparison in data["comparisons"]:
+        lines.extend([f"Threshold: {comparison['threshold']}", "", "| Mode | Eligible / input | Correct / all hits | Unsafe hits | Precision | Valid reuse | Errors |",
+                      "|---|---:|---:|---:|---:|---:|---:|"])
+        for mode, result in [("no_cache", data["baseline"]), *comparison["modes"].items()]:
+            errors = sum(result["decisions"].get(k, 0) for k in ("error", "audit_error", "seed_error"))
+            lines.append(f"| {mode} | {result['eligible_pairs']} / {result['total_pairs']} | {result['correct_hits']} / {result['total_hits']} | {result['unsafe_hits']} | {display(result['safe_reuse_precision'])} | {display(result['valid_reuse_rate'])} | {errors} |")
+        lines.append("")
+    return "\n".join(lines)

@@ -260,7 +260,10 @@ class BGEEmbedder:
     def model(self) -> Any:
         """Lazily load the SentenceTransformer model."""
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError:
+                raise RuntimeError("Dense retrieval requires the semantic extra: install rulelens[semantic].") from None
 
             self._model = SentenceTransformer(self.model_name, device=self.device)
         return self._model
@@ -500,7 +503,7 @@ def reciprocal_rank_fusion(
 
 
 def load_validated_corpus(base_dir: Optional[Union[Path, str]] = None) -> List[Dict[str, Any]]:
-    """Load the 64 processed policy chunks from chunks.jsonl after Stage C corpus validation."""
+    """Load the 64 processed policy chunks from chunks.jsonl after corpus validation."""
     base = Path(base_dir) if base_dir else Path.cwd()
     processed_dir = base / "data" / "processed"
     chunks_path = processed_dir / "chunks.jsonl"
@@ -510,7 +513,7 @@ def load_validated_corpus(base_dir: Optional[Union[Path, str]] = None) -> List[D
     if not chunks_path.exists() or not rules_path.exists() or not manifest_path.exists():
         raise FileNotFoundError(f"Missing required processed files in {processed_dir}")
 
-    # Call Stage C validation to verify all source documents, PyMuPDF extraction,
+    # Call validation to verify all source documents, PyMuPDF extraction,
     # permissions, manifest metadata, and rule integrity
     validate_corpus(base)
 

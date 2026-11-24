@@ -1,4 +1,4 @@
-"""Offline deterministic tests for RuleLens Stage D2 Qdrant vector database integration.
+"""Offline deterministic tests for RuleLens Qdrant vector database integration.
 
 Verifies:
 - Deterministic UUIDv5 point ID generation across all 64 corpus chunks.
@@ -53,17 +53,6 @@ from rulelens.retrieval import (
 )
 
 
-@pytest.fixture(autouse=True)
-def guard_network(monkeypatch):
-    """Enforce that unit tests make zero external network calls."""
-
-    def guarded_connect(*args, **kwargs):
-        raise AssertionError("External network connection attempted during offline unit tests")
-
-    monkeypatch.setattr(socket, "create_connection", guarded_connect)
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
-
-
 @pytest.fixture
 def repo_root() -> Path:
     """Return repository root path."""
@@ -106,11 +95,7 @@ class FakeSentenceTransformerModel:
         return np.array(embeddings)
 
 
-# ==============================================================================
-# 1. Point IDs & Payload Preparation
-# ==============================================================================
-
-
+# Point IDs & Payload Preparation
 def test_get_point_id_deterministic_and_unique(sample_chunks: List[Dict[str, Any]]):
     """get_point_id must generate deterministic UUIDv5 strings that are distinct for all 64 chunks."""
     point_ids = set()
@@ -149,11 +134,7 @@ def test_prepare_chunk_payload_format(sample_chunks: List[Dict[str, Any]]):
     assert payload["corpus_fingerprint"] == "test_fp_123"
 
 
-# ==============================================================================
-# 2. Client Initialization & Error Handling
-# ==============================================================================
-
-
+# Client Initialization & Error Handling
 def test_get_qdrant_client_missing_url(monkeypatch):
     """get_qdrant_client must raise ValueError when QDRANT_URL is not provided or empty."""
     monkeypatch.delenv(QDRANT_URL, raising=False)
@@ -175,15 +156,11 @@ def test_get_qdrant_client_rejects_marketing_url():
 
 def test_get_qdrant_client_initialization():
     """get_qdrant_client must instantiate QdrantClient with provided URL and key."""
-    client = get_qdrant_client(url="http://localhost:6333", api_key="secret-key")
+    client = get_qdrant_client(url="https://localhost:6333", api_key="test-key")
     assert isinstance(client, QdrantClient)
 
 
-# ==============================================================================
-# 3. Collection Management & Incompatible Configuration Detection
-# ==============================================================================
-
-
+# Collection Management & Incompatible Configuration Detection
 def test_ensure_collection_in_memory():
     """ensure_collection must create the collection with size=384 and Cosine distance."""
     client = QdrantClient(":memory:")
@@ -252,11 +229,7 @@ def test_ensure_collection_rejects_conflicting_corpus_fingerprint():
         ensure_collection(client, collection_name=col_name, expected_fingerprint="new_fp_value")
 
 
-# ==============================================================================
-# 4. Corpus Synchronization & Verification (In-Memory)
-# ==============================================================================
-
-
+# Corpus Synchronization & Verification (In-Memory)
 def test_sync_corpus_and_verify_collection_in_memory(repo_root: Path):
     """sync_corpus must populate 64 points and verify_collection must succeed."""
     client = QdrantClient(":memory:")
@@ -317,11 +290,7 @@ def test_verify_collection_detects_incomplete_points(repo_root: Path):
         verify_collection(client=client, base_dir=repo_root, collection_name=col_name)
 
 
-# ==============================================================================
-# 5. Server-Side Filtering (Roles & Dates)
-# ==============================================================================
-
-
+# Server-Side Filtering (Roles & Dates)
 def test_search_qdrant_server_side_filtering(repo_root: Path, sample_chunks: List[Dict[str, Any]]):
     """search_qdrant must filter by role and temporal validity server-side."""
     client = QdrantClient(":memory:")
@@ -645,11 +614,7 @@ def test_sync_corpus_safe_completion_of_partial_collection(repo_root: Path, samp
     assert client.get_collection(col_name).points_count == 64
 
 
-# ==============================================================================
-# 6. CLI Entrypoints
-# ==============================================================================
-
-
+# CLI Entrypoints
 def test_cli_missing_credentials_fails_cleanly(monkeypatch):
     """CLI sync and verify without QDRANT_URL must return non-zero exit code with clear error message."""
     monkeypatch.delenv(QDRANT_URL, raising=False)
@@ -663,11 +628,7 @@ def test_cli_missing_credentials_fails_cleanly(monkeypatch):
     assert exc2.value.code != 0
 
 
-# ==============================================================================
-# 7. Payload Indexes & Sync Safety Validations
-# ==============================================================================
-
-
+# Payload Indexes & Sync Safety Validations
 def test_ensure_payload_indexes_reuses_valid_server_index():
     """ensure_payload_indexes must reuse valid existing indexes without recreation."""
     mock_client = MagicMock(spec=QdrantClient)

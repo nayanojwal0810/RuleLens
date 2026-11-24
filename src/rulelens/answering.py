@@ -13,9 +13,9 @@ import json
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from rulelens.config import (
     CACHE_DEFAULT_SIMILARITY_THRESHOLD,
@@ -28,6 +28,8 @@ from rulelens.config import (
     is_cache_enabled,
 )
 from rulelens.dataset import ROLES
+from rulelens.grounding import request_support, validate_grounded_answer, render_grounded_answer
+from rulelens.ingestion import CorpusSnapshot, assert_snapshot_current, get_corpus_snapshot
 from rulelens.llm import (
     AnswerResponse,
     AnswerStatus,
@@ -59,6 +61,7 @@ from rulelens.rules import (
 )
 from rulelens.cache import (
     CacheLookupResult,
+    CacheInsertionError,
     ensure_cache_collection,
     insert_cache_entry,
     lookup_cache,
@@ -111,13 +114,26 @@ class GenerationResult:
     has_incomplete_tokens: bool = False
     error_category: Optional[str] = None
     error: Optional[str] = None
-    # Stage F: Cache telemetry
+    # Cache telemetry
     cache_enabled: bool = False
     cache_hit: bool = False
     cache_similarity: Optional[float] = None
     cache_rejection_reason: Optional[str] = None
     cache_lookup_latency_ms: Optional[float] = None
     cache_entry_id: Optional[str] = None
+    cache_insert_outcome: Optional[str] = None
+    cache_insert_reason: Optional[str] = None
+    clarification: Optional[str] = None
+    route: Optional[str] = None
+    reason_code: Optional[str] = None
+
+    def __post_init__(self):
+        if self.route is None:
+            self.route = ("error" if self.status == "operational_error" else
+                          "clarification" if self.clarification else
+                          "refusal" if self.status != "answered" else "unverified")
+        if self.reason_code is None:
+            self.reason_code = self.error_category or self.route
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -148,6 +164,7 @@ def check_restricted_policy_access(
     query: str,
     role: str,
     query_date: datetime.date,
+    metadata_chunks: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> bool:
     """Check if query unambiguously targets a policy active on date that is restricted for the role.
 
@@ -157,29 +174,28 @@ def check_restricted_policy_access(
     to authorized retrieval which safely returns insufficient.
     """
     date_str = query_date.isoformat()
-    # Cache document-level metadata catalog on retriever to avoid redundant grouping
-    doc_catalog = getattr(retriever, "_doc_metadata_catalog", None)
-    if not isinstance(doc_catalog, dict):
-        doc_catalog = {}
-        for c in getattr(retriever, "chunks", []):
-            did = c.get("doc_id")
-            if not did:
-                continue
-            if did not in doc_catalog:
-                doc_catalog[did] = {
-                    "doc_id": did,
-                    "title": c.get("title", ""),
-                    "department": c.get("department", ""),
-                    "allowed_roles": set(c.get("allowed_roles", [])),
-                    "effective_from": c.get("effective_from", "0000-01-01"),
-                    "effective_to": c.get("effective_to") or "9999-12-31",
-                }
-            else:
-                doc_catalog[did]["allowed_roles"].update(c.get("allowed_roles", []))
-        try:
-            retriever._doc_metadata_catalog = doc_catalog
-        except Exception:
-            pass
+    parts = re.split(r"\s+(?:and|also)\s+|;", query, flags=re.IGNORECASE)
+    if len(parts) > 1 and any(
+        check_restricted_policy_access(retriever, part, role, query_date, metadata_chunks)
+        for part in parts if part.strip()
+    ):
+        return True
+    doc_catalog = {}
+    for c in (metadata_chunks if metadata_chunks is not None else getattr(retriever, "chunks", [])):
+        did = c.get("doc_id")
+        if not did:
+            continue
+        if did not in doc_catalog:
+            doc_catalog[did] = {
+                "doc_id": did,
+                "title": c.get("title", ""),
+                "department": c.get("department", ""),
+                "allowed_roles": set(c.get("allowed_roles", [])),
+                "effective_from": c.get("effective_from", "0000-01-01"),
+                "effective_to": c.get("effective_to") or "9999-12-31",
+            }
+        else:
+            doc_catalog[did]["allowed_roles"].update(c.get("allowed_roles", []))
 
     if not doc_catalog:
         return False
@@ -390,6 +406,46 @@ def check_evidence_support(
         return match_count >= 2 or (match_count / total_salient) >= 0.4
 
 
+def _finish_answer(result: GenerationResult, snapshot: CorpusSnapshot) -> GenerationResult:
+    try:
+        assert_snapshot_current(snapshot)
+        return result
+    except (OSError, ValueError):
+        return replace(result, answer="Policy data changed or could not be verified. Please retry.",
+                       status="operational_error", reason="Corpus integrity verification failed.",
+                       citations=[], citation_metadata=[], referenced_rule_ids=[], cache_hit=False,
+                       cache_entry_id=None, route="error", reason_code="evidence_integrity_error", error_category="evidence_integrity_error",
+                       error="Corpus integrity verification failed.")
+
+
+def _context_conflict(question: str, query_date: datetime.date, chunks: Sequence[Dict[str, Any]]) -> bool:
+    versions = re.findall(r"\btravel\s+policy\s+v([0-9]+)\b", question, re.IGNORECASE)
+    for version in versions:
+        if not any(c["title"].lower() == f"travel policy v{version}"
+                   and c["effective_from"] <= query_date.isoformat() <= (c.get("effective_to") or "9999-12-31")
+                   for c in chunks):
+            return True
+    dates = re.findall(r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}\b", question)
+    for date_text in dates:
+        try:
+            if datetime.date.fromisoformat(date_text) != query_date:
+                return True
+        except ValueError:
+            return True
+    named_dates = re.findall(r"\b(?:on|as of)\s+([A-Za-z]+\s+[0-9]{1,2},?\s+[0-9]{4})", question, re.IGNORECASE)
+    for date_text in named_dates:
+        for pattern in ("%B %d %Y", "%b %d %Y"):
+            try:
+                if datetime.datetime.strptime(date_text.replace(",", ""), pattern).date() != query_date:
+                    return True
+                break
+            except ValueError:
+                continue
+        else:
+            return True
+    return False
+
+
 def answer_question(
     question: str,
     role: str,
@@ -405,6 +461,7 @@ def answer_question(
     cache_client: Optional[Any] = None,
     cache_enabled: Optional[bool] = None,
     cache_threshold: Optional[float] = None,
+    cache_lookup_fn: Optional[Callable[..., CacheLookupResult]] = None,
     embedder: Optional[BGEEmbedder] = None,
 ) -> GenerationResult:
     """Answer an enterprise policy question using verified retrieval, rules, and Groq.
@@ -503,8 +560,32 @@ def answer_question(
 
     corpus_fp = manifest["processed_fingerprint"]
 
+    snapshot_base = base_dir
+    if snapshot_base is None:
+        candidate_base = getattr(active_retriever, "base_dir", None)
+        snapshot_base = candidate_base if isinstance(candidate_base, (str, Path)) else Path.cwd()
+    try:
+        corpus_snapshot = get_corpus_snapshot(snapshot_base)
+        if corpus_snapshot.fingerprint != corpus_fp:
+            raise ValueError("Retriever corpus differs from the validated snapshot.")
+        canonical_chunks = {c["chunk_id"]: c for c in corpus_snapshot.chunks}
+    except (OSError, ValueError):
+        return GenerationResult(cleaned_question, role, date_str,
+                                "Policy data could not be verified. Please retry.",
+                                "operational_error", "Corpus integrity verification failed.",
+                                [], [], [], GENERATION_MODEL, "", {},
+                                round((time.perf_counter() - start_total_time) * 1000, 2),
+                                error_category="evidence_integrity_error", error="Corpus integrity verification failed.")
+
+    if _context_conflict(cleaned_question, validated_date, list(canonical_chunks.values())):
+        message = "The question conflicts with the selected policy date or version. Please choose one effective date."
+        return GenerationResult(cleaned_question, role, date_str, message, "insufficient",
+                                "Policy date or version requires clarification.", [], [], [],
+                                GENERATION_MODEL, corpus_fp, {},
+                                round((time.perf_counter() - start_total_time) * 1000, 2), clarification=message)
+
     # Step C: Check restricted document access via permissible policy metadata
-    if check_restricted_policy_access(active_retriever, cleaned_question, role, validated_date):
+    if check_restricted_policy_access(active_retriever, cleaned_question, role, validated_date, list(canonical_chunks.values())):
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -559,10 +640,6 @@ def answer_question(
         )
 
     # Step E: Strengthened evidence validation against canonical corpus records
-    canonical_chunks = getattr(active_retriever, "chunks_by_id", {})
-    if not canonical_chunks and hasattr(active_retriever, "chunks"):
-        canonical_chunks = {c["chunk_id"]: c for c in active_retriever.chunks}
-
     authorized_chunks: List[RetrievalResult] = []
     for res in retrieved_results:
         try:
@@ -615,7 +692,14 @@ def answer_question(
 
     # Step G: Deterministic rule resolution
     try:
+        assert_snapshot_current(corpus_snapshot)
         extracted_conds = extract_conditions_from_query(cleaned_question)
+        invalid_condition = next((c for c in extracted_conds if c.get("cannot_evaluate")), None)
+        if invalid_condition:
+            message = invalid_condition.get("cannot_evaluate_reason") or "Please clarify the numerical condition."
+            return GenerationResult(cleaned_question, role, date_str, message, "insufficient", message,
+                                    [], [], [], GENERATION_MODEL, corpus_fp, ev_fingerprint,
+                                    round((time.perf_counter() - start_total_time) * 1000, 2), clarification=message)
         chunk_dicts = [c.to_dict() for c in authorized_chunks]
         rule_results = resolve_rules_for_evidence(
             authorized_chunks=chunk_dicts,
@@ -623,7 +707,9 @@ def answer_question(
             query_date=validated_date,
             base_dir=base_dir,
             extracted_conditions=extracted_conds,
+            corpus_snapshot=corpus_snapshot,
         )
+        assert_snapshot_current(corpus_snapshot)
     except Exception as exc:
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
@@ -645,7 +731,7 @@ def answer_question(
             token_usage=None,
             schema_valid=None,
             has_incomplete_tokens=False,
-            error_category="rule_loading_error",
+            error_category="evidence_integrity_error" if isinstance(exc, (OSError, ValueError)) else "rule_loading_error",
             error="Structured rule resolution failed due to an infrastructure error.",
         )
 
@@ -688,11 +774,12 @@ def answer_question(
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         cited_chunk = canonical_chunks.get(authoritative_dec.citation_chunk_id)
         cited_meta = [build_citation_metadata(cited_chunk)] if cited_chunk else []
-        return GenerationResult(
+        return _finish_answer(GenerationResult(
             question=cleaned_question,
             role=role,
             query_date=date_str,
             answer=authoritative_dec.answer,
+            route="rule",
             status=AnswerStatus.ANSWERED.value,
             reason=authoritative_dec.reason,
             citations=[authoritative_dec.citation_chunk_id],
@@ -707,7 +794,7 @@ def answer_question(
             token_usage=None,
             schema_valid=None,
             has_incomplete_tokens=False,
-        )
+        ), corpus_snapshot)
 
     # Step G.1b: Boundary-crossing condition safeguard
     # For conditions crossing multiple rule outcomes (e.g. at least threshold, or range crossing threshold),
@@ -718,7 +805,7 @@ def answer_question(
             question=cleaned_question,
             role=role,
             query_date=date_str,
-            answer="The provided corporate policies establish different approval requirements across the specified condition range; an unconditional decision cannot be determined.",
+            answer="The range crosses different policy outcomes. Please provide one specific amount to check.",
             status=AnswerStatus.INSUFFICIENT.value,
             reason="Numerical condition crosses policy approval boundaries.",
             citations=[],
@@ -730,6 +817,7 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=0,
             provider_latency_ms=None,
+            clarification="What specific amount should be checked?",
         )
 
     # Step G.1c: Fail-safe handling of unresolved conditions for decision requests
@@ -741,7 +829,9 @@ def answer_question(
             question=cleaned_question,
             role=role,
             query_date=date_str,
-            answer="The provided corporate policies do not contain sufficient evidence to establish an authoritative decision for this condition.",
+            answer=authoritative_dec.reason or "Please clarify the numerical condition and its currency or unit.",
+            clarification=authoritative_dec.reason or "What numerical condition and unit should be checked?",
+            reason_code="unresolved_condition",
             status=AnswerStatus.INSUFFICIENT.value,
             reason=authoritative_dec.reason or "Relevant policy rule condition is unresolved or cannot be evaluated safely.",
             citations=[],
@@ -811,26 +901,42 @@ def answer_question(
             provider_latency_ms=None,
         )
 
-    # Step G.4: Guarded semantic cache lookup
+    _, _, unsupported = request_support(cleaned_question, chunk_dicts)
+    if unsupported:
+        return GenerationResult(cleaned_question, role, date_str,
+                                "The provided corporate policies do not contain sufficient evidence to answer every part of this question.",
+                                "insufficient", "Requested facts or context are unsupported.", [], [], [],
+                                GENERATION_MODEL, corpus_fp, ev_fingerprint,
+                                round((time.perf_counter() - start_total_time) * 1000, 2),
+                                reason_code="unsupported_request")
+
+    # Guarded semantic cache lookup
     is_cache_active = cache_enabled if cache_enabled is not None else is_cache_enabled()
     active_cache_client = cache_client or qdrant_client
     active_embedder = embedder
+    cache_config_reason = None
+    supplied_model = GENERATION_MODEL if llm_client is None else getattr(llm_client, "model", None)
+    if is_cache_active and supplied_model != GENERATION_MODEL:
+        is_cache_active = False
+        cache_config_reason = "generation_configuration_mismatch"
     if is_cache_active and active_embedder is None:
-        dense_ret = getattr(active_retriever, "dense_retriever", None)
-        active_embedder = getattr(dense_ret, "embedder", None)
+        active_embedder = getattr(active_retriever, "embedder", None)
         if active_embedder is None:
             try:
                 active_embedder = BGEEmbedder()
             except Exception:
                 active_embedder = None
+                cache_config_reason = "embedding_error"
 
     if is_cache_active and active_cache_client is None:
         try:
             active_cache_client = get_qdrant_client()
         except Exception:
             active_cache_client = None
+            cache_config_reason = "cache_service_unavailable"
 
-    cache_lookup_res: Optional[CacheLookupResult] = None
+    cache_lookup_res: Optional[CacheLookupResult] = (
+        CacheLookupResult(hit=False, rejection_reason=cache_config_reason) if cache_config_reason else None)
     if is_cache_active and active_cache_client is not None and active_embedder is not None:
         eff_threshold = (
             cache_threshold
@@ -839,7 +945,7 @@ def answer_question(
         )
         try:
             ensure_cache_collection(active_cache_client)
-            cache_lookup_res = lookup_cache(
+            cache_lookup_res = (cache_lookup_fn or lookup_cache)(
                 client=active_cache_client,
                 embedder=active_embedder,
                 question=cleaned_question,
@@ -860,11 +966,12 @@ def answer_question(
                     for cid in rec.cited_chunk_ids
                     if cid in canonical_chunks
                 ] or rec.citation_metadata
-                return GenerationResult(
+                return _finish_answer(GenerationResult(
                     question=cleaned_question,
                     role=role,
                     query_date=date_str,
                     answer=rec.answer,
+                    route="cache",
                     status=AnswerStatus.ANSWERED.value,
                     reason=f"Reused verified answer from semantic cache (entry {rec.entry_id}, similarity {cache_lookup_res.similarity:.4f}).",
                     citations=rec.cited_chunk_ids,
@@ -885,7 +992,7 @@ def answer_question(
                     cache_rejection_reason=None,
                     cache_lookup_latency_ms=cache_lookup_res.latency_ms,
                     cache_entry_id=rec.entry_id,
-                )
+                ), corpus_snapshot)
         except Exception:
             cache_lookup_res = CacheLookupResult(
                 hit=False,
@@ -893,6 +1000,15 @@ def answer_question(
             )
 
     # Step H: Call Groq LLM
+    try:
+        assert_snapshot_current(corpus_snapshot)
+    except (OSError, ValueError):
+        return GenerationResult(cleaned_question, role, date_str,
+                                "Policy data changed or could not be verified. Please retry.",
+                                "operational_error", "Corpus integrity verification failed.",
+                                [], [], [], GENERATION_MODEL, corpus_fp, {},
+                                round((time.perf_counter() - start_total_time) * 1000, 2),
+                                error_category="evidence_integrity_error", error="Corpus integrity verification failed.")
     try:
         active_llm = llm_client or GroqClientWrapper()
     except (ValueError, SanitizedProviderError) as client_err:
@@ -950,15 +1066,8 @@ def answer_question(
             error="Generation service encountered an unhandled provider error.",
         )
 
-    baseline_telemetry = None
-    if hasattr(active_llm, "get_telemetry_snapshot"):
-        try:
-            snap = active_llm.get_telemetry_snapshot()
-            if isinstance(snap, ProviderTelemetrySnapshot):
-                baseline_telemetry = snap
-        except Exception:
-            baseline_telemetry = None
-
+    active_model = getattr(active_llm, "model", GENERATION_MODEL)
+    response_model = active_model if isinstance(active_model, str) else GENERATION_MODEL
     provider_calls: Optional[int] = None
     provider_lat: Optional[float] = None
     toks_used: Optional[int] = None
@@ -974,33 +1083,25 @@ def answer_question(
             applicable_rule_facts=applicable_rule_results,
         )
         schema_valid_status = True
-        if baseline_telemetry is not None:
-            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
-            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
-            toks_used = _safe_int(getattr(delta, "known_total_tokens", None), default=None)
-            has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
+        request_usage = llm_meta.get("telemetry") if isinstance(llm_meta, dict) else None
+        if isinstance(request_usage, ProviderTelemetrySnapshot):
+            provider_calls = request_usage.provider_requests_attempted
+            provider_lat = request_usage.provider_request_latency_ms
+            toks_used = request_usage.known_total_tokens
+            has_inc_toks = request_usage.has_incomplete_tokens
         elif isinstance(llm_meta, dict):
             provider_calls = _safe_int(llm_meta.get("calls_made"), default=None)
             provider_lat = _safe_float(llm_meta.get("latency_ms"))
             toks_used = _safe_int(llm_meta.get("total_tokens"), default=None)
-            has_inc_toks = False
-        else:
-            provider_calls = None
-            provider_lat = None
-            toks_used = None
-            has_inc_toks = False
+            has_inc_toks = bool(llm_meta.get("has_incomplete_tokens", toks_used is None))
     except SanitizedProviderError as prov_err:
         schema_valid_status = False if prov_err.category == "invalid_generation" else None
-        if baseline_telemetry is not None:
-            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
-            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
-            has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
-        else:
-            provider_calls = None
-            provider_lat = None
-            has_inc_toks = False
+        request_usage = prov_err.request_telemetry
+        if isinstance(request_usage, ProviderTelemetrySnapshot):
+            provider_calls = request_usage.provider_requests_attempted
+            provider_lat = request_usage.provider_request_latency_ms
+            toks_used = request_usage.known_total_tokens
+            has_inc_toks = request_usage.has_incomplete_tokens
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -1018,7 +1119,7 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=provider_calls,
             provider_latency_ms=provider_lat,
-            token_usage=None,
+            token_usage=toks_used,
             schema_valid=schema_valid_status,
             has_incomplete_tokens=has_inc_toks,
             error_category=prov_err.category,
@@ -1026,15 +1127,6 @@ def answer_question(
         )
     except Exception:
         schema_valid_status = None
-        if baseline_telemetry is not None:
-            delta = active_llm.get_telemetry_snapshot().delta(baseline_telemetry)
-            provider_calls = _safe_int(getattr(delta, "provider_requests_attempted", None), default=None)
-            provider_lat = _safe_float(getattr(delta, "provider_request_latency_ms", None))
-            has_inc_toks = bool(getattr(delta, "has_incomplete_tokens", False))
-        else:
-            provider_calls = None
-            provider_lat = None
-            has_inc_toks = False
         total_latency = (time.perf_counter() - start_total_time) * 1000.0
         return GenerationResult(
             question=cleaned_question,
@@ -1052,14 +1144,26 @@ def answer_question(
             latency_ms=round(total_latency, 2),
             provider_calls_attempted=provider_calls,
             provider_latency_ms=provider_lat,
-            token_usage=None,
+            token_usage=toks_used,
             schema_valid=schema_valid_status,
             has_incomplete_tokens=has_inc_toks,
             error_category="service_unavailable",
             error="Generation service encountered an unhandled provider error.",
         )
 
-    # Step I: Validate LLM output and citations
+    try:
+        assert_snapshot_current(corpus_snapshot)
+    except (OSError, ValueError):
+        return GenerationResult(cleaned_question, role, date_str,
+                                "Policy data changed or could not be verified. Please retry.",
+                                "operational_error", "Corpus integrity verification failed.", [], [], [],
+                                GENERATION_MODEL, corpus_fp, ev_fingerprint,
+                                round((time.perf_counter() - start_total_time) * 1000, 2),
+                                provider_calls_attempted=provider_calls, provider_latency_ms=provider_lat,
+                                token_usage=toks_used, schema_valid=schema_valid_status, has_incomplete_tokens=has_inc_toks,
+                                error_category="evidence_integrity_error", error="Corpus integrity verification failed.")
+
+    # Validate model output and citations
     try:
         val_citations, val_metadata, val_rules = validate_citations_and_rules(
             response=model_resp,
@@ -1076,7 +1180,7 @@ def answer_question(
             query_date=date_str,
             answer="Policy evidence retrieved, but the generated response could not be verified against authorized citations.",
             status="operational_error",
-            reason=cit_err.safe_message,
+            reason="Citation validation failed.",
             citations=[],
             citation_metadata=[],
             referenced_rule_ids=[],
@@ -1117,6 +1221,58 @@ def answer_question(
             error="Citation validation failed.",
         )
 
+    if model_resp.status == AnswerStatus.ANSWERED:
+        try:
+            claims = validate_grounded_answer(cleaned_question, model_resp.answer, val_citations, chunk_dicts)
+            model_resp = model_resp.model_copy(update={"answer": render_grounded_answer(claims),
+                                                       "reason": "All requested facts verified against complete policy source spans."})
+        except ValueError:
+            return GenerationResult(cleaned_question, role, date_str,
+                                    "The generated answer could not be verified against the policy evidence.",
+                                    "operational_error", "Factual claim validation failed.", [], [], [],
+                                    GENERATION_MODEL, corpus_fp, ev_fingerprint,
+                                    round((time.perf_counter() - start_total_time) * 1000, 2),
+                                    provider_calls_attempted=provider_calls, provider_latency_ms=provider_lat,
+                                    token_usage=toks_used, schema_valid=True, has_incomplete_tokens=has_inc_toks,
+                                    error_category="claim_validation_failed", error="Factual claim validation failed.")
+
+    else:
+        message = ("Access restricted for the selected role." if model_resp.status == AnswerStatus.RESTRICTED else
+                   "The provided corporate policies do not contain sufficient evidence to answer this question.")
+        model_resp = model_resp.model_copy(update={"answer": message, "reason": "No verified answer was produced."})
+
+    total_latency = (time.perf_counter() - start_total_time) * 1000.0
+    result = GenerationResult(
+        question=cleaned_question,
+        role=role,
+        query_date=date_str,
+        answer=model_resp.answer,
+        route="generated_verified" if model_resp.status == AnswerStatus.ANSWERED else "refusal",
+        status=model_resp.status.value,
+        reason=model_resp.reason,
+        citations=val_citations,
+        citation_metadata=val_metadata,
+        referenced_rule_ids=val_rules,
+        model=response_model,
+        corpus_fingerprint=corpus_fp,
+        evidence_fingerprint=ev_fingerprint,
+        latency_ms=round(total_latency, 2),
+        provider_calls_attempted=provider_calls,
+        provider_latency_ms=provider_lat,
+        token_usage=toks_used,
+        schema_valid=True,
+        has_incomplete_tokens=has_inc_toks,
+        cache_enabled=is_cache_active,
+        cache_hit=False,
+        cache_similarity=cache_lookup_res.similarity if cache_lookup_res else None,
+        cache_rejection_reason=cache_lookup_res.rejection_reason if cache_lookup_res else None,
+        cache_lookup_latency_ms=cache_lookup_res.latency_ms if cache_lookup_res else None,
+        cache_entry_id=None,
+    )
+    result = _finish_answer(result, corpus_snapshot)
+    if result.status == "operational_error":
+        return result
+
     # Step J: Insert verified answer into semantic cache if eligible
     inserted_cache_id = None
     if is_cache_active and active_cache_client is not None and active_embedder is not None:
@@ -1137,39 +1293,21 @@ def answer_question(
                     rule_results=rule_results,
                     canonical_chunks_by_id=canonical_chunks,
                     extracted_conditions=extracted_conds,
-                    model=GENERATION_MODEL,
+                    model=result.model,
+                    validation_route=result.route,
+                    raise_on_error=True,
                 )
+                result.cache_insert_outcome = "stored" if inserted_cache_id else "ineligible"
+            except CacheInsertionError as exc:
+                result.cache_insert_outcome = "error"
+                result.cache_insert_reason = exc.reason
             except Exception:
-                inserted_cache_id = None
+                result.cache_insert_outcome = "error"
+                result.cache_insert_reason = "cache_insert_error"
 
-    total_latency = (time.perf_counter() - start_total_time) * 1000.0
-
-    return GenerationResult(
-        question=cleaned_question,
-        role=role,
-        query_date=date_str,
-        answer=model_resp.answer,
-        status=model_resp.status.value,
-        reason=model_resp.reason,
-        citations=val_citations,
-        citation_metadata=val_metadata,
-        referenced_rule_ids=val_rules,
-        model=GENERATION_MODEL,
-        corpus_fingerprint=corpus_fp,
-        evidence_fingerprint=ev_fingerprint,
-        latency_ms=round(total_latency, 2),
-        provider_calls_attempted=provider_calls,
-        provider_latency_ms=provider_lat,
-        token_usage=toks_used,
-        schema_valid=True,
-        has_incomplete_tokens=has_inc_toks,
-        cache_enabled=is_cache_active,
-        cache_hit=False,
-        cache_similarity=cache_lookup_res.similarity if cache_lookup_res else None,
-        cache_rejection_reason=cache_lookup_res.rejection_reason if cache_lookup_res else None,
-        cache_lookup_latency_ms=cache_lookup_res.latency_ms if cache_lookup_res else None,
-        cache_entry_id=inserted_cache_id,
-    )
+    result.cache_entry_id = inserted_cache_id
+    result.latency_ms = round((time.perf_counter() - start_total_time) * 1000.0, 2)
+    return _finish_answer(result, corpus_snapshot)
 
 
 def main():

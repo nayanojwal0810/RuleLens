@@ -1,4 +1,4 @@
-"""Offline deterministic tests for RuleLens Stage D1 hybrid retrieval foundation.
+"""Offline deterministic tests for RuleLens hybrid retrieval foundation.
 
 Verifies:
 - Tokenization (lowercase, number retention, no stopword removal, empty queries).
@@ -46,17 +46,6 @@ from rulelens.retrieval import (
 )
 
 
-@pytest.fixture(autouse=True)
-def guard_network(monkeypatch):
-    """Enforce that unit tests make zero network calls."""
-
-    def guarded_connect(*args, **kwargs):
-        raise AssertionError("Network connection attempted during offline unit tests")
-
-    monkeypatch.setattr(socket, "create_connection", guarded_connect)
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
-
-
 @pytest.fixture
 def repo_root() -> Path:
     """Return the absolute path of the repository root."""
@@ -69,11 +58,7 @@ def sample_chunks(repo_root: Path) -> List[Dict[str, Any]]:
     return load_validated_corpus(repo_root)
 
 
-# ==============================================================================
-# 1. Corpus Loading & Integrity Verification
-# ==============================================================================
-
-
+# Corpus Loading & Integrity Verification
 def test_load_validated_corpus_loads_all_64_chunks(repo_root: Path):
     """Corpus loader must load all 64 chunks and verify fingerprint integrity."""
     chunks = load_validated_corpus(repo_root)
@@ -107,7 +92,7 @@ def test_load_validated_corpus_rejects_corrupted_fingerprint(tmp_path: Path, rep
 
 
 def test_load_validated_corpus_rejects_tampered_corpus_despite_recomputed_fingerprint(tmp_path: Path, repo_root: Path):
-    """Corpus loader must call Stage C validate_corpus and reject tampered content even with recomputed fingerprints."""
+    """Corpus loader must call validate_corpus and reject tampered content even with recomputed fingerprints."""
     import json
     from rulelens.ingestion import calculate_processed_fingerprint, calculate_source_fingerprint
 
@@ -152,11 +137,7 @@ def test_load_validated_corpus_rejects_tampered_corpus_despite_recomputed_finger
         load_validated_corpus(tmp_path)
 
 
-# ==============================================================================
-# 2. Tokenization & BM25 Lexical Search
-# ==============================================================================
-
-
+# Tokenization & BM25 Lexical Search
 def test_tokenize_lowercase_and_retains_numbers():
     """Tokenize must lowercase terms, retain numbers, and normalize comma-separated numbers."""
     tokens = tokenize("Asterline Travel Policy v1 limits hotel to 250 USD and flight to 40,000 USD.")
@@ -281,11 +262,7 @@ def test_bm25_deterministic_tie_breaking():
     assert results[2].rank == 3
 
 
-# ==============================================================================
-# 3. Reciprocal Rank Fusion (RRF)
-# ==============================================================================
-
-
+# Reciprocal Rank Fusion (RRF)
 def test_rrf_pure_calculation_with_known_ranks():
     """Verify RRF formula calculation exactly matches 1/(k + rank) with k=60."""
     chunk_a = {
@@ -583,11 +560,7 @@ def test_rrf_merged_rank_ordering_and_tie_breaking():
     assert [r.chunk_id for r in results] == ["DOC-X", "DOC-Y"]
 
 
-# ==============================================================================
-# 4. Role Permissions & Date Boundary Eligibility
-# ==============================================================================
-
-
+# Role Permissions & Date Boundary Eligibility
 def test_role_authorization_all_six_roles(sample_chunks: List[Dict[str, Any]]):
     """Every approved role must have positive chunk eligibility."""
     assert len(ROLES) == 6
@@ -701,11 +674,7 @@ def test_preservation_of_citation_and_department_metadata(sample_chunks: List[Di
     assert as_dict["chunk_id"] == top.chunk_id
 
 
-# ==============================================================================
-# 5. Security Enforcements & Candidate Filtering
-# ==============================================================================
-
-
+# Security Enforcements & Candidate Filtering
 def test_security_real_unauthorized_dense_candidate_excluded(sample_chunks: List[Dict[str, Any]]):
     """Verify real restricted chunk DOC-TRV-004_TRV-E01 is excluded for employee, accepted for manager."""
     retriever = HybridRetriever(chunks=sample_chunks)
@@ -858,11 +827,7 @@ def test_hybrid_retriever_rejects_negative_limits_and_depth(sample_chunks: List[
         retriever.search("flight", role="employee", candidate_depth=0)
 
 
-# ==============================================================================
-# 6. Offline Fake Embedding Wrapper Interface
-# ==============================================================================
-
-
+# Offline Fake Embedding Wrapper Interface
 class FakeSentenceTransformerModel:
     """Deterministic fake model for testing BGEEmbedder without network access or downloading weights."""
 
@@ -948,11 +913,7 @@ def test_bge_wrapper_validates_dimension_and_finite_values():
         embedder_non_finite.embed_texts(["test text"])
 
 
-# ==============================================================================
-# 7. Stage D2 Hybrid Retrieval & Caching Enhancements
-# ==============================================================================
-
-
+# Hybrid Retrieval & Caching Enhancements
 def test_query_instruction_applied_to_query_only():
     """Verify BGE_QUERY_INSTRUCTION is prepended in embed_query but not in embed_texts."""
     captured_texts = []

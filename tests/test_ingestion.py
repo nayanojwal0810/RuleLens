@@ -20,6 +20,9 @@ from rulelens.ingestion import (
     validate_corpus,
     calculate_source_fingerprint,
     calculate_processed_fingerprint,
+    get_corpus_snapshot,
+    assert_snapshot_current,
+    validate_policy_versions,
 )
 
 
@@ -41,10 +44,7 @@ def copy_source_and_processed(repo_root: Path, target_dir: Path) -> Path:
     return target_dir
 
 
-# ---------------------------------------------------------------------------
 # Committed Processed Data Tests
-# ---------------------------------------------------------------------------
-
 def test_committed_processed_corpus_validation(repo_root):
     """Verify that existing committed processed corpus passes strengthened validation."""
     assert validate_corpus(repo_root) is True
@@ -225,10 +225,7 @@ def test_rule_to_chunk_linking(repo_root):
             assert rule["effective_to"] <= chunk["effective_to"]
 
 
-# ---------------------------------------------------------------------------
 # Fresh Build & Determinism Tests
-# ---------------------------------------------------------------------------
-
 def test_repeated_builds_produce_identical_hashes(repo_root):
     """Verify independent builds in two temporary directories yield identical file hashes."""
     with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
@@ -267,10 +264,7 @@ def test_ingestion_offline(repo_root, monkeypatch, tmp_path):
     assert validate_corpus(tmp_path) is True
 
 
-# ---------------------------------------------------------------------------
 # Negative Tests: Corruptions & Failure Handling
-# ---------------------------------------------------------------------------
-
 def test_negative_unauthorized_role_added_with_recomputed_hash(repo_root, tmp_path):
     """Validation must reject unauthorized role even when processed fingerprint is recomputed."""
     copy_source_and_processed(repo_root, tmp_path)
@@ -475,3 +469,75 @@ def test_extraction_failure_preserves_existing_outputs(repo_root, tmp_path):
     for name, expected_hash in initial_hashes.items():
         actual_hash = hashlib.sha256((processed_dir / name).read_bytes()).hexdigest()
         assert actual_hash == expected_hash, f"File {name} was modified despite extraction failure!"
+
+
+def test_snapshot_reuses_validation_but_not_mutable_payloads(repo_root, tmp_path, monkeypatch):
+    import rulelens.ingestion as ingestion
+
+    copy_source_and_processed(repo_root, tmp_path)
+    calls = []
+    original = ingestion.validate_corpus
+
+    def counted_validation(base):
+        calls.append(base)
+        return original(base)
+
+    monkeypatch.setattr(ingestion, "validate_corpus", counted_validation)
+    snapshot = get_corpus_snapshot(tmp_path)
+    assert get_corpus_snapshot(tmp_path) is snapshot
+    assert len(calls) == 1
+    edited = snapshot.chunks
+    edited[0]["text"] = "Forged text"
+    assert snapshot.chunks[0]["text"] != "Forged text"
+
+
+@pytest.mark.parametrize("filename", ["rules.jsonl", "chunks.jsonl", "corpus_manifest.json"])
+def test_snapshot_detects_warm_file_changes(repo_root, tmp_path, filename):
+    copy_source_and_processed(repo_root, tmp_path)
+    snapshot = get_corpus_snapshot(tmp_path)
+    path = tmp_path / "data/processed" / filename
+    path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    with pytest.raises(ValueError, match="changed"):
+        assert_snapshot_current(snapshot)
+
+
+def test_recomputed_fingerprints_do_not_validate_changed_rules(repo_root, tmp_path):
+    copy_source_and_processed(repo_root, tmp_path)
+    get_corpus_snapshot(tmp_path)
+    processed = tmp_path / "data/processed"
+    chunks = [json.loads(line) for line in (processed / "chunks.jsonl").read_text(encoding="utf-8").splitlines()]
+    rules = [json.loads(line) for line in (processed / "rules.jsonl").read_text(encoding="utf-8").splitlines()]
+    rules[0]["threshold_value"] = 99999
+    manifest = json.loads((processed / "corpus_manifest.json").read_text(encoding="utf-8"))
+    manifest["processed_fingerprint"] = calculate_processed_fingerprint(chunks, rules)
+    (processed / "rules.jsonl").write_text("\n".join(json.dumps(rule) for rule in rules), encoding="utf-8")
+    (processed / "corpus_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="mismatch"):
+        get_corpus_snapshot(tmp_path)
+
+
+def test_snapshot_detects_changes_during_validation(repo_root, tmp_path, monkeypatch):
+    import rulelens.ingestion as ingestion
+
+    copy_source_and_processed(repo_root, tmp_path)
+    original = ingestion.validate_corpus
+
+    def changing_validation(base):
+        original(base)
+        path = base / "data/processed/rules.jsonl"
+        path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(ingestion, "validate_corpus", changing_validation)
+    with pytest.raises(ValueError, match="changed"):
+        get_corpus_snapshot(tmp_path)
+
+
+def test_conflicting_versions_are_rejected():
+    records = [
+        {"doc_id": "travel_old", "title": "Travel Policy v1", "effective_from": "2026-01-01", "effective_to": "2026-07-01"},
+        {"doc_id": "travel_new", "title": "Travel Policy v2", "effective_from": "2026-07-01", "effective_to": "2099-12-31"},
+    ]
+    with pytest.raises(ValueError, match="Conflicting active policy versions"):
+        validate_policy_versions(records)
+    records[0]["effective_to"] = "2026-06-30"
+    validate_policy_versions(records)

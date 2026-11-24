@@ -1,4 +1,4 @@
-"""Guarded Semantic Caching for RuleLens (Stage F).
+"""Guarded semantic caching for RuleLens.
 
 Provides an evidence-bound semantic cache that safely reuses previously generated
 policy answers, reducing Groq requests without bypassing authorization, retrieval,
@@ -18,10 +18,12 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
+from decimal import Decimal
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from qdrant_client import QdrantClient, models
@@ -33,11 +35,16 @@ from rulelens.config import (
     QDRANT_CACHE_COLLECTION_NAME,
 )
 from rulelens.dataset import ROLES
+from rulelens.grounding import (
+    GROUNDING_VERSION, fact_fingerprint, request_meaning, request_support,
+    validate_grounded_answer, render_grounded_answer,
+)
 from rulelens.qdrant_store import is_in_memory_or_local_client
 from rulelens.retrieval import (
     EMBEDDING_DIMENSION,
     BGEEmbedder,
     RetrievalResult,
+    is_chunk_eligible,
 )
 from rulelens.rules import (
     RuleEvaluationResult,
@@ -48,7 +55,7 @@ from rulelens.rules import (
 # Namespace for deterministic cache record point IDs
 CACHE_POINT_NAMESPACE: uuid.UUID = uuid.uuid5(uuid.NAMESPACE_DNS, "cache.rulelens.asterline.internal")
 
-CACHE_SCHEMA_VERSION: str = "1.0"
+CACHE_SCHEMA_VERSION: str = "2.0"
 
 # Required payload indexes on non-in-memory Qdrant servers
 CACHE_REQUIRED_PAYLOAD_INDEXES: List[Tuple[str, models.PayloadSchemaType]] = [
@@ -57,6 +64,12 @@ CACHE_REQUIRED_PAYLOAD_INDEXES: List[Tuple[str, models.PayloadSchemaType]] = [
     ("schema_version", models.PayloadSchemaType.KEYWORD),
     ("status", models.PayloadSchemaType.KEYWORD),
 ]
+
+
+def supported_embedding_configuration(embedder: BGEEmbedder) -> bool:
+    name = getattr(embedder, "model_name", None)
+    normalized = getattr(embedder, "normalize_embeddings", None)
+    return name == EMBEDDING_MODEL and normalized is True
 
 
 def normalize_question(text: str) -> str:
@@ -73,154 +86,27 @@ def normalize_question(text: str) -> str:
 
 
 def compute_fact_target_signature(question: str) -> Dict[str, Any]:
-    """Extract fine-grained, explainable fact targets from the question.
-
-    Distinguishes specific policy facts within the same domain or clause:
-    - meal_allowance vs hotel_lodging vs flight_booking
-    - claim_submission_deadline vs manager_review_sla vs payment_cycle
-    - approval_threshold vs expense_eligibility
-    - standard_procurement vs emergency_procurement
-    - data_encryption vs data_transfer_restrictions
-    - business_travel vs personal_travel
-    - vacation_accrual vs sick_leave vs parental_leave
-    - tuition_assistance vs internal_mobility
-    - card_spending_limit vs card_issuance_eligibility
-    """
-    q_lower = question.lower()
-    facets: Set[str] = set()
-
-    # Meal subsistence vs hotel lodging
-    if any(k in q_lower for k in ("meal", "meals", "subsistence", "per diem", "food", "dining")):
-        facets.add("meal_allowance")
-    if any(k in q_lower for k in ("hotel", "hotels", "lodging", "nightly", "accommodation", "accommodations")):
-        facets.add("hotel_lodging")
-    if any(k in q_lower for k in ("flight", "flights", "advance booking", "booking notice", "airline", "railway", "departure")):
-        facets.add("flight_booking")
-
-    # Personal vs business travel
-    if "personal travel" in q_lower or "personal expense" in q_lower or "personal entertainment" in q_lower:
-        facets.add("personal_travel")
-    elif any(k in q_lower for k in ("business travel", "domestic travel", "official travel", "domestic assignments", "for work", "within india")):
-        facets.add("business_travel")
-
-    # Finance: Submission deadline vs Manager review SLA vs Payment cycle vs Receipt
-    if any(k in q_lower for k in ("manager review", "supervising manager", "inspect and approve", "review and approve", "turnaround time", "review turnaround", "approval turnaround")):
-        facets.add("manager_review_sla")
-    elif any(k in q_lower for k in ("submit", "submission", "employee claim", "filing", "incurring an expense", "file reimbursement")):
-        facets.add("claim_submission_deadline")
-
-    if any(k in q_lower for k in ("receipt", "tax invoice", "itemized", "incidental")):
-        facets.add("receipt_requirement")
-
-    if any(k in q_lower for k in ("corporate credit card", "corporate card", "cardholder", "cardholders")):
-        if any(k in q_lower for k in ("limit", "monthly", "spend")):
-            facets.add("card_spending_limit")
-        if any(k in q_lower for k in ("eligible", "eligibility", "issued", "issuance")):
-            facets.add("card_issuance_eligibility")
-
-    # Procurement: Standard vs Emergency vs Vendor onboarding vs Contract
-    if any(k in q_lower for k in ("emergency procurement", "emergency purchase", "emergency purchases")):
-        facets.add("emergency_procurement")
-    elif any(k in q_lower for k in ("procurement", "purchase order", "bidding", "quote", "vendor quote", "supplier")):
-        facets.add("standard_procurement")
-
-    # People Ops: Vacation vs Sick leave vs Remote core hours vs Tuition vs Mobility
-    if any(k in q_lower for k in ("vacation", "annual leave", "paid annual")):
-        facets.add("vacation_accrual")
-    if any(k in q_lower for k in ("sick leave", "medical certificate", "consecutive sick")):
-        facets.add("sick_leave")
-    if any(k in q_lower for k in ("core hours", "daily hours", "active availability", "availability window", "reachable")):
-        facets.add("core_working_hours")
-    if any(k in q_lower for k in ("tuition", "educational assistance", "degree", "learning allowance", "course")):
-        facets.add("tuition_assistance")
-    if any(k in q_lower for k in ("internal mobility", "internal transfer", "department transfer", "role transfer", "employee transfer")):
-        facets.add("internal_mobility")
-
-    # Security: Classification vs Recertification vs Incident SLA vs Encryption vs Transfer
-    if any(k in q_lower for k in ("classification tier", "classification tiers", "classification level", "classification levels", "categorize corporate information")):
-        facets.add("classification_tiers")
-    if any(k in q_lower for k in ("recertification", "recertify", "recertified")):
-        facets.add("account_recertification")
-    if any(k in q_lower for k in ("incident", "containment", "p1")):
-        facets.add("incident_containment")
-    if any(k in q_lower for k in ("encryption", "aes", "cipher", "storage drives", "purged")):
-        facets.add("data_encryption")
-    if any(k in q_lower for k in ("transferring", "outside authorized networks", "outside company networks", "transmission", "document-transfer")):
-        facets.add("data_transfer_restrictions")
-
-    # Approval threshold vs Expense eligibility check
-    is_threshold_query = bool(re.search(r"\b(maximum|cap|limit|threshold|spending limit|ceiling|rate)\b", q_lower))
-    is_eligibility_query = bool(re.search(r"\b(eligible|eligibility|qualify|entitled|entitlement|who is eligible|allowed to|permissible|can employees spend)\b", q_lower))
-
-    return {
-        "facets": sorted(list(facets)),
-        "is_threshold_query": is_threshold_query,
-        "is_eligibility_query": is_eligibility_query,
-    }
+    return request_meaning(question)
 
 
 def compute_question_indicators(question: str) -> Dict[str, Any]:
-    """Extract linguistic and semantic indicators from a question to guard cache reuse."""
-    q_norm = normalize_question(question)
-    q_lower = question.lower()
-
-    # Negation indicators
-    negation_patterns = r"\b(not|never|no|cannot|can't|without|disallow|disallowed|non-reimbursable|prohibited|neither|nor)\b"
-    has_negation = bool(re.search(negation_patterns, q_lower))
-
-    # Comparison and boundary indicators
-    comparison_patterns = r"\b(exceed|exceeds|exceeding|greater|less|more|fewer|maximum|minimum|cap|at least|at most|under|over|up to|above|below|higher|lower)\b"
-    has_comparison = bool(re.search(comparison_patterns, q_lower))
-
-    # Exception and emergency indicators
-    exception_patterns = r"\b(exception|exceptions|urgent|urgently|extraordinary|emergency|waiver|exempt|exemption|deviat|special)\b"
-    has_exception = bool(re.search(exception_patterns, q_lower))
-
-    # Critical approval authority entities mentioned in the query
-    authorities: List[str] = []
-    if "manager" in q_lower or "reporting manager" in q_lower:
-        authorities.append("manager")
-    if "director" in q_lower:
-        authorities.append("director")
-    if "vp" in q_lower or "vice president" in q_lower:
-        authorities.append("vp")
-    if "cfo" in q_lower or "chief financial officer" in q_lower:
-        authorities.append("cfo")
-    if "committee" in q_lower or "board" in q_lower:
-        authorities.append("board_or_committee")
-    if "lead" in q_lower or "leads" in q_lower:
-        authorities.append("lead")
-    if "ciso" in q_lower:
-        authorities.append("ciso")
-    authorities.sort()
-
-    # Broad policy subject categorization
-    subject = "general"
-    if any(k in q_lower for k in ("travel", "flight", "flights", "hotel", "lodging", "meal", "subsistence", "per diem", "booking", "portal")):
-        subject = "travel"
-    elif any(k in q_lower for k in ("receipt", "tax invoice", "card", "credit card", "reimbursement", "claim", "submit", "submission", "settling", "bitcoin")):
-        subject = "finance"
-    elif any(k in q_lower for k in ("vacation", "sick", "leave", "remote", "hours", "tuition", "education", "degree", "course", "transfer", "mobility", "sabbatical")):
-        subject = "people_ops"
-    elif any(k in q_lower for k in ("procurement", "purchase", "order", "quote", "supplier", "vendor", "emergency purchase", "bidding", "contract", "barter")):
-        subject = "procurement"
-    elif any(k in q_lower for k in ("classification", "tier", "confidential", "restricted", "encryption", "aes", "privileged", "recertification", "incident", "severity", "sla", "sanitiz", "storage", "drives", "smart", "iot")):
-        subject = "security"
-
-    fact_signature = compute_fact_target_signature(question)
-
-    return {
-        "has_negation": has_negation,
-        "has_comparison": has_comparison,
-        "has_exception": has_exception,
-        "approval_authorities": authorities,
-        "policy_subject": subject,
-        "fact_signature": fact_signature,
-    }
+    meaning = request_meaning(question)
+    conditions = extract_conditions_from_query(question)
+    return {"has_negation": meaning["negation"],
+            "has_comparison": any(c.get("comparison", "exact") != "exact" for c in conditions),
+            "has_exception": meaning["exception"], "approval_authorities": meaning["authorities"],
+            "fact_signature": meaning}
 
 
 def compute_condition_signature(conditions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Create a canonical deterministic signature of extracted condition values, units, and comparisons."""
+    def normalized(value):
+        try:
+            number = Decimal(str(value))
+            return format(number.normalize(), "f") if number.is_finite() else str(value)
+        except Exception:
+            return str(value)
+
     sig: Dict[str, Any] = {}
     for c in conditions:
         if not isinstance(c, dict):
@@ -231,18 +117,18 @@ def compute_condition_signature(conditions: Sequence[Dict[str, Any]]) -> Dict[st
         comp = (c.get("comparison") or "exact").lower()
         if field and val is not None and not c.get("is_ambiguous", False):
             if isinstance(val, (list, tuple)):
-                val_repr = [str(x) for x in val]
+                val_repr = [normalized(x) for x in val]
             else:
-                val_repr = str(val)
+                val_repr = normalized(val)
             sig[field] = {
                 "value": val_repr,
                 "unit": unit,
                 "comparison": comp,
             }
             if c.get("min_value") is not None:
-                sig[field]["min_value"] = str(c.get("min_value"))
+                sig[field]["min_value"] = normalized(c.get("min_value"))
             if c.get("max_value") is not None:
-                sig[field]["max_value"] = str(c.get("max_value"))
+                sig[field]["max_value"] = normalized(c.get("max_value"))
     return sig
 
 
@@ -254,6 +140,7 @@ def build_canonical_citation_metadata(chunk: Union[Dict[str, Any], Any]) -> Dict
         "doc_id": c_dict.get("doc_id", ""),
         "clause_id": c_dict.get("clause_id", ""),
         "title": c_dict.get("title", ""),
+        "version": c_dict.get("version", ""),
         "source_file": c_dict.get("source_file", ""),
         "source_page": int(c_dict.get("source_page", 1)),
     }
@@ -288,6 +175,10 @@ class CacheRecord:
     rule_outcomes: Dict[str, str]
     citation_metadata: List[Dict[str, Any]]
     created_at: str
+    validation_route: str = ""
+    grounding_version: str = ""
+    meaning_signature: Dict[str, Any] = field(default_factory=dict)
+    fact_fingerprint: str = ""
 
     def to_payload(self) -> Dict[str, Any]:
         """Convert record to a clean Qdrant payload dictionary."""
@@ -296,6 +187,13 @@ class CacheRecord:
     @classmethod
     def from_payload(cls, payload: Dict[str, Any]) -> CacheRecord:
         """Construct record from a Qdrant payload dictionary."""
+        string_fields = ("entry_id", "original_question", "normalized_question", "answer", "status",
+                         "model", "role", "query_date", "corpus_fingerprint", "embedding_model", "created_at")
+        if any(not isinstance(payload.get(name), str) or not payload[name].strip() for name in string_fields):
+            raise ValueError("Malformed cache record.")
+        if any(not isinstance(payload.get(name), list) for name in
+               ("cited_chunk_ids", "referenced_rule_ids", "citation_metadata")):
+            raise ValueError("Malformed cache record.")
         return cls(
             entry_id=str(payload.get("entry_id", "")),
             schema_version=str(payload.get("schema_version") or ""),
@@ -317,7 +215,17 @@ class CacheRecord:
             rule_outcomes=dict(payload.get("rule_outcomes") or {}),
             citation_metadata=list(payload.get("citation_metadata") or []),
             created_at=str(payload.get("created_at", "")),
+            validation_route=payload.get("validation_route", ""),
+            grounding_version=payload.get("grounding_version", ""),
+            meaning_signature=dict(payload.get("meaning_signature") or {}),
+            fact_fingerprint=payload.get("fact_fingerprint", ""),
         )
+
+
+class CacheInsertionError(RuntimeError):
+    def __init__(self, reason: str):
+        super().__init__("Cache insertion failed.")
+        self.reason = reason
 
 
 @dataclass
@@ -401,6 +309,11 @@ def validate_cache_candidate(
     if candidate.corpus_fingerprint != corpus_fingerprint:
         return False, "corpus_fingerprint_mismatch"
 
+    source_conditions = extract_conditions_from_query(candidate.original_question)
+    if any(c.get("is_ambiguous") or c.get("cannot_evaluate") or c.get("is_boundary_crossing")
+           for c in list(extracted_conditions) + source_conditions):
+        return False, "invalid_condition"
+
     # 8. Condition signature verification (numerical values and units)
     query_cond_sig = compute_condition_signature(extracted_conditions)
     candidate_cond_sig = candidate.condition_signature or {}
@@ -409,69 +322,21 @@ def validate_cache_candidate(
     if set(query_cond_sig.keys()) != set(candidate_cond_sig.keys()):
         return False, "numerical_condition_mismatch"
 
-    for field, q_val_info in query_cond_sig.items():
-        c_val_info = candidate_cond_sig.get(field)
-        if not c_val_info:
-            return False, "numerical_condition_mismatch"
-        if q_val_info.get("value") != c_val_info.get("value"):
-            return False, "numerical_condition_mismatch"
-        if q_val_info.get("unit") != c_val_info.get("unit"):
-            return False, "numerical_condition_mismatch"
-        q_comp = (q_val_info.get("comparison") or "exact").lower()
-        c_comp = (c_val_info.get("comparison") or "exact").lower()
-        if q_comp != c_comp:
+    for name, value in query_cond_sig.items():
+        cached = candidate_cond_sig.get(name) or {}
+        if value.get("comparison") != cached.get("comparison"):
             return False, "comparison_mismatch"
+        if value != cached:
+            return False, "numerical_condition_mismatch"
 
-    # 9. Semantic and linguistic indicator checks
-    query_indicators = compute_question_indicators(question)
-    cand_indicators = candidate.indicators or {}
-
-    if query_indicators["has_negation"] != cand_indicators.get("has_negation", False):
+    query_meaning = request_meaning(question)
+    source_meaning = request_meaning(candidate.original_question)
+    if query_meaning["negation"] != source_meaning["negation"]:
         return False, "negation_mismatch"
-
-    if query_indicators["has_comparison"] != cand_indicators.get("has_comparison", False):
-        return False, "comparison_mismatch"
-
-    if query_indicators["has_exception"] != cand_indicators.get("has_exception", False):
+    if query_meaning["exception"] != source_meaning["exception"]:
         return False, "exception_mismatch"
-
-    # 10. Conservative fact-level query signature check (must precede generic entity matching)
-    q_norm = normalize_question(question)
-    c_norm = candidate.normalized_question or normalize_question(candidate.original_question)
-    if q_norm != c_norm:
-        q_fact = compute_fact_target_signature(question)
-        c_fact = (cand_indicators.get("fact_signature") or compute_fact_target_signature(candidate.original_question))
-        q_facets = set(q_fact.get("facets", []))
-        c_facets = set(c_fact.get("facets", []))
-
-        # Reject if domain facts differ (e.g. meal vs hotel, submission deadline vs manager SLA)
-        if q_facets != c_facets:
-            return False, "fact_target_mismatch"
-
-        # Explicit personal vs business travel check
-        if ("personal_travel" in q_facets) != ("personal_travel" in c_facets):
-            return False, "fact_target_mismatch"
-        if ("business_travel" in q_facets) != ("business_travel" in c_facets):
-            return False, "fact_target_mismatch"
-
-        # Threshold vs eligibility distinction
-        if q_fact.get("is_threshold_query") != c_fact.get("is_threshold_query") and (
-            q_fact.get("is_eligibility_query") or c_fact.get("is_eligibility_query")
-        ):
-            return False, "fact_target_mismatch"
-
-    # Approval authorities check
-    q_auths = set(query_indicators.get("approval_authorities", []))
-    c_auths = set(cand_indicators.get("approval_authorities", []))
-    if q_auths != c_auths:
-        return False, "critical_entity_mismatch"
-
-    # Policy subject compatibility
-    q_subj = query_indicators.get("policy_subject")
-    c_subj = cand_indicators.get("policy_subject")
-    if q_subj and c_subj and q_subj != "general" and c_subj != "general" and q_subj != c_subj:
-        return False, "policy_subject_mismatch"
-
+    if query_meaning != source_meaning:
+        return False, "fact_target_mismatch"
     # 11. Structured rule validation
     # For every cached referenced rule ID:
     # - Require an associated cached outcome.
@@ -562,7 +427,36 @@ def validate_cache_candidate(
         if canon_chunk and meta_entry.get("title") != canon_chunk.get("title"):
             return False, "incomplete_citation_metadata"
 
-    # All mandatory conditions satisfied
+    if (compute_condition_signature(extract_conditions_from_query(question)) != query_cond_sig or
+            compute_condition_signature(source_conditions) != candidate_cond_sig):
+        return False, "numerical_condition_mismatch"
+
+    if (candidate.validation_route != "generated_verified" or
+            candidate.grounding_version != GROUNDING_VERSION or
+            candidate.meaning_signature != source_meaning or
+            candidate.fact_fingerprint != fact_fingerprint(list(canonical_chunks_by_id.values()))):
+        return False, "unverified_cache_record"
+    if not source_meaning["targets"] or source_meaning["kind"] != "lookup" or source_meaning["negation"]:
+        return False, "unsupported_request_meaning"
+    if candidate.normalized_question != normalize_question(candidate.original_question):
+        return False, "malformed_cache_record"
+    current_chunks = []
+    for cid in authorized_cids:
+        chunk = canonical_chunks_by_id.get(cid)
+        if chunk and is_chunk_eligible(chunk, role, query_date):
+            current_chunks.append(chunk)
+    for cid in candidate.cited_chunk_ids:
+        chunk = canonical_chunks_by_id[cid]
+        if not is_chunk_eligible(chunk, role, query_date):
+            return False, "missing_authorized_citation"
+        if meta_by_cid[cid] != build_canonical_citation_metadata(chunk):
+            return False, "incomplete_citation_metadata"
+    try:
+        validate_grounded_answer(candidate.original_question, candidate.answer, candidate.cited_chunk_ids, current_chunks)
+        claims = validate_grounded_answer(question, candidate.answer, candidate.cited_chunk_ids, current_chunks)
+    except ValueError:
+        return False, "claim_validation_failed"
+    candidate.answer = render_grounded_answer(claims)
     return True, None
 
 
@@ -682,7 +576,10 @@ def lookup_cache(
     """
     start_time = time.perf_counter()
 
-    # 1. Embed query vector
+    if not supported_embedding_configuration(embedder):
+        return CacheLookupResult(hit=False, rejection_reason="embedding_configuration_mismatch")
+
+    # Embed query vector
     try:
         vector = embedder.embed_query(question)
     except Exception as exc:
@@ -751,6 +648,9 @@ def lookup_cache(
 
     top_candidate = scored_points[0]
     top_score = float(top_candidate.score)
+    if not math.isfinite(top_score) or not math.isfinite(similarity_threshold) or not 0 <= similarity_threshold <= 1:
+        return CacheLookupResult(hit=False, rejection_reason="invalid_similarity",
+                                 latency_ms=round((time.perf_counter() - start_time) * 1000, 2))
 
     if top_score < similarity_threshold:
         latency = (time.perf_counter() - start_time) * 1000.0
@@ -778,6 +678,8 @@ def lookup_cache(
     first_rejection_reason: Optional[str] = None
     for point in scored_points:
         cand_score = float(point.score)
+        if not math.isfinite(cand_score):
+            continue
         if cand_score < similarity_threshold:
             break
 
@@ -847,6 +749,8 @@ def insert_cache_entry(
     extracted_conditions: Sequence[Dict[str, Any]],
     model: str = GENERATION_MODEL,
     collection_name: str = QDRANT_CACHE_COLLECTION_NAME,
+    validation_route: Optional[str] = None,
+    raise_on_error: bool = False,
 ) -> Optional[str]:
     """Insert a verified, generation-produced answer into the semantic cache.
 
@@ -857,24 +761,39 @@ def insert_cache_entry(
         entry_id (str) if successfully inserted, None otherwise.
     """
     # 1. Eligibility gate
-    if status != "answered":
+    if (status != "answered" or validation_route != "generated_verified" or model != GENERATION_MODEL
+            or not supported_embedding_configuration(embedder)):
         return None
     if not citations or not answer or not answer.strip():
         return None
-    if any(c.get("is_ambiguous") for c in (extracted_conditions or [])):
+    if any(c.get("is_ambiguous") or c.get("cannot_evaluate") or c.get("is_boundary_crossing") for c in (extracted_conditions or [])):
         return None
+
+    chunks = [c for c in canonical_chunks_by_id.values() if is_chunk_eligible(c, role, query_date)]
+    meaning, _, unsupported = request_support(question, chunks)
+    if unsupported or meaning["kind"] != "lookup" or meaning["negation"]:
+        return None
+    try:
+        claims = validate_grounded_answer(question, answer, citations, chunks)
+    except ValueError:
+        return None
+    answer = render_grounded_answer(claims)
 
     norm_q = normalize_question(question)
     if not norm_q:
         return None
 
-    # Deterministic point ID based on corpus, role, and normalized question
-    entry_id = str(uuid.uuid5(CACHE_POINT_NAMESPACE, f"{corpus_fingerprint}:{role}:{norm_q}"))
+    facts_identity = fact_fingerprint(list(canonical_chunks_by_id.values()))
+    identity = json.dumps([CACHE_SCHEMA_VERSION, GROUNDING_VERSION, facts_identity, corpus_fingerprint, role,
+                           query_date, model, EMBEDDING_MODEL, norm_q], separators=(",", ":"))
+    entry_id = str(uuid.uuid5(CACHE_POINT_NAMESPACE, identity))
 
     # 2. Compute embeddings and metadata
     try:
         vector = embedder.embed_query(question)
     except Exception:
+        if raise_on_error:
+            raise CacheInsertionError("embedding_error") from None
         return None
 
     # Compute cited chunk hashes and versions
@@ -899,17 +818,7 @@ def insert_cache_entry(
 
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-    # Ensure citation metadata is populated and consistent with canonical evidence
-    final_metadata = [dict(m) for m in (citation_metadata or []) if isinstance(m, dict) and m.get("chunk_id")]
-    if not final_metadata and citations and canonical_chunks_by_id:
-        for cid in citations:
-            chk = canonical_chunks_by_id.get(cid)
-            if chk:
-                final_metadata.append({
-                    "chunk_id": cid,
-                    "title": chk.get("title", ""),
-                    "clause_id": chk.get("clause_id", ""),
-                })
+    final_metadata = [build_canonical_citation_metadata(canonical_chunks_by_id[cid]) for cid in citations]
 
     record = CacheRecord(
         entry_id=entry_id,
@@ -932,7 +841,16 @@ def insert_cache_entry(
         rule_outcomes=rule_outcomes,
         citation_metadata=final_metadata,
         created_at=now_iso,
+        validation_route=validation_route,
+        grounding_version=GROUNDING_VERSION,
+        meaning_signature=meaning,
+        fact_fingerprint=facts_identity,
     )
+
+    valid, _ = validate_cache_candidate(record, question, role, query_date, corpus_fingerprint,
+                                        chunks, extracted_conditions, rule_results, canonical_chunks_by_id)
+    if not valid:
+        return None
 
     try:
         client.upsert(
@@ -947,5 +865,6 @@ def insert_cache_entry(
         )
         return entry_id
     except Exception:
-        # A cache write failure must not raise or expose secrets
+        if raise_on_error:
+            raise CacheInsertionError("cache_service_unavailable") from None
         return None

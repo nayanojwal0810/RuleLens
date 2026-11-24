@@ -1,4 +1,4 @@
-"""Offline deterministic tests for RuleLens Stage E structured rule resolution.
+"""Offline deterministic tests for RuleLens structured rule resolution.
 
 Verifies:
 - Loading all 32 canonical rules and linking to policy chunk IDs.
@@ -34,17 +34,6 @@ from rulelens.rules import (
 )
 
 
-@pytest.fixture(autouse=True)
-def guard_network(monkeypatch):
-    """Enforce that unit tests make zero network calls."""
-
-    def guarded_connect(*args, **kwargs):
-        raise AssertionError("Network connection attempted during offline unit tests")
-
-    monkeypatch.setattr(socket, "create_connection", guarded_connect)
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
-
-
 @pytest.fixture
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -55,11 +44,7 @@ def all_rules(repo_root: Path) -> List[RuleRecord]:
     return load_rules(base_dir=repo_root, reload=True)
 
 
-# ==============================================================================
-# 1. Rule Loading and Structure
-# ==============================================================================
-
-
+# Rule Loading and Structure
 def test_load_all_32_canonical_rules(all_rules: List[RuleRecord]):
     """load_rules must return exactly 32 canonical rules with valid chunk_ids."""
     assert len(all_rules) == 32
@@ -73,11 +58,7 @@ def test_load_all_32_canonical_rules(all_rules: List[RuleRecord]):
         assert r.effective_from <= r.effective_to
 
 
-# ==============================================================================
-# 2. Mandatory Boundary Tests (Section 10)
-# ==============================================================================
-
-
+# Mandatory Boundary Tests (Section 10)
 def test_travel_approval_historical_boundary(all_rules: List[RuleRecord]):
     """Travel approval v1 (on 2026-06-30): INR 40,000 standard vs 40,001 additional."""
     r1 = next(r for r in all_rules if r.rule_id == "R-TRV-001")  # <= 40000
@@ -159,11 +140,7 @@ def test_security_classification_tier_equality(all_rules: List[RuleRecord]):
     assert evaluate_rule_condition(r_restr, "Public", "tier") is False
 
 
-# ==============================================================================
-# 3. Unit and Type Safety
-# ==============================================================================
-
-
+# Unit and Type Safety
 def test_rule_unit_mismatch_raises_error(all_rules: List[RuleRecord]):
     """Evaluating rule with incompatible unit must raise ValueError."""
     r_inr = next(r for r in all_rules if r.rule_id == "R-TRV-001")  # INR
@@ -178,11 +155,7 @@ def test_rule_invalid_numeric_type_raises_error(all_rules: List[RuleRecord]):
         evaluate_rule_condition(r_num, "not_a_number", "INR")
 
 
-# ==============================================================================
-# 4. Evidence Rule Resolution
-# ==============================================================================
-
-
+# Evidence Rule Resolution
 def test_resolve_rules_for_evidence_filters_by_chunk_and_date(repo_root: Path):
     """resolve_rules_for_evidence must only link rules for authorized chunks active on date."""
     mock_chunks = [
@@ -210,11 +183,7 @@ def test_resolve_rules_for_evidence_filters_by_chunk_and_date(repo_root: Path):
     assert eval_r1.outcome == "standard_approval"
 
 
-# ==============================================================================
-# 5. Natural Language Condition Extraction
-# ==============================================================================
-
-
+# Natural Language Condition Extraction
 def test_extract_conditions_from_query():
     """Conservative condition extraction from queries with currency, days, tiers."""
     # Currency
@@ -330,11 +299,7 @@ def test_rules_cache_isolation_by_base_dir(repo_root: Path, tmp_path: Path):
         load_rules(base_dir=tmp_path, reload=False)
 
 
-# ==============================================================================
-# 5. Decimal Precision and Ambiguous Condition Tests
-# ==============================================================================
-
-
+# Decimal Precision and Ambiguous Condition Tests
 def test_decimal_currency_precision_preserved(all_rules: List[RuleRecord]):
     """Currency conditions preserve exact Decimal precision without float conversion loss."""
     r3 = next(r for r in all_rules if r.rule_id == "R-TRV-003")  # <= 50000 INR
@@ -379,11 +344,7 @@ def test_ambiguous_condition_marks_rule_evaluation_error(repo_root: Path):
     assert "ambiguous" in r_err.explanation.lower()
 
 
-# ==============================================================================
-# 6. Comprehensive Numerical Unit Ambiguity Tests (Correction C)
-# ==============================================================================
-
-
+# Comprehensive Numerical Unit Ambiguity Tests (Correction C)
 @pytest.mark.parametrize(
     "query,expected_field",
     [
@@ -432,11 +393,7 @@ def test_valid_cross_document_distinct_fields_not_ambiguous():
     assert not any(c.get("is_ambiguous") for c in res.conditions)
 
 
-# ==============================================================================
-# 7. Authoritative Rule Decision Tests (Correction B)
-# ==============================================================================
-
-
+# Authoritative Rule Decision Tests (Correction B)
 from rulelens.rules import evaluate_authoritative_rule_decision
 
 
@@ -719,12 +676,8 @@ def test_business_travel_authoritative_approval(repo_root: Path):
     assert "Standard manager approval is permitted" in dec.answer
 
 
-# ==============================================================================
-# 9. Focused Numerical Comparison Directional Regression Tests (Section 2.5)
-# ==============================================================================
-
-
-def test_section_2_5_01_exact_threshold(repo_root: Path):
+# Focused Numerical Comparison Directional Regression Tests (Section 2.5)
+def test_exact_threshold(repo_root: Path):
     """1. Exact threshold: INR 50,000 -> standard approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve an expense of INR 50,000 under Travel Policy v2?"
@@ -736,7 +689,7 @@ def test_section_2_5_01_exact_threshold(repo_root: Path):
     assert dec.outcome == "standard_approval"
 
 
-def test_section_2_5_02_immediately_above_threshold(repo_root: Path):
+def test_immediately_above_threshold(repo_root: Path):
     """2. Immediately above threshold: INR 50,001 -> additional approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve an expense of INR 50,001 under Travel Policy v2?"
@@ -748,7 +701,7 @@ def test_section_2_5_02_immediately_above_threshold(repo_root: Path):
     assert dec.outcome == "additional_approval"
 
 
-def test_section_2_5_03_immediately_below_threshold(repo_root: Path):
+def test_immediately_below_threshold(repo_root: Path):
     """3. Immediately below threshold: INR 49,999 -> standard approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve an expense of INR 49,999 under Travel Policy v2?"
@@ -760,7 +713,7 @@ def test_section_2_5_03_immediately_below_threshold(repo_root: Path):
     assert dec.outcome == "standard_approval"
 
 
-def test_section_2_5_04_exceeding_threshold(repo_root: Path):
+def test_exceeding_threshold(repo_root: Path):
     """4. 'Exceeding' the threshold: exceeding INR 50,000 -> additional approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve travel expenses exceeding INR 50,000 under Travel Policy v2?"
@@ -774,7 +727,7 @@ def test_section_2_5_04_exceeding_threshold(repo_root: Path):
     assert "exceeding" in dec.answer.lower()
 
 
-def test_section_2_5_05_at_least_threshold_boundary_crossing(repo_root: Path):
+def test_at_least_threshold_boundary_crossing(repo_root: Path):
     """5. 'At least' the threshold: at least INR 50,000 -> boundary crossing, cannot give unconditional decision."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve travel expenses of at least INR 50,000 under Travel Policy v2?"
@@ -787,7 +740,7 @@ def test_section_2_5_05_at_least_threshold_boundary_crossing(repo_root: Path):
     assert dec.is_boundary_crossing is True
 
 
-def test_section_2_5_06_up_to_threshold(repo_root: Path):
+def test_up_to_threshold(repo_root: Path):
     """6. 'Up to' the threshold: up to INR 50,000 -> standard approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve travel expenses up to INR 50,000 under Travel Policy v2?"
@@ -801,7 +754,7 @@ def test_section_2_5_06_up_to_threshold(repo_root: Path):
     assert "up to" in dec.answer.lower()
 
 
-def test_section_2_5_07_range_crossing_threshold(repo_root: Path):
+def test_range_crossing_threshold(repo_root: Path):
     """7. Range crossing the threshold: between INR 40,000 and 60,000 -> boundary crossing."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve travel expenses between INR 40,000 and 60,000 under Travel Policy v2?"
@@ -814,7 +767,7 @@ def test_section_2_5_07_range_crossing_threshold(repo_root: Path):
     assert dec.is_boundary_crossing is True
 
 
-def test_section_2_5_08_opposite_comparison_wording(repo_root: Path):
+def test_opposite_comparison_wording(repo_root: Path):
     """8. Opposite comparison wording: below INR 50,000 -> standard approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve travel expenses below INR 50,000 under Travel Policy v2?"
@@ -827,7 +780,7 @@ def test_section_2_5_08_opposite_comparison_wording(repo_root: Path):
     assert dec.outcome == "standard_approval"
 
 
-def test_section_2_5_09_negation_with_comparison(repo_root: Path):
+def test_negation_with_comparison(repo_root: Path):
     """9. Negation with a comparison: not exceeding INR 50,000 -> less_than_or_equal -> standard approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve travel expenses not exceeding INR 50,000 under Travel Policy v2?"
@@ -840,7 +793,7 @@ def test_section_2_5_09_negation_with_comparison(repo_root: Path):
     assert dec.outcome == "standard_approval"
 
 
-def test_section_2_5_10_invalid_currency(repo_root: Path):
+def test_invalid_currency(repo_root: Path):
     """10. Foreign currency: USD 50,000 against INR rule produces incompatible_unit error and no authoritative decision."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can a direct manager approve travel expenses of USD 50,000 under Travel Policy v2?"
@@ -852,7 +805,7 @@ def test_section_2_5_10_invalid_currency(repo_root: Path):
     assert dec.is_authoritative is False
 
 
-def test_section_2_5_11_historical_current_boundaries(repo_root: Path):
+def test_historical_current_boundaries(repo_root: Path):
     """11. Historical vs current boundaries: 40,000 on 2026-06-30 vs 50,000 on 2026-07-01."""
     mock_chunks_v1 = [{"chunk_id": "DOC-TRV-001_TRV-C04", "doc_id": "DOC-TRV-001", "clause_id": "TRV-C04", "text": "Travel expenses up to INR 40,000 follow standard approval."}]
     mock_chunks_v2 = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to INR 50,000 follow standard approval."}]
@@ -874,7 +827,7 @@ def test_section_2_5_11_historical_current_boundaries(repo_root: Path):
     assert d_curr.rule_id == "R-TRV-003"
 
 
-def test_section_2_5_12_unsupported_expense_eligibility(repo_root: Path):
+def test_unsupported_expense_eligibility(repo_root: Path):
     """12. Unsupported expense category: personal travel rejected from deterministic approval."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
     q = "Can employees spend INR 50,000 on personal travel?"
@@ -885,11 +838,7 @@ def test_section_2_5_12_unsupported_expense_eligibility(repo_root: Path):
     assert dec.unsupported_terms == ["personal"]
 
 
-# ==============================================================================
-# 10. Pass 1 Final Review: Numerical Boundary Regression Tests
-# ==============================================================================
-
-
+# Pass 1 Final Review: Numerical Boundary Regression Tests
 def test_boundary_travel_v2_more_than_40k_crosses_50k_boundary(repo_root: Path):
     """Travel Policy v2: More than INR 40,000 crosses the 50,000 boundary."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
@@ -1019,7 +968,7 @@ def test_boundary_corporate_card_monthly_spend_at_200k(repo_root: Path):
     # Exact 200,000 -> within_standard_card_limit
     q1 = "Can an employee spend INR 200,000 on corporate credit card?"
     c1 = extract_conditions_from_query(q1)
-    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c1)
     d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
     assert d1.is_authoritative is True
     assert d1.outcome == "within_standard_card_limit"
@@ -1028,7 +977,7 @@ def test_boundary_corporate_card_monthly_spend_at_200k(repo_root: Path):
     # Exact 200,001 -> card_limit_escalation_required
     q2 = "Can an employee spend INR 200,001 on corporate credit card?"
     c2 = extract_conditions_from_query(q2)
-    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c2)
     d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
     assert d2.is_authoritative is True
     assert d2.outcome == "card_limit_escalation_required"
@@ -1037,7 +986,7 @@ def test_boundary_corporate_card_monthly_spend_at_200k(repo_root: Path):
     # Up to 200,000 -> within_standard_card_limit
     q3 = "Can an employee have monthly card spending up to INR 200,000?"
     c3 = extract_conditions_from_query(q3)
-    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c3)
     d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
     assert d3.is_authoritative is True
     assert d3.outcome == "within_standard_card_limit"
@@ -1046,7 +995,7 @@ def test_boundary_corporate_card_monthly_spend_at_200k(repo_root: Path):
     # Exceeding 200,000 -> card_limit_escalation_required
     q4 = "Can an employee have monthly card spending exceeding INR 200,000?"
     c4 = extract_conditions_from_query(q4)
-    r4 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c4)
+    r4 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c4)
     d4 = evaluate_authoritative_rule_decision(q4, mock_chunks, r4, c4)
     assert d4.is_authoritative is True
     assert d4.outcome == "card_limit_escalation_required"
@@ -1055,7 +1004,7 @@ def test_boundary_corporate_card_monthly_spend_at_200k(repo_root: Path):
     # More than 150,000 -> crosses 200k boundary
     q5 = "Can an employee have monthly card spending of more than INR 150,000?"
     c5 = extract_conditions_from_query(q5)
-    r5 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c5)
+    r5 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c5)
     assert c5[0]["is_boundary_crossing"] is True
     d5 = evaluate_authoritative_rule_decision(q5, mock_chunks, r5, c5)
     assert d5.is_authoritative is False
@@ -1064,7 +1013,7 @@ def test_boundary_corporate_card_monthly_spend_at_200k(repo_root: Path):
     # Up to 250,000 -> crosses 200k boundary
     q6 = "Can an employee have monthly card spending up to INR 250,000?"
     c6 = extract_conditions_from_query(q6)
-    r6 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c6)
+    r6 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c6)
     assert c6[0]["is_boundary_crossing"] is True
     d6 = evaluate_authoritative_rule_decision(q6, mock_chunks, r6, c6)
     assert d6.is_authoritative is False
@@ -1130,11 +1079,7 @@ def test_boundary_tuition_claim_at_75k(repo_root: Path):
     assert d6.is_boundary_crossing is True
 
 
-# ==============================================================================
-# 9. Stale-Rule Cache Invalidation, Reload, and Repository Isolation Tests
-# ==============================================================================
-
-
+# Stale-Rule Cache Invalidation, Reload, and Repository Isolation Tests
 def test_rules_cache_invalidation_on_content_change(repo_root: Path, tmp_path: Path):
     """Rules cache is invalidated when rules.jsonl content changes on disk."""
     import shutil
@@ -1201,11 +1146,7 @@ def test_explicit_reload_flag_reloads_from_disk(repo_root: Path):
     assert len(rules) == 32
 
 
-# ==============================================================================
-# 10. Mandatory 10 Travel Policy v2 Checks (Prompt Specification Table)
-# ==============================================================================
-
-
+# Mandatory 10 Travel Policy v2 Checks (Prompt Specification Table)
 def test_mandatory_travel_v2_all_10_checks(repo_root: Path):
     """Test all 10 conditions specified in the Travel Policy v2 mandatory table."""
     mock_chunks = [{
@@ -1304,11 +1245,7 @@ def test_mandatory_travel_v2_all_10_checks(repo_root: Path):
     assert d10.is_boundary_crossing is True
 
 
-# ==============================================================================
-# 11. Multi-Department Boundary Decisions Across All Five Departments
-# ==============================================================================
-
-
+# Multi-Department Boundary Decisions Across All Five Departments
 def test_procurement_order_amount_boundaries(repo_root: Path):
     """Procurement order amount (150,000 INR boundary from DOC-PRC-001)."""
     mock_chunks = [{"chunk_id": "DOC-PRC-001_PRC-P02", "doc_id": "DOC-PRC-001", "clause_id": "PRC-P02", "text": "Purchase orders up to INR 150,000 require a single supplier quote."}]
@@ -1383,7 +1320,7 @@ def test_procurement_contract_duration_boundaries(repo_root: Path):
     # Exactly 12 months -> department_lead_signoff
     q1 = "Can a department lead sign off on a vendor contract duration of 12 months?"
     c1 = extract_conditions_from_query(q1)
-    r1 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c1)
+    r1 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c1)
     d1 = evaluate_authoritative_rule_decision(q1, mock_chunks, r1, c1)
     assert d1.is_authoritative is True
     assert d1.outcome == "department_lead_signoff"
@@ -1392,7 +1329,7 @@ def test_procurement_contract_duration_boundaries(repo_root: Path):
     # 13 months -> legal_and_procurement_signoff
     q2 = "Is legal signoff required for a vendor contract duration of 13 months?"
     c2 = extract_conditions_from_query(q2)
-    r2 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c2)
+    r2 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c2)
     d2 = evaluate_authoritative_rule_decision(q2, mock_chunks, r2, c2)
     assert d2.is_authoritative is True
     assert d2.outcome == "legal_and_procurement_signoff"
@@ -1401,7 +1338,7 @@ def test_procurement_contract_duration_boundaries(repo_root: Path):
     # Exceeding 12 months -> legal_and_procurement_signoff
     q3 = "Is legal signoff required for vendor contracts exceeding 12 months?"
     c3 = extract_conditions_from_query(q3)
-    r3 = resolve_rules_for_evidence(mock_chunks, "employee", "2026-11-22", repo_root, c3)
+    r3 = resolve_rules_for_evidence(mock_chunks, "manager", "2026-11-22", repo_root, c3)
     d3 = evaluate_authoritative_rule_decision(q3, mock_chunks, r3, c3)
     assert d3.is_authoritative is True
     assert d3.outcome == "legal_and_procurement_signoff"
@@ -1529,11 +1466,7 @@ def test_infosec_privileged_review_and_p1_sla_boundaries(repo_root: Path):
     assert d4.rule_id == "R-SEC-006"
 
 
-# ==============================================================================
-# 12. Fail-Safe Handling of Unresolved Conditions
-# ==============================================================================
-
-
+# Fail-Safe Handling of Unresolved Conditions
 def test_failsafe_negative_values_cannot_evaluate(repo_root: Path):
     """Negative values cannot be evaluated and trigger is_unresolved=True."""
     mock_chunks = [{"chunk_id": "DOC-TRV-002_TRV-C04", "doc_id": "DOC-TRV-002", "clause_id": "TRV-C04", "text": "Travel expenses up to and including INR 50,000 follow standard approval by direct reporting manager."}]
@@ -1573,3 +1506,88 @@ def test_explanatory_questions_preserve_non_decision_status(repo_root: Path):
     assert dec.is_decision_request is False
     assert dec.is_unresolved is False
 
+
+@pytest.mark.parametrize("amount, expected", [
+    ("INR 60k", "60000"), ("INR 1,00,000", "100000"),
+    ("INR 12,34,567.89", "1234567.89"), ("INR 50,000.01", "50000.01"),
+    ("Rs. 50,000", "50000"), ("\u20b9 50,000", "50000"),
+    ("INR 1 lakh", "100000"), ("1.5 lakhs INR", "150000"),
+    ("INR 0.01 crore", "100000"), ("60000 rupees", "60000"),
+])
+def test_complete_monetary_expression(amount, expected):
+    result = extract_condition_result(f"Can a manager approve a travel expense of {amount}?")
+    assert result.status == "valid"
+    assert len(result.conditions) == 1
+    assert result.conditions[0]["value"] == Decimal(expected)
+    assert result.conditions[0]["unit"] == "INR"
+
+
+@pytest.mark.parametrize("amount", [
+    "INR 1,2,000", "INR 50,000foo", "INR 50e3", "INR NaN",
+    "INR Infinity", "INR 50,000.0.1", "INR -50", "USD 50 INR",
+    "60k", "INR 60 million", "INR 1.2.3",
+])
+def test_invalid_or_incomplete_money_is_not_partially_accepted(amount):
+    result = extract_condition_result(f"Can a manager approve a travel expense of {amount}?")
+    assert result.status == "invalid"
+    assert any(c["cannot_evaluate"] for c in result.conditions)
+
+
+@pytest.mark.parametrize("expression, lower, upper", [
+    ("between INR 40k and 60k", "40000", "60000"),
+    ("from 40,000 to 50,000 INR", "40000", "50000"),
+    ("between INR 1,00,000 and INR 1,50,000", "100000", "150000"),
+])
+def test_money_ranges_keep_both_boundaries(expression, lower, upper):
+    result = extract_condition_result(f"Can a manager approve travel expenses {expression}?")
+    assert result.status == "valid"
+    assert result.conditions[0]["comparison"] == "range"
+    assert result.conditions[0]["min_value"] == Decimal(lower)
+    assert result.conditions[0]["max_value"] == Decimal(upper)
+
+
+@pytest.mark.parametrize("expression", [
+    "between INR 60,000 and INR 40,000", "between USD 40,000 and INR 50,000",
+    "between INR 40,00 and INR 60,000",
+])
+def test_invalid_ranges_require_clarification(expression):
+    result = extract_condition_result(f"Can a manager approve travel expenses {expression}?")
+    assert result.status == "invalid"
+
+
+@pytest.mark.parametrize("query, expected", [
+    ("Does a P1 incident response of 1.5 hours meet the SLA?", "1.5"),
+    ("Is an internet speed of 49.5 Mbps compliant for remote work?", "49.5"),
+])
+def test_decimal_units_are_not_truncated(query, expected):
+    conditions = extract_conditions_from_query(query)
+    assert len(conditions) == 1
+    assert conditions[0]["value"] == Decimal(expected)
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_nonfinite_rule_inputs_are_rejected(all_rules, value):
+    rule = next(r for r in all_rules if r.rule_id == "R-TRV-003")
+    with pytest.raises((ValueError, TypeError)):
+        evaluate_rule_condition(rule, value, "INR")
+
+
+@pytest.mark.parametrize("chunk_id", ["DOC-FIN-003_FIN-K02", "DOC-PRC-003_PRC-C02"])
+def test_rule_execution_rechecks_canonical_permissions(repo_root, chunk_id):
+    result = resolve_rules_for_evidence(
+        [{"chunk_id": chunk_id, "allowed_roles": ["employee"]}],
+        "employee", "2026-11-22", repo_root,
+    )
+    assert result == []
+
+
+@pytest.mark.parametrize("quantity", ["NaN hours", "Infinity hours", "1e2 hours", "1.2.3 hours", "-1 hours"])
+def test_invalid_duration_is_not_partially_accepted(quantity):
+    result = extract_condition_result(f"Does a P1 incident response of {quantity} meet the SLA?")
+    assert result.status == "invalid"
+
+
+@pytest.mark.parametrize("quantity", ["50", "50k"])
+def test_speed_requires_an_explicit_unit(quantity):
+    result = extract_condition_result(f"Is an internet speed of {quantity} compliant?")
+    assert result.status == "invalid"

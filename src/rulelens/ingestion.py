@@ -13,6 +13,7 @@ import json
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -62,10 +63,85 @@ RULE_REQUIRED_FIELDS: Tuple[str, ...] = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Fingerprint Calculations
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CorpusSnapshot:
+    base_dir: Path
+    file_hashes: Tuple[Tuple[str, str], ...]
+    chunks_json: str
+    rules_json: str
+    manifest_json: str
 
+    @property
+    def chunks(self) -> List[Dict[str, Any]]:
+        return json.loads(self.chunks_json)
+
+    @property
+    def rules(self) -> List[Dict[str, Any]]:
+        return json.loads(self.rules_json)
+
+    @property
+    def fingerprint(self) -> str:
+        return json.loads(self.manifest_json)["processed_fingerprint"]
+
+
+_CORPUS_SNAPSHOTS: Dict[Path, CorpusSnapshot] = {}
+
+
+def corpus_file_hashes(base_dir: Path) -> Tuple[Tuple[str, str], ...]:
+    files = [p for p in (base_dir / "data/source").rglob("*") if p.is_file()]
+    files += [base_dir / "data/processed" / name for name in
+              ("chunks.jsonl", "rules.jsonl", "corpus_manifest.json")]
+    return tuple((p.relative_to(base_dir).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
+                 for p in sorted(files))
+
+
+def assert_snapshot_current(snapshot: CorpusSnapshot) -> None:
+    if corpus_file_hashes(snapshot.base_dir) != snapshot.file_hashes:
+        raise ValueError("Corpus changed during the request.")
+
+
+def validate_policy_versions(chunks: Sequence[Dict[str, Any]]) -> None:
+    families: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for chunk in chunks:
+        family = re.sub(r"\bv\d+(?:\.\d+)*\b", "", chunk["title"].lower()).strip()
+        families.setdefault(family, {})[chunk["doc_id"]] = chunk
+    for documents in families.values():
+        records = list(documents.values())
+        for index, left in enumerate(records):
+            for right in records[index + 1:]:
+                if max(left["effective_from"], right["effective_from"]) <= min(
+                    left.get("effective_to") or "9999-12-31",
+                    right.get("effective_to") or "9999-12-31",
+                ):
+                    raise ValueError("Conflicting active policy versions.")
+
+
+def get_corpus_snapshot(base_dir: Optional[Path | str] = None) -> CorpusSnapshot:
+    base = (Path(base_dir) if base_dir is not None else Path.cwd()).resolve()
+    before = corpus_file_hashes(base)
+    cached = _CORPUS_SNAPSHOTS.get(base)
+    if cached is not None and cached.file_hashes == before:
+        return cached
+    validate_corpus(base)
+    processed = base / "data/processed"
+    chunks_text = (processed / "chunks.jsonl").read_text(encoding="utf-8")
+    rules_text = (processed / "rules.jsonl").read_text(encoding="utf-8")
+    manifest_text = (processed / "corpus_manifest.json").read_text(encoding="utf-8")
+    chunks = [json.loads(line) for line in chunks_text.splitlines() if line.strip()]
+    rules = [json.loads(line) for line in rules_text.splitlines() if line.strip()]
+    manifest = json.loads(manifest_text)
+    validate_policy_versions(chunks)
+    if calculate_processed_fingerprint(chunks, rules) != manifest["processed_fingerprint"]:
+        raise ValueError("Snapshot fingerprint mismatch.")
+    snapshot = CorpusSnapshot(base, before, json.dumps(chunks), json.dumps(rules), manifest_text)
+    assert_snapshot_current(snapshot)
+    if len(_CORPUS_SNAPSHOTS) >= 4:
+        _CORPUS_SNAPSHOTS.pop(next(iter(_CORPUS_SNAPSHOTS)))
+    _CORPUS_SNAPSHOTS[base] = snapshot
+    return snapshot
+
+
+# Fingerprint Calculations
 def calculate_source_fingerprint(source_dir: Path) -> str:
     """Compute SHA-256 fingerprint over all approved source files in sorted order."""
     hasher = hashlib.sha256()
@@ -100,10 +176,7 @@ def calculate_processed_fingerprint(
     return hasher.hexdigest()
 
 
-# ---------------------------------------------------------------------------
 # PDF Extraction and Chunking
-# ---------------------------------------------------------------------------
-
 def extract_pdf_chunks(
     policies_dir: Path, manifest_docs: Sequence[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -188,10 +261,7 @@ def extract_pdf_chunks(
     return chunks
 
 
-# ---------------------------------------------------------------------------
 # CSV Rule Processing
-# ---------------------------------------------------------------------------
-
 def parse_threshold_value(val_str: str) -> int | float | str:
     """Parse threshold string into typed integer, float, or string."""
     try:
@@ -258,10 +328,7 @@ def parse_csv_rules(
     return rules
 
 
-# ---------------------------------------------------------------------------
 # Corpus Building and Validation Pipeline
-# ---------------------------------------------------------------------------
-
 def build_corpus(base_dir: Optional[Path | str] = None) -> Dict[str, Any]:
     """Execute the full ingestion build pipeline atomically."""
     base = Path(base_dir) if base_dir else Path.cwd()
@@ -568,10 +635,7 @@ def validate_corpus(base_dir: Optional[Path | str] = None) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
 # CLI Command Entrypoint
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     """CLI interface for corpus building and validation."""
     import sys

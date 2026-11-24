@@ -1,30 +1,17 @@
-"""Retrieval evaluation harness for RuleLens.
-
-Provides standard IR metrics calculation: Hit@K, Recall@K, MRR@K,
-latency profiling (median, p95), permission violation checks,
-and failure inspection across BM25, BGE dense, and Hybrid retrieval methods.
-"""
+"""Retrieval metrics and evidence coverage for explicit question workloads."""
 
 from __future__ import annotations
 
-import argparse
-import datetime
+import math
 import json
-import os
 from pathlib import Path
 import statistics
-import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set
 
-from rulelens.dataset import DEPARTMENTS, ROLES
-from rulelens.retrieval import (
-    DEFAULT_CANDIDATE_DEPTH,
-    BGEEmbedder,
-    HybridRetriever,
-    RetrievalResult,
-    load_validated_corpus,
-)
+from rulelens.dataset import DEPARTMENTS
+from rulelens.retrieval import HybridRetriever, ALLOWED_ROLES_SET, is_chunk_eligible, parse_query_date
+from rulelens.ingestion import get_corpus_snapshot
 
 
 def compute_hit_at_k(retrieved_chunk_ids: Sequence[str], gold_chunk_ids: Set[str], k: int = 5) -> float:
@@ -34,7 +21,6 @@ def compute_hit_at_k(retrieved_chunk_ids: Sequence[str], gold_chunk_ids: Set[str
     top_k = retrieved_chunk_ids[:k]
     return 1.0 if any(cid in gold_chunk_ids for cid in top_k) else 0.0
 
-
 def compute_recall_at_k(retrieved_chunk_ids: Sequence[str], gold_chunk_ids: Set[str], k: int = 5) -> float:
     """Return fraction of gold chunk IDs retrieved in top K (multi-gold Recall@K)."""
     if not gold_chunk_ids:
@@ -43,14 +29,12 @@ def compute_recall_at_k(retrieved_chunk_ids: Sequence[str], gold_chunk_ids: Set[
     found = len(top_k.intersection(gold_chunk_ids))
     return float(found) / float(len(gold_chunk_ids))
 
-
 def compute_full_evidence_at_k(retrieved_chunk_ids: Sequence[str], gold_chunk_ids: Set[str], k: int = 5) -> float:
     """Return 1.0 if ALL gold chunk IDs are present in top K retrieved chunks, else 0.0."""
     if not gold_chunk_ids:
         return 0.0
     top_k = set(retrieved_chunk_ids[:k])
     return 1.0 if gold_chunk_ids.issubset(top_k) else 0.0
-
 
 def compute_mrr_at_k(retrieved_chunk_ids: Sequence[str], gold_chunk_ids: Set[str], k: int = 5) -> float:
     """Return reciprocal rank of first gold chunk in top K (1-based), or 0.0 if not found."""
@@ -60,391 +44,6 @@ def compute_mrr_at_k(retrieved_chunk_ids: Sequence[str], gold_chunk_ids: Set[str
         if cid in gold_chunk_ids:
             return 1.0 / float(rank_idx)
     return 0.0
-
-
-REQUIRED_QUESTION_FIELDS: Set[str] = {
-    "question_id",
-    "department",
-    "question",
-    "role",
-    "query_date",
-    "difficulty",
-    "question_type",
-    "answerability",
-    "gold_chunk_ids",
-    "restricted_target_chunk_ids",
-    "difficulty_reason",
-    "evidence_reason",
-    "gold_evidence",
-}
-
-VALID_QUESTION_TYPES: Set[str] = {
-    "direct",
-    "paraphrased",
-    "numeric_boundary",
-    "cross_clause",
-    "cross_document",
-    "version_historical",
-    "version_current",
-    "restricted_permission",
-    "unsupported_policy",
-}
-
-
-def validate_evaluation_dataset(
-    dataset: Union[str, Path, Dict[str, Any]],
-    base_dir: Optional[Union[Path, str]] = None,
-) -> Dict[str, Any]:
-    """Validate 50-question development evaluation dataset schema, integrity, and references.
-
-    Verifies:
-    - Top-level schema version is '1.0'.
-    - Corpus fingerprint matches processed corpus manifest.
-    - Exactly 50 questions with unique IDs, valid roles, valid dates, and non-empty text.
-    - All 12 required fields present on every question with non-empty reason strings.
-    - Department balance: exactly 10 questions per department across all 5 departments.
-    - Difficulty balance: exactly 5 Easy (1/dept), 15 Medium (3/dept), 30 Hard (6/dept).
-    - Category balance: 40 Answerable, 5 Restricted Diagnostics (1/dept, Hard), 5 Unsupported Diagnostics (1/dept, Hard).
-    - Multi-clause coverage: at least 12 answerable questions require multiple gold clauses.
-    - Cross-document coverage: at least 5 answerable questions span multiple policy documents.
-    - Historical query coverage: at least 10 answerable questions have query dates prior to 2026-07-01.
-    - Role distribution: all 6 roles present, every role has >= 2 answerable questions, employee <= 30, and >= 2 non-employee restricted diagnostics.
-    - Comprehensive policy coverage: all 20 canonical documents are referenced across answerable questions.
-    - Grounded chunk references, role permissions, and date validity windows against corpus.
-    """
-    root_dir = Path(base_dir) if base_dir else Path.cwd()
-
-    if isinstance(dataset, (str, Path)):
-        p = Path(dataset)
-        if not p.is_file():
-            raise ValueError(f"Dataset file does not exist: {p}")
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            raise ValueError(f"Failed to parse dataset JSON from {p}: {e}")
-    elif isinstance(dataset, dict):
-        data = dataset
-    else:
-        raise TypeError(f"dataset must be str, Path, or dict, got {type(dataset).__name__}")
-
-    # 1. Schema version
-    version = data.get("schema_version") or data.get("version")
-    if version != "1.0":
-        raise ValueError(f"Invalid schema_version '{version}'. Expected '1.0'.")
-
-    # 2. Corpus fingerprint and manifest validation
-    corpus_fp = data.get("corpus_fingerprint")
-    if not corpus_fp or not isinstance(corpus_fp, str) or not corpus_fp.strip():
-        raise ValueError("Missing or empty corpus_fingerprint in dataset.")
-
-    manifest_path = root_dir / "data" / "processed" / "corpus_manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError(f"Corpus manifest file does not exist: {manifest_path}")
-
-    try:
-        manifest_text = manifest_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        raise ValueError(f"Failed to read corpus manifest file at {manifest_path}") from exc
-
-    try:
-        manifest = json.loads(manifest_text)
-    except Exception as exc:
-        raise ValueError(f"Corpus manifest is not valid JSON: {exc}") from exc
-
-    if not isinstance(manifest, dict):
-        raise ValueError("Corpus manifest must be a JSON object.")
-
-    expected_fp = manifest.get("processed_fingerprint")
-    if not expected_fp or not isinstance(expected_fp, str) or not expected_fp.strip():
-        raise ValueError("Corpus manifest is missing required 'processed_fingerprint' field.")
-
-    for req_field in ("chunk_count", "document_count"):
-        if req_field not in manifest:
-            raise ValueError(f"Corpus manifest is missing required '{req_field}' field.")
-
-    if corpus_fp != expected_fp:
-        raise ValueError(
-            f"Dataset corpus_fingerprint '{corpus_fp}' does not match processed corpus fingerprint '{expected_fp}'."
-        )
-
-    # 3. Questions array
-    questions = data.get("questions")
-    if not isinstance(questions, list):
-        raise ValueError("Dataset 'questions' field must be a list.")
-    if len(questions) != 50:
-        raise ValueError(f"Dataset must contain exactly 50 questions, found {len(questions)}.")
-
-    # Load corpus to validate chunk IDs, permissions, and effective dates
-    corpus_chunks = load_validated_corpus(root_dir)
-    chunks_by_id = {c["chunk_id"]: c for c in corpus_chunks}
-    expected_doc_ids = {c["doc_id"] for c in corpus_chunks}
-
-    valid_roles_set = set(ROLES)
-    valid_departments_set = set(DEPARTMENTS)
-    valid_difficulties_set = {"easy", "medium", "hard"}
-
-    seen_ids: Set[str] = set()
-    dept_counts: Dict[str, int] = {d: 0 for d in DEPARTMENTS}
-    diff_counts: Dict[str, int] = {"easy": 0, "medium": 0, "hard": 0}
-    dept_diff_counts: Dict[Tuple[str, str], int] = {}
-
-    role_total_counts: Dict[str, int] = {r: 0 for r in ROLES}
-    role_answerable_counts: Dict[str, int] = {r: 0 for r in ROLES}
-
-    answerable_count = 0
-    restricted_count = 0
-    non_employee_restricted_count = 0
-    unsupported_count = 0
-    multi_clause_count = 0
-    cross_document_count = 0
-    historical_answerable_count = 0
-    covered_docs_in_answerable: Set[str] = set()
-
-    for idx, q in enumerate(questions, start=1):
-        if not isinstance(q, dict):
-            raise ValueError(f"Question #{idx} is not a dict.")
-
-        # Check all required fields are present
-        missing_fields = REQUIRED_QUESTION_FIELDS - set(q.keys())
-        if missing_fields:
-            raise ValueError(f"Question #{idx} missing required fields: {sorted(missing_fields)}.")
-
-        qid = q.get("question_id")
-        if not qid or not isinstance(qid, str) or not qid.strip():
-            raise ValueError(f"Question #{idx} missing valid question_id.")
-        if qid in seen_ids:
-            raise ValueError(f"Duplicate question_id: '{qid}'.")
-        seen_ids.add(qid)
-
-        query_text = q.get("question")
-        if not query_text or not isinstance(query_text, str) or not query_text.strip():
-            raise ValueError(f"Question '{qid}' has empty question text.")
-
-        dept = q.get("department")
-        if dept not in valid_departments_set:
-            raise ValueError(f"Question '{qid}' has invalid department '{dept}'. Allowed: {sorted(valid_departments_set)}")
-        dept_counts[dept] += 1
-
-        diff = q.get("difficulty")
-        if diff not in valid_difficulties_set:
-            raise ValueError(f"Question '{qid}' has invalid difficulty '{diff}'. Allowed: {sorted(valid_difficulties_set)}")
-        diff_counts[diff] += 1
-
-        dept_diff_counts[(dept, diff)] = dept_diff_counts.get((dept, diff), 0) + 1
-
-        role = q.get("role")
-        if role not in valid_roles_set:
-            raise ValueError(f"Question '{qid}' has invalid role '{role}'. Allowed: {sorted(valid_roles_set)}")
-        role_total_counts[role] += 1
-
-        q_type = q.get("question_type")
-        if q_type not in VALID_QUESTION_TYPES:
-            raise ValueError(
-                f"Question '{qid}' has invalid question_type '{q_type}'. Allowed: {sorted(VALID_QUESTION_TYPES)}"
-            )
-
-        query_date_str = q.get("query_date")
-        if not query_date_str or not isinstance(query_date_str, str):
-            raise ValueError(f"Question '{qid}' missing valid query_date string.")
-        try:
-            q_date_obj = datetime.date.fromisoformat(query_date_str)
-        except ValueError:
-            raise ValueError(f"Question '{qid}' has malformed query_date '{query_date_str}'. Must be ISO YYYY-MM-DD.")
-
-        diff_reason = q.get("difficulty_reason")
-        if not diff_reason or not isinstance(diff_reason, str) or not diff_reason.strip():
-            raise ValueError(f"Question '{qid}' must have non-empty 'difficulty_reason' string.")
-
-        ev_reason = q.get("evidence_reason")
-        if not ev_reason or not isinstance(ev_reason, str) or not ev_reason.strip():
-            raise ValueError(f"Question '{qid}' must have non-empty 'evidence_reason' string.")
-
-        is_answerable = q.get("answerability")
-        if not isinstance(is_answerable, bool):
-            raise ValueError(f"Question '{qid}' 'answerability' must be a boolean.")
-
-        gold_cids = q.get("gold_chunk_ids", [])
-        if not isinstance(gold_cids, list):
-            raise ValueError(f"Question '{qid}' 'gold_chunk_ids' must be a list.")
-
-        restr_cids = q.get("restricted_target_chunk_ids", [])
-        if not isinstance(restr_cids, list):
-            raise ValueError(f"Question '{qid}' 'restricted_target_chunk_ids' must be a list.")
-
-        gold_ev = q.get("gold_evidence")
-        if not isinstance(gold_ev, list):
-            raise ValueError(f"Question '{qid}' 'gold_evidence' must be a list.")
-
-        if is_answerable:
-            answerable_count += 1
-            role_answerable_counts[role] += 1
-
-            if not gold_cids:
-                raise ValueError(f"Answerable question '{qid}' must have non-empty gold_chunk_ids.")
-            if len(gold_cids) != len(set(gold_cids)):
-                raise ValueError(f"Question '{qid}' has duplicate gold_chunk_ids.")
-            if restr_cids:
-                raise ValueError(f"Answerable question '{qid}' must have empty restricted_target_chunk_ids.")
-            if not gold_ev:
-                raise ValueError(f"Answerable question '{qid}' must have non-empty gold_evidence.")
-            if len(gold_cids) >= 2:
-                multi_clause_count += 1
-
-            gold_docs = set()
-            for cid in gold_cids:
-                if cid not in chunks_by_id:
-                    raise ValueError(f"Question '{qid}' references non-existent gold chunk '{cid}'.")
-                chunk = chunks_by_id[cid]
-                gold_docs.add(chunk["doc_id"])
-                covered_docs_in_answerable.add(chunk["doc_id"])
-                if role not in chunk["allowed_roles"]:
-                    raise ValueError(
-                        f"Question '{qid}' role '{role}' is not in allowed_roles {chunk['allowed_roles']} for gold chunk '{cid}'."
-                    )
-                eff_from = chunk["effective_from"]
-                eff_to = chunk.get("effective_to") or "2099-12-31"
-                if not (eff_from <= query_date_str <= eff_to):
-                    raise ValueError(
-                        f"Question '{qid}' query_date '{query_date_str}' falls outside gold chunk '{cid}' validity [{eff_from}, {eff_to}]."
-                    )
-
-            # Validate each quote in gold_evidence
-            seen_ev = set()
-            quoted_cids = set()
-            for ev_idx, ev in enumerate(gold_ev, start=1):
-                if not isinstance(ev, dict):
-                    raise ValueError(f"Question '{qid}' gold_evidence entry #{ev_idx} is not a dict.")
-                ev_cid = ev.get("chunk_id")
-                quote = ev.get("quote")
-                if not ev_cid or not isinstance(ev_cid, str) or not ev_cid.strip():
-                    raise ValueError(f"Question '{qid}' gold_evidence entry #{ev_idx} missing valid 'chunk_id'.")
-                if not quote or not isinstance(quote, str) or not quote.strip():
-                    raise ValueError(f"Question '{qid}' gold_evidence entry #{ev_idx} missing valid non-empty 'quote'.")
-                if ev_cid not in gold_cids:
-                    raise ValueError(
-                        f"Question '{qid}' gold_evidence references chunk '{ev_cid}' not in gold_chunk_ids {sorted(gold_cids)}."
-                    )
-                if ev_cid not in chunks_by_id:
-                    raise ValueError(f"Question '{qid}' gold_evidence references non-existent chunk '{ev_cid}'.")
-
-                chunk_text = chunks_by_id[ev_cid]["text"]
-                if quote not in chunk_text:
-                    raise ValueError(
-                        f"Question '{qid}' evidence quote for chunk '{ev_cid}' is not an exact substring of canonical chunk text: {quote!r}"
-                    )
-
-                pair = (ev_cid, quote)
-                if pair in seen_ev:
-                    raise ValueError(f"Question '{qid}' contains duplicate gold_evidence entry for chunk '{ev_cid}'.")
-                seen_ev.add(pair)
-                quoted_cids.add(ev_cid)
-
-            missing_quoted = set(gold_cids) - quoted_cids
-            if missing_quoted:
-                raise ValueError(
-                    f"Question '{qid}' gold_chunk_ids {sorted(missing_quoted)} have no supporting quotes in gold_evidence."
-                )
-
-            if len(gold_docs) >= 2:
-                cross_document_count += 1
-
-            if query_date_str < "2026-07-01":
-                historical_answerable_count += 1
-        else:
-            if diff != "hard":
-                raise ValueError(f"Diagnostic question '{qid}' must be 'hard' difficulty, got '{diff}'.")
-            if gold_cids:
-                raise ValueError(f"Diagnostic question '{qid}' must have empty gold_chunk_ids.")
-            if gold_ev:
-                raise ValueError(f"Diagnostic question '{qid}' must have empty gold_evidence list.")
-
-            if restr_cids:
-                restricted_count += 1
-                if role != "employee":
-                    non_employee_restricted_count += 1
-                for cid in restr_cids:
-                    if cid not in chunks_by_id:
-                        raise ValueError(f"Restricted diagnostic question '{qid}' references non-existent target chunk '{cid}'.")
-                    chunk = chunks_by_id[cid]
-                    if role in chunk["allowed_roles"]:
-                        raise ValueError(
-                            f"Restricted diagnostic question '{qid}' role '{role}' IS allowed for target chunk '{cid}'. Must be forbidden."
-                        )
-            else:
-                unsupported_count += 1
-
-    # 4. Check exact distributions
-    for d, count in dept_counts.items():
-        if count != 10:
-            raise ValueError(f"Department '{d}' has {count} questions; expected exactly 10.")
-
-    if diff_counts["easy"] != 5:
-        raise ValueError(f"Expected 5 easy questions, got {diff_counts['easy']}.")
-    if diff_counts["medium"] != 15:
-        raise ValueError(f"Expected 15 medium questions, got {diff_counts['medium']}.")
-    if diff_counts["hard"] != 30:
-        raise ValueError(f"Expected 30 hard questions, got {diff_counts['hard']}.")
-
-    for d in DEPARTMENTS:
-        easy_c = dept_diff_counts.get((d, "easy"), 0)
-        med_c = dept_diff_counts.get((d, "medium"), 0)
-        hard_c = dept_diff_counts.get((d, "hard"), 0)
-        if easy_c != 1 or med_c != 3 or hard_c != 6:
-            raise ValueError(
-                f"Department '{d}' has distribution (easy={easy_c}, medium={med_c}, hard={hard_c}). Expected (1, 3, 6)."
-            )
-
-    if answerable_count != 40:
-        raise ValueError(f"Expected exactly 40 answerable questions, found {answerable_count}.")
-    if restricted_count != 5:
-        raise ValueError(f"Expected exactly 5 restricted diagnostic questions, found {restricted_count}.")
-    if unsupported_count != 5:
-        raise ValueError(f"Expected exactly 5 unsupported diagnostic questions, found {unsupported_count}.")
-    if multi_clause_count < 12:
-        raise ValueError(f"Expected at least 12 multi-clause questions, found {multi_clause_count}.")
-    if cross_document_count < 5:
-        raise ValueError(f"Expected at least 5 cross-document questions, found {cross_document_count}.")
-    if historical_answerable_count < 10:
-        raise ValueError(f"Expected at least 10 historical answerable questions (prior to 2026-07-01), found {historical_answerable_count}.")
-
-    # Role distribution checks
-    if role_total_counts.get("employee", 0) > 30:
-        raise ValueError(f"Employee role questions exceed maximum 30: {role_total_counts['employee']}.")
-    for r in ROLES:
-        ans_r = role_answerable_counts.get(r, 0)
-        if ans_r < 2:
-            raise ValueError(f"Role '{r}' has only {ans_r} answerable questions; expected at least 2.")
-    if non_employee_restricted_count < 2:
-        raise ValueError(
-            f"Expected at least 2 non-employee restricted diagnostic questions, found {non_employee_restricted_count}."
-        )
-
-    # 20-document coverage check
-    missing_docs = expected_doc_ids - covered_docs_in_answerable
-    if missing_docs:
-        raise ValueError(
-            f"Answerable evaluation questions must cover all {len(expected_doc_ids)} documents. Missing coverage for: {sorted(missing_docs)}."
-        )
-
-    return {
-        "status": "valid",
-        "total_questions": len(questions),
-        "answerable_count": answerable_count,
-        "restricted_count": restricted_count,
-        "non_employee_restricted_count": non_employee_restricted_count,
-        "unsupported_count": unsupported_count,
-        "multi_clause_count": multi_clause_count,
-        "cross_document_count": cross_document_count,
-        "historical_answerable_count": historical_answerable_count,
-        "covered_documents_count": len(covered_docs_in_answerable),
-        "department_counts": dept_counts,
-        "difficulty_counts": diff_counts,
-        "role_total_counts": role_total_counts,
-        "role_answerable_counts": role_answerable_counts,
-        "corpus_fingerprint": corpus_fp,
-    }
-
 
 def evaluate_retriever_method(
     retriever: HybridRetriever,
@@ -669,7 +268,7 @@ def evaluate_retriever_method(
         )
 
     median_lat = float(statistics.median(latencies_ms)) if latencies_ms else 0.0
-    p95_lat = float(statistics.quantiles(latencies_ms, n=20)[18]) if len(latencies_ms) >= 20 else (max(latencies_ms) if latencies_ms else 0.0)
+    p95_lat = sorted(latencies_ms)[math.ceil(0.95 * len(latencies_ms)) - 1] if latencies_ms else 0.0
 
     avg_hit = float(sum(hits) / len(hits)) if hits else 0.0
     avg_recall = float(sum(recalls) / len(recalls)) if recalls else 0.0
@@ -796,403 +395,99 @@ def evaluate_retriever_method(
     return res_dict
 
 
-def generate_summary_markdown(
-    eval_results: Dict[str, Dict[str, Any]],
-    questions: Sequence[Dict[str, Any]],
-    metadata: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Dynamically generate Markdown report from actual evaluation run results."""
-    meta = metadata or {}
-    ts = meta.get("timestamp", datetime.datetime.now(datetime.timezone.utc).isoformat())
-    backend = meta.get("dense_backend", "local")
-    cutoff_k = meta.get("top_k") or next(
-        (res.get("cutoff") for res in eval_results.values() if isinstance(res, dict) and "cutoff" in res),
-        5,
-    )
-
-    ans_q = [q for q in questions if q.get("answerability", True)]
-    diag_restr = [q for q in questions if not q.get("answerability", True) and q.get("restricted_target_chunk_ids")]
-    diag_unsupp = [q for q in questions if not q.get("answerability", True) and not q.get("restricted_target_chunk_ids")]
-
-    multi_clause_ans = [q for q in ans_q if len(q.get("gold_chunk_ids", [])) >= 2]
-    cross_doc_ans = [
-        q for q in ans_q
-        if len({cid.split("_")[0] for cid in q.get("gold_chunk_ids", [])}) >= 2
-    ]
-    hist_ans = [q for q in ans_q if q.get("query_date", "") < "2026-07-01"]
-
-    md: List[str] = [
-        "# RuleLens — Stage D2 Development Retrieval Evaluation Summary\n",
-        "## 1. Evaluation Setup\n",
-        f"- **Timestamp**: `{ts}`",
-        f"- **Dataset**: `data/evaluation/dev_questions.json` ({len(questions)} grounded policy questions)",
-        f"- **Answerable Questions**: {len(ans_q)} (5 Easy, 15 Medium, 20 Hard)",
-        f"- **Complexity Subsets**: {len(multi_clause_ans)} multi-clause questions, {len(cross_doc_ans)} cross-document questions, {len(hist_ans)} historical questions (< 2026-07-01)",
-        f"- **Diagnostic Questions**: {len(diag_restr)} Role-Restricted queries + {len(diag_unsupp)} Unsupported queries (all Hard)",
-        "- **Department Balance**: Exactly 10 questions per department across all 5 departments",
-        f"- **Dense Backend**: `{backend}` (BGE-small-en-v1.5, 384-dimensional cosine)",
-        "- **Retrieval Modes Evaluated**: BM25 Lexical, BGE Dense, Hybrid (BM25 + BGE via RRF with k=60)",
-        f"- **Candidate Depth & Cutoff**: Candidate depth 20, evaluation cutoff top-{cutoff_k}\n",
-        "## 2. Quantitative Performance Comparison\n",
-        f"| Retrieval Method | Recall@{cutoff_k} | Hit@{cutoff_k} | MRR@{cutoff_k} | FullEvidence@{cutoff_k} | Median Latency (ms) | P95 Latency (ms) | Role Violations | Version Violations |",
-        "|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
-    ]
-
-    for mode in ("bm25", "dense", "hybrid"):
-        res = eval_results.get(mode, {})
-        rec = f"{res.get(f'recall_at_{cutoff_k}', res.get('recall_at_k', res.get('recall_at_5', 0.0))):.4f}"
-        hit = f"{res.get(f'hit_at_{cutoff_k}', res.get('hit_at_k', res.get('hit_at_5', 0.0))):.4f}"
-        mrr = f"{res.get(f'mrr_at_{cutoff_k}', res.get('mrr_at_k', res.get('mrr_at_5', 0.0))):.4f}"
-        fe = f"{res.get(f'full_evidence_at_{cutoff_k}', res.get('full_evidence_at_k', res.get('full_evidence_at_5', 0.0))):.4f}"
-        med = f"{res.get('median_latency_ms', 0.0):.2f}"
-        p95 = f"{res.get('p95_latency_ms', 0.0):.2f}"
-        pv = res.get("permission_violations", 0)
-        vv = res.get("version_violations", 0)
-        mode_label = "BM25 (Lexical)" if mode == "bm25" else ("BGE Dense" if mode == "dense" else "**Hybrid (BM25 + Dense + RRF)**")
-        md.append(f"| {mode_label} | {rec} | {hit} | {mrr} | {fe} | {med} ms | {p95} ms | {pv} | {vv} |")
-
-    # Dynamic violation verification
-    total_pv = sum(eval_results.get(m, {}).get("permission_violations", 0) for m in ("bm25", "dense", "hybrid"))
-    total_vv = sum(eval_results.get(m, {}).get("version_violations", 0) for m in ("bm25", "dense", "hybrid"))
-
-    md.extend([
-        f"\n> **Security & Version Verification**: Across all evaluated modes, exactly {total_pv} role violations and {total_vv} version violations occurred, confirming strict deterministic pre-filtering.",
-        "\n## 3. Breakdown by Question Difficulty\n",
-        f"| Difficulty | Mode | Hit@{cutoff_k} | Recall@{cutoff_k} | MRR@{cutoff_k} | FullEvidence@{cutoff_k} | Question Count |",
-        "|---|---|:---:|:---:|:---:|:---:|:---:|",
-    ])
-
-    for diff in ("easy", "medium", "hard"):
-        for mode in ("bm25", "dense", "hybrid"):
-            res = eval_results.get(mode, {})
-            diff_data = res.get("by_difficulty", {}).get(diff, {})
-            h = f"{diff_data.get(f'hit_at_{cutoff_k}', diff_data.get('hit_at_k', diff_data.get('hit_at_5', 0.0))):.4f}"
-            r = f"{diff_data.get(f'recall_at_{cutoff_k}', diff_data.get('recall_at_k', diff_data.get('recall_at_5', 0.0))):.4f}"
-            m = f"{diff_data.get(f'mrr_at_{cutoff_k}', diff_data.get('mrr_at_k', diff_data.get('mrr_at_5', 0.0))):.4f}"
-            fe = f"{diff_data.get(f'full_evidence_at_{cutoff_k}', diff_data.get('full_evidence_at_k', diff_data.get('full_evidence_at_5', 0.0))):.4f}"
-            c = diff_data.get("count", 0)
-            md.append(f"| {diff.capitalize()} | {mode.upper()} | {h} | {r} | {m} | {fe} | {c} |")
-
-    md.extend([
-        "\n## 4. Breakdown by Department\n",
-        f"| Department | BM25 Recall@{cutoff_k} | BGE Dense Recall@{cutoff_k} | Hybrid Recall@{cutoff_k} | Hybrid MRR@{cutoff_k} | Hybrid FullEvidence@{cutoff_k} | Answerable Qs |",
-        "|---|:---:|:---:|:---:|:---:|:---:|:---:|",
-    ])
-
-    for d in DEPARTMENTS:
-        bm25_d = eval_results.get("bm25", {}).get("by_department", {}).get(d, {})
-        dense_d = eval_results.get("dense", {}).get("by_department", {}).get(d, {})
-        hybrid_d = eval_results.get("hybrid", {}).get("by_department", {}).get(d, {})
-        b_rec = f"{bm25_d.get(f'recall_at_{cutoff_k}', bm25_d.get('recall_at_k', bm25_d.get('recall_at_5', 0.0))):.4f}"
-        d_rec = f"{dense_d.get(f'recall_at_{cutoff_k}', dense_d.get('recall_at_k', dense_d.get('recall_at_5', 0.0))):.4f}"
-        h_rec = f"{hybrid_d.get(f'recall_at_{cutoff_k}', hybrid_d.get('recall_at_k', hybrid_d.get('recall_at_5', 0.0))):.4f}"
-        h_mrr = f"{hybrid_d.get(f'mrr_at_{cutoff_k}', hybrid_d.get('mrr_at_k', hybrid_d.get('mrr_at_5', 0.0))):.4f}"
-        h_fe = f"{hybrid_d.get(f'full_evidence_at_{cutoff_k}', hybrid_d.get('full_evidence_at_k', hybrid_d.get('full_evidence_at_5', 0.0))):.4f}"
-        cnt = hybrid_d.get("count", 0)
-        md.append(f"| {d} | {b_rec} | {d_rec} | {h_rec} | {h_mrr} | {h_fe} | {cnt} |")
-
-    # Question Type Breakdown
-    md.extend([
-        "\n## 5. Breakdown by Question Type\n",
-        f"| Question Type | Count | BM25 Recall@{cutoff_k} | Dense Recall@{cutoff_k} | Hybrid Recall@{cutoff_k} | Hybrid MRR@{cutoff_k} | Hybrid FullEvidence@{cutoff_k} |",
-        "|---|:---:|:---:|:---:|:---:|:---:|:---:|",
-    ])
-
-    hybrid_qtypes = eval_results.get("hybrid", {}).get("by_question_type", {})
-    for qt in sorted(hybrid_qtypes.keys()):
-        b_qt = eval_results.get("bm25", {}).get("by_question_type", {}).get(qt, {})
-        d_qt = eval_results.get("dense", {}).get("by_question_type", {}).get(qt, {})
-        h_qt = hybrid_qtypes.get(qt, {})
-        cnt = h_qt.get("count", 0)
-        b_rec = f"{b_qt.get(f'recall_at_{cutoff_k}', b_qt.get('recall_at_k', b_qt.get('recall_at_5', 0.0))):.4f}"
-        d_rec = f"{d_qt.get(f'recall_at_{cutoff_k}', d_qt.get('recall_at_k', d_qt.get('recall_at_5', 0.0))):.4f}"
-        h_rec = f"{h_qt.get(f'recall_at_{cutoff_k}', h_qt.get('recall_at_k', h_qt.get('recall_at_5', 0.0))):.4f}"
-        h_mrr = f"{h_qt.get(f'mrr_at_{cutoff_k}', h_qt.get('mrr_at_k', h_qt.get('mrr_at_5', 0.0))):.4f}"
-        h_fe = f"{h_qt.get(f'full_evidence_at_{cutoff_k}', h_qt.get('full_evidence_at_k', h_qt.get('full_evidence_at_5', 0.0))):.4f}"
-        md.append(f"| `{qt}` | {cnt} | {b_rec} | {d_rec} | {h_rec} | {h_mrr} | {h_fe} |")
-
-    # Diagnostic question performance
-    md.extend([
-        "\n## 6. Security & Diagnostic Question Analysis\n",
-        f"### A. Role-Restricted Diagnostic Queries ({len(diag_restr)} queries across departments)",
-        "- **Target Scenario**: Requesting role is strictly forbidden from accessing the target policy.",
-    ])
-
-    for q in diag_restr:
-        leaked_modes = [
-            m for m in ("bm25", "dense", "hybrid")
-            if any(
-                d.get("question_id") == q["question_id"] and d.get("leakage_detected")
-                for d in eval_results.get(m, {}).get("diagnostic_results", [])
-            )
-        ]
-        leakage_str = f"Leaked in {leaked_modes}" if leaked_modes else "0 leaks across all modes"
-        md.append(
-            f"- **{q['question_id']}** ({q['department']} - role: `{q['role']}`): \"{q['question']}\" -> Targets: `{q.get('restricted_target_chunk_ids')}` (Leakage: **{leakage_str}**)"
-        )
-
-    md.extend([
-        "\n### B. Unsupported Diagnostic Queries (5 queries, 1 per department)",
-        "- **Target Scenario**: User query asks for non-existent policy conditions or out-of-scope policies.",
-    ])
-
-    for q in diag_unsupp:
-        md.append(
-            f"- **{q['question_id']}** ({q['department']} - role: `{q['role']}`): \"{q['question']}\" -> Reason: {q.get('evidence_reason')}"
-        )
-
-    # Dynamic Analysis of Misses and Differences
-    md.extend([
-        "\n## 7. Misses, Partial Evidence & Sub-Optimal Ranking Analysis\n",
-    ])
-
-    # Check for actual complete misses in any mode
-    total_complete_misses = sum(len(eval_results.get(m, {}).get("misses", [])) for m in ("bm25", "dense", "hybrid"))
-    if total_complete_misses > 0:
-        md.append(f"### Complete Misses (Hit@{cutoff_k} = 0.0)")
-        for mode in ("bm25", "dense", "hybrid"):
-            mode_misses = eval_results.get(mode, {}).get("misses", [])
-            if mode_misses:
-                md.append(f"\n#### Mode: {mode.upper()} ({len(mode_misses)} missed)")
-                for m in mode_misses:
-                    md.append(f"- **{m['question_id']}** ({m['department']} - {m['difficulty']}): \"{m['question']}\"")
-                    md.append(f"  - Role: `{m['role']}` | Date: `{m['query_date']}`")
-                    md.append(f"  - Expected Gold: `{m['expected_gold_chunk_ids']}`")
-                    md.append(f"  - Actual Retrieved: `{m['actual_top_k_chunk_ids']}`")
-    else:
-        hybrid_hit_val = eval_results.get("hybrid", {}).get(f"hit_at_{cutoff_k}", eval_results.get("hybrid", {}).get("hit_at_k", 0.0))
-        all_perfect = all(
-            eval_results.get(m, {}).get(f"hit_at_{cutoff_k}", eval_results.get(m, {}).get("hit_at_k", 0.0)) == 1.0
-            for m in ("bm25", "dense", "hybrid") if m in eval_results
-        )
-        if all_perfect:
-            md.append(f"Across all three retrieval modes, **Hit@{cutoff_k} achieved 1.000** on all {len(ans_q)} answerable questions (every answerable query retrieved at least one gold chunk in its top candidates).\n")
-        else:
-            md.append(f"Across evaluated retrieval modes, Hybrid Hit@{cutoff_k} was {hybrid_hit_val:.4f} on answerable questions.\n")
-
-    # Partial evidence misses
-    hybrid_partial = eval_results.get("hybrid", {}).get("partial_evidence_misses", [])
-    if hybrid_partial:
-        md.append(f"### Hybrid Partial Evidence Misses ({len(hybrid_partial)} questions where 0 < Recall@{cutoff_k} < 1.0)")
-        for pm in hybrid_partial:
-            md.append(f"- **{pm['question_id']}** ({pm['department']} - Recall@{cutoff_k}: {pm['recall']}): \"{pm['question']}\"")
-            md.append(f"  - Expected Gold: `{pm['expected_gold_chunk_ids']}`")
-            md.append(f"  - Retrieved Gold: `{pm['retrieved_gold_ids']}` | Missing: `{pm['missing_gold_ids']}`")
-    else:
-        hybrid_fe_count = eval_results.get("hybrid", {}).get("complete_evidence_count", 0)
-        hybrid_ans_count = eval_results.get("hybrid", {}).get("total_answerable_questions", 0)
-        md.append(f"No partial evidence misses recorded for Hybrid retrieval ({hybrid_fe_count}/{hybrid_ans_count} answerable questions retrieved 100% of gold clauses in top-{cutoff_k}).\n")
-
-    # Dynamic Sub-Optimal Ranking comparisons (BM25 vs Dense trade-offs)
-    md.append("\n### Architectural Case Studies: BM25 vs Dense vs Hybrid Dynamics\n")
-    bm25_sub = {s["question_id"]: s for s in eval_results.get("bm25", {}).get("suboptimal_rankings", [])}
-    dense_sub = {s["question_id"]: s for s in eval_results.get("dense", {}).get("suboptimal_rankings", [])}
-
-    # Case where Dense outperformed BM25
-    dense_better = [qid for qid in bm25_sub if qid not in dense_sub]
-    # Case where BM25 outperformed Dense
-    bm25_better = [qid for qid in dense_sub if qid not in bm25_sub]
-
-    case_count = 0
-    if dense_better:
-        for qid in dense_better[:3]:
-            case_count += 1
-            info = bm25_sub[qid]
-            dense_top = eval_results.get("dense", {}).get("per_question_details", [])
-            dense_q = next((d for d in dense_top if d.get("question_id") == qid), None)
-            dense_cids = dense_q.get("retrieved_chunk_ids", []) if dense_q else []
-            dense_rank = next((idx for idx, c in enumerate(dense_cids, start=1) if c in info['expected_gold_chunk_ids']), 1)
-            md.extend([
-                f"#### Case {case_count}: Question {qid} (Dense Rank {dense_rank} vs BM25 Rank {info['first_gold_rank']})",
-                f"- **Question**: \"{info['question']}\"",
-                f"- **Department**: {info['department']} | **Role**: `{info['role']}` | **Date**: `{info['query_date']}`",
-                f"- **Expected Gold**: `{info['expected_gold_chunk_ids']}`",
-                f"- **BM25 Top-{cutoff_k}**: `{info['actual_top_k_chunk_ids']}`",
-                f"- **Dense Top-{cutoff_k}**: `{dense_cids}`",
-                f"- **Observed Dynamics**: Dense semantic retrieval ranked gold chunk at position {dense_rank}, whereas BM25 placed it at rank {info['first_gold_rank']}.",
-                "",
-            ])
-
-    if bm25_better:
-        for qid in bm25_better[:3]:
-            case_count += 1
-            info = dense_sub[qid]
-            bm25_top = eval_results.get("bm25", {}).get("per_question_details", [])
-            bm25_q = next((d for d in bm25_top if d.get("question_id") == qid), None)
-            bm25_cids = bm25_q.get("retrieved_chunk_ids", []) if bm25_q else []
-            bm25_rank = next((idx for idx, c in enumerate(bm25_cids, start=1) if c in info['expected_gold_chunk_ids']), 1)
-            md.extend([
-                f"#### Case {case_count}: Question {qid} (BM25 Rank {bm25_rank} vs Dense Rank {info['first_gold_rank']})",
-                f"- **Question**: \"{info['question']}\"",
-                f"- **Department**: {info['department']} | **Role**: `{info['role']}` | **Date**: `{info['query_date']}`",
-                f"- **Expected Gold**: `{info['expected_gold_chunk_ids']}`",
-                f"- **BM25 Top-{cutoff_k}**: `{bm25_cids}`",
-                f"- **Dense Top-{cutoff_k}**: `{info['actual_top_k_chunk_ids']}`",
-                f"- **Observed Dynamics**: BM25 lexical retrieval placed gold chunk at position {bm25_rank}, whereas Dense semantic retrieval placed it at rank {info['first_gold_rank']}.",
-                "",
-            ])
-
-    md.extend([
-        "## 8. Method Trade-Offs & Architectural Findings\n",
-        "1. **BM25 Lexical Retrieval**:",
-        "   - Excels at exact numeric thresholds, statutory identifiers, and distinct policy terminology.",
-        "   - Vulnerable to vocabulary mismatch and synonym-rich natural language questions.",
-        "",
-        "2. **BGE Dense Retrieval**:",
-        "   - Excels at conversational paraphrasing and conceptual policy searches.",
-        "   - Occasionally shows rank displacement when two adjacent clauses in the same document discuss related topics.",
-        "",
-        "3. **Hybrid RRF Fusion**:",
-        "   - Combines the reciprocal rank positions of candidates from both lexical and dense pools ($k=60$).",
-        "   - Retains exact keyword sensitivity without losing conversational synonym recall.",
-        "",
-        "## 9. Qdrant Integration Status\n",
-        "- **In-Memory Qdrant**: 100% verified offline with deterministic UUIDv5 point IDs, 15 canonical chunk payload fields, and server-side filtering.",
-        "- **Live Qdrant Cloud**: Blocked if cluster endpoint is unset or configured with marketing URL (`https://qdrant.io`). Offline implementation and local dense backend ensure full operational capability.",
-    ])
-
-    return "\n".join(md)
+def validate_question_dataset(dataset, base_dir=None):
+    """Check question references against the corpus without prescribing a distribution."""
+    data = json.loads(Path(dataset).read_text(encoding="utf-8")) if isinstance(dataset, (str, Path)) else dataset
+    if not isinstance(data, dict) or data.get("schema_version") not in ("1.0", "2.0"):
+        raise ValueError("Expected question schema 1.0 or 2.0.")
+    questions = data.get("questions")
+    if not isinstance(questions, list) or not questions:
+        raise ValueError("Expected a non-empty questions list.")
+    snapshot = get_corpus_snapshot(base_dir)
+    if data.get("corpus_fingerprint") != snapshot.fingerprint:
+        raise ValueError("Question-set corpus fingerprint mismatch.")
+    chunks = {c["chunk_id"]: c for c in snapshot.chunks}
+    seen = set()
+    for q in questions:
+        if not isinstance(q, dict):
+            raise ValueError("Questions must be objects.")
+        for field in ("question_id", "question", "role", "query_date"):
+            if not isinstance(q.get(field), str) or not q[field].strip():
+                raise ValueError(f"Missing required field: {field}.")
+        if q["question_id"] in seen:
+            raise ValueError("Duplicate question ID.")
+        seen.add(q["question_id"])
+        if q["role"] not in ALLOWED_ROLES_SET or not isinstance(q.get("answerability"), bool):
+            raise ValueError("Invalid role or answerability.")
+        if q.get("difficulty") not in ("easy", "medium", "hard"):
+            raise ValueError("Invalid difficulty.")
+        if q.get("department") not in (*DEPARTMENTS, "Cross-policy"):
+            raise ValueError("Invalid department.")
+        if not isinstance(q.get("question_type"), str) or not q["question_type"].strip():
+            raise ValueError("Missing question type.")
+        date = parse_query_date(q["query_date"])
+        gold = q.get("gold_chunk_ids", [])
+        evidence = q.get("gold_evidence", [])
+        if (not isinstance(gold, list) or not all(isinstance(cid, str) for cid in gold)
+                or not isinstance(evidence, list) or not all(isinstance(e, dict) for e in evidence)
+                or len(gold) != len(set(gold))):
+            raise ValueError("Malformed gold evidence.")
+        if q["answerability"]:
+            if not 1 <= len(gold) <= 4 or {e.get("chunk_id") for e in evidence} != set(gold):
+                raise ValueError("Answerable questions need complete evidence within four chunks.")
+            for cid in gold:
+                if cid not in chunks or not is_chunk_eligible(chunks[cid], q["role"], date):
+                    raise ValueError("Gold evidence is not authorized and active.")
+            for e in evidence:
+                quote = e.get("quote", "")
+                if not isinstance(quote, str) or not quote.strip() or " ".join(quote.split()) not in " ".join(chunks[e["chunk_id"]]["text"].split()):
+                    raise ValueError("Gold quote does not match its source.")
+        elif gold or evidence:
+            raise ValueError("Refusal questions must not include answer evidence.")
+        restricted = q.get("restricted_target_chunk_ids", [])
+        if not isinstance(restricted, list) or not all(isinstance(cid, str) for cid in restricted):
+            raise ValueError("Malformed restricted targets.")
+        if q["answerability"] and restricted:
+            raise ValueError("Answerable questions cannot have restricted targets.")
+        for cid in restricted:
+            if cid not in chunks or q["role"] in chunks[cid]["allowed_roles"]:
+                raise ValueError("Restricted target is not a valid permission diagnostic.")
+        if data["schema_version"] == "2.0":
+            validate_expected_result(q, chunks)
+    return {"status": "valid", "total_questions": len(questions)}
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    """CLI entrypoint for running dataset validation and development retrieval evaluation."""
-    parser = argparse.ArgumentParser(description="RuleLens Retrieval Evaluation CLI")
-    subparsers = parser.add_subparsers(dest="command", help="Subcommand to run")
-
-    # Subcommand: validate
-    val_parser = subparsers.add_parser("validate", help="Validate evaluation dataset without loading embedding model")
-    val_parser.add_argument(
-        "--questions",
-        "-q",
-        default="data/evaluation/dev_questions.json",
-        help="Path to evaluation questions JSON file (default: data/evaluation/dev_questions.json)",
-    )
-
-    # Subcommand: run
-    run_parser = subparsers.add_parser("run", help="Run development retrieval evaluation across BM25, Dense, and Hybrid")
-    run_parser.add_argument(
-        "--questions",
-        "-q",
-        default="data/evaluation/dev_questions.json",
-        help="Path to evaluation questions JSON file (default: data/evaluation/dev_questions.json)",
-    )
-    run_parser.add_argument(
-        "--backend",
-        "-b",
-        choices=["local", "qdrant"],
-        default="local",
-        help="Dense retrieval backend: 'local' (default) or 'qdrant'",
-    )
-    run_parser.add_argument(
-        "--top-k",
-        "-k",
-        type=int,
-        default=5,
-        help="Evaluation cutoff depth (default: 5)",
-    )
-
-    args = parser.parse_args(argv)
-
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-
-    base = Path.cwd()
-    questions_path = Path(args.questions)
-    if not questions_path.is_absolute():
-        questions_path = base / questions_path
-
-    if args.command == "validate":
-        print(f"Validating evaluation dataset: {questions_path}...")
-        try:
-            summary = validate_evaluation_dataset(questions_path, base_dir=base)
-            print("=" * 60)
-            print("RuleLens Evaluation Dataset Validation: SUCCESS")
-            print("=" * 60)
-            print(f"Total Questions:         {summary['total_questions']}")
-            print(f"Answerable Questions:    {summary['answerable_count']}")
-            print(f"Restricted Diagnostics:  {summary['restricted_count']}")
-            print(f"Unsupported Diagnostics: {summary['unsupported_count']}")
-            print(f"Multi-Clause Questions:  {summary['multi_clause_count']}")
-            print(f"Departments:             {summary['department_counts']}")
-            print(f"Difficulties:            {summary['difficulty_counts']}")
-            print(f"Corpus Fingerprint:      {summary['corpus_fingerprint']}")
-            print("Status: All schema, role, date, and corpus constraints verified.")
-            print("=" * 60)
-            sys.exit(0)
-        except Exception as e:
-            print(f"Dataset Validation FAILED: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    elif args.command == "run":
-        print(f"Validating dataset {questions_path} prior to evaluation...")
-        try:
-            val_summary = validate_evaluation_dataset(questions_path, base_dir=base)
-            print(f"Validation passed: {val_summary['total_questions']} questions verified.")
-        except Exception as e:
-            print(f"Dataset Validation FAILED: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        with open(questions_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        questions = data["questions"]
-
-        print("Initializing BGEEmbedder and HybridRetriever...")
-        embedder = BGEEmbedder()
-        retriever = HybridRetriever(base_dir=base, embedder=embedder)
-
-        print("Pre-computing 64-chunk dense embeddings...")
-        retriever.get_dense_embeddings()
-
-        qdrant_client = None
-        if args.backend == "qdrant":
-            from rulelens.qdrant_store import get_qdrant_client
-
-            qdrant_client = get_qdrant_client()
-
-        eval_results: Dict[str, Dict[str, Any]] = {}
-        for mode in ("bm25", "dense", "hybrid"):
-            print(f"Evaluating mode: '{mode}' (backend: {args.backend}, top_k: {args.top_k})...")
-            res = evaluate_retriever_method(
-                retriever=retriever,
-                questions=questions,
-                mode=mode,
-                top_k=args.top_k,
-                dense_backend=args.backend,
-                qdrant_client=qdrant_client,
-                warmup=True,
-            )
-            eval_results[mode] = res
-            print(
-                f"  [{mode.upper()}] Recall@{args.top_k}: {res.get(f'recall_at_{args.top_k}', res.get('recall_at_k', res.get('recall_at_5', 0.0))):.4f} | "
-                f"Hit@{args.top_k}: {res.get(f'hit_at_{args.top_k}', res.get('hit_at_k', res.get('hit_at_5', 0.0))):.4f} | "
-                f"MRR@{args.top_k}: {res.get(f'mrr_at_{args.top_k}', res.get('mrr_at_k', res.get('mrr_at_5', 0.0))):.4f} | "
-                f"Median Lat: {res['median_latency_ms']:.2f}ms"
-            )
-
-        # Output results
-        local_eval_dir = base / "local_eval"
-        local_eval_dir.mkdir(exist_ok=True)
-
-        metadata = {
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "total_questions": len(questions),
-            "dense_backend": args.backend,
-            "embedding_model": "BAAI/bge-small-en-v1.5",
-            "top_k": args.top_k,
-        }
-
-        results_out = local_eval_dir / "development_results.json"
-        with open(results_out, "w", encoding="utf-8") as f:
-            json.dump({"metadata": metadata, "results_by_mode": eval_results}, f, indent=2)
-        print(f"Saved evaluation results to {results_out}")
-
-        summary_out = local_eval_dir / "development_summary.md"
-        summary_md = generate_summary_markdown(eval_results, questions, metadata=metadata)
-        with open(summary_out, "w", encoding="utf-8") as f:
-            f.write(summary_md)
-        print(f"Saved evaluation summary to {summary_out}")
-
-
-if __name__ == "__main__":
-    main()
+def validate_expected_result(question, chunks):
+    """Check structured gold references; semantic entailment still needs source review."""
+    expected = question.get("expected")
+    if not isinstance(expected, dict):
+        raise ValueError("Missing expected result.")
+    status, route = expected.get("status"), expected.get("route")
+    routes = {"answered": {"rule", "generated_verified"},
+              "restricted": {"refusal"}, "insufficient": {"refusal", "clarification"}}
+    if status not in routes or route not in routes[status]:
+        raise ValueError("Invalid expected status or route.")
+    if question["answerability"] != (status == "answered"):
+        raise ValueError("Expected status conflicts with answerability.")
+    if (status == "restricted") != bool(question.get("restricted_target_chunk_ids")):
+        raise ValueError("Expected restriction conflicts with target evidence.")
+    if route == "clarification" and not expected.get("clarification"):
+        raise ValueError("Expected clarification needs a question.")
+    if not isinstance(expected.get("reason_code"), str) or not expected["reason_code"].strip():
+        raise ValueError("Missing expected reason code.")
+    evidence = question["gold_evidence"]
+    fact_ids = [e.get("fact_id") for e in evidence]
+    required = expected.get("required_fact_ids")
+    if (not all(isinstance(fid, str) and fid for fid in fact_ids)
+            or not isinstance(required, list) or not all(isinstance(fid, str) and fid for fid in required)
+            or len(required) != len(set(required)) or len(fact_ids) != len(set(fact_ids))
+            or set(required) != set(fact_ids)):
+        raise ValueError("Expected facts do not match gold evidence.")
+    for fact in evidence:
+        if (not isinstance(fact.get("target"), str) or not fact["target"].strip()
+                or not isinstance(fact.get("slots"), dict) or "value" not in fact
+                or not isinstance(fact.get("unit"), str)
+                or not isinstance(fact.get("prerequisites"), list)
+                or not all(isinstance(p, str) and p for p in fact["prerequisites"])
+                or fact.get("content_hash") != chunks[fact["chunk_id"]]["content_hash"]):
+            raise ValueError("Malformed expected fact or source hash mismatch.")

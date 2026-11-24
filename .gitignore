@@ -71,9 +71,11 @@ tmp/
 temp/
 outputs/
 
-# Private documents, guidebooks, and plans
-RuleLens_Implementation_Guidebook*.pdf
+# Local workspace files
+/*.pdf
+/internal/
 
 # Local evaluation files and private notes
 /local_eval/
-local_eval/
+
+/.pytest_tmp/

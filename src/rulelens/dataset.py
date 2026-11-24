@@ -93,10 +93,7 @@ class PolicyDocument:
     clauses: Tuple[Clause, ...]
 
 
-# ---------------------------------------------------------------------------
 # Central Dataset Specification
-# ---------------------------------------------------------------------------
-
 DOCUMENTS: Tuple[PolicyDocument, ...] = (
     # --- Travel Department ---
     PolicyDocument(
@@ -1103,10 +1100,7 @@ OUTCOME_TEXT_SUPPORT: Dict[str, Tuple[str, ...]] = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Deterministic PDF Canvas & Generation
-# ---------------------------------------------------------------------------
-
 class DeterministicNumberedCanvas(canvas.Canvas):
     """Two-pass canvas for deterministic PDF creation with exact page numbering."""
 
@@ -1240,10 +1234,7 @@ def generate_pdf(doc: PolicyDocument, output_file: Path) -> None:
     pdf_doc.build(story, canvasmaker=DeterministicNumberedCanvas)
 
 
-# ---------------------------------------------------------------------------
 # Structured CSV Rules Generation
-# ---------------------------------------------------------------------------
-
 def generate_csv_rules(rules: Sequence[Rule], output_file: Path) -> None:
     """Write rules to CSV with deterministic line endings and strict field order."""
     with open(output_file, mode="w", newline="\n", encoding="utf-8") as f:
@@ -1253,10 +1244,7 @@ def generate_csv_rules(rules: Sequence[Rule], output_file: Path) -> None:
             writer.writerow(asdict(rule))
 
 
-# ---------------------------------------------------------------------------
 # Roles Specification & Generation
-# ---------------------------------------------------------------------------
-
 def build_roles_data() -> Dict[str, Any]:
     """Generate the 6 demo roles and their explicit document permissions."""
     role_descriptions = {
@@ -1288,10 +1276,7 @@ def build_roles_data() -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
 # Manifest Generation
-# ---------------------------------------------------------------------------
-
 def build_manifest_data() -> Dict[str, Any]:
     """Generate manifest recording document inventory, versions, roles, and rules."""
     doc_entries = []
@@ -1319,10 +1304,7 @@ def build_manifest_data() -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
 # Dataset Generator & Validator
-# ---------------------------------------------------------------------------
-
 def generate_dataset(root_dir: Path | str | None = None) -> Dict[str, str]:
     """Deterministically generate all 20 PDFs, 5 CSV tables, roles.json, and manifest.json.
 
@@ -1641,10 +1623,7 @@ def validate_dataset(root_dir: Path | str | None = None) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
 # CLI Command Entrypoint
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     """CLI interface for dataset generation and validation."""
     import sys

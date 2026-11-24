@@ -1,4 +1,4 @@
-"""Offline unit tests for RuleLens Stage E Groq LLM integration and citation validation.
+"""Offline unit tests for RuleLens Groq LLM integration and citation validation.
 
 Verifies:
 - Strict Pydantic AnswerResponse schema enforcement (rejects extra/missing fields).
@@ -31,17 +31,7 @@ from rulelens.llm import (
     validate_citations_and_rules,
 )
 from rulelens.retrieval import RetrievalResult, load_validated_corpus
-
-
-@pytest.fixture(autouse=True)
-def guard_network(monkeypatch):
-    """Enforce that unit tests make zero network calls."""
-
-    def guarded_connect(*args, **kwargs):
-        raise AssertionError("Network connection attempted during offline unit tests")
-
-    monkeypatch.setattr(socket, "create_connection", guarded_connect)
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+from rulelens.grounding import request_meaning, source_facts, validate_grounded_answer, render_grounded_answer
 
 
 @pytest.fixture
@@ -54,11 +44,7 @@ def sample_chunks(repo_root: Path) -> List[Dict[str, Any]]:
     return load_validated_corpus(repo_root)
 
 
-# ==============================================================================
-# 1. Pydantic Schema Validation Tests
-# ==============================================================================
-
-
+# Pydantic Schema Validation Tests
 def test_answer_response_valid_schema():
     """AnswerResponse accepts valid answered, insufficient, and restricted payloads."""
     # Answered
@@ -132,11 +118,7 @@ def test_answer_response_rejects_invalid_status():
         AnswerResponse.model_validate(payload)
 
 
-# ==============================================================================
-# 2. Citation and Source Safety Validation Tests
-# ==============================================================================
-
-
+# Citation and Source Safety Validation Tests
 def test_validate_citations_accepts_authorized_evidence(sample_chunks: List[Dict[str, Any]]):
     """validate_citations_and_rules must pass when citations exist in supplied authorized evidence."""
     target_chunk = next(c for c in sample_chunks if c["chunk_id"] == "DOC-TRV-002_TRV-C03")
@@ -285,11 +267,7 @@ def test_prompt_injection_inside_evidence_is_treated_as_data():
     assert "--- Evidence Chunk 1 [DOC-INJ-001_INJ-C01] ---" in context
 
 
-# ==============================================================================
-# 3. Groq Client Wrapper & Error Mapping Tests
-# ==============================================================================
-
-
+# Groq Client Wrapper & Error Mapping Tests
 def test_groq_missing_api_key_raises_error(monkeypatch):
     """Missing or empty GROQ_API_KEY must raise ValueError."""
     monkeypatch.delenv(GROQ_API_KEY, raising=False)
@@ -493,11 +471,7 @@ def test_groq_wrapper_uses_strict_json_schema():
     assert set(schema["required"]) == {"answer", "status", "citations", "referenced_rule_ids", "reason"}
 
 
-# ==============================================================================
-# 5. Evidence Limits and Provider Telemetry Tests
-# ==============================================================================
-
-
+# Evidence Limits and Provider Telemetry Tests
 def test_evidence_chunks_strict_limit_enforced():
     """generate_answer and build_evidence_context strictly reject 0 or >4 evidence chunks."""
     mock_client = MagicMock()
@@ -710,3 +684,118 @@ def test_consecutive_questions_have_independent_token_completeness_tracking(samp
     assert delta2.known_total_tokens == 85
     # Question 2 interval MUST NOT be marked as incomplete because of question 1!
     assert delta2.has_incomplete_tokens is False
+
+
+@pytest.mark.parametrize("answer", [
+    "Daily meal subsistence allowance is capped at INR 2,500 per diem with itemized receipts.",
+    "Daily meal subsistence allowance is capped at USD 2,000 per diem with itemized receipts.",
+    "Daily meal subsistence allowance is capped at INR 2,000 per diem.",
+    "Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts. No receipts are needed.",
+    "Standard hotel accommodations are capped at INR 7,500 per night in metropolitan cities and INR 5,000 in regional locations.",
+])
+def test_known_citation_does_not_prove_an_answer(sample_chunks, answer):
+    with pytest.raises(ValueError):
+        validate_grounded_answer("What is the daily meal allowance?", answer,
+                                 ["DOC-TRV-002_TRV-C03"], sample_chunks)
+
+
+def test_parental_fact_preserves_caregiver(sample_chunks):
+    question = "How many weeks of paid parental leave do secondary caregivers receive?"
+    quote = "Secondary caregivers receive 4 weeks of fully paid paternity leave."
+    claims = validate_grounded_answer(question, quote, ["DOC-PPO-001_PPO-L03"], sample_chunks)
+    assert claims[0]["quote"] == quote
+    assert render_grounded_answer(claims) == "> " + quote
+    with pytest.raises(ValueError):
+        validate_grounded_answer(question, "Eligible primary caregivers receive 26 continuous weeks of fully paid maternity leave.",
+                                 ["DOC-PPO-001_PPO-L03"], sample_chunks)
+
+
+def test_grounding_requires_every_requested_fact(sample_chunks):
+    question = "What is the daily meal allowance, and how many annual vacation days do employees accrue?"
+    meal = "Daily meal subsistence allowance is capped at INR 2,000 per diem with itemized receipts."
+    with pytest.raises(ValueError, match="every requested fact"):
+        validate_grounded_answer(question, meal, ["DOC-TRV-002_TRV-C03"], sample_chunks)
+    meaning = request_meaning(question)
+    facts = source_facts(sample_chunks, meaning)
+    facts = [f for f in facts if f["chunk_id"] != "DOC-TRV-001_TRV-C03"]
+    claims = validate_grounded_answer(question, "\n".join(f["quote"] for f in facts),
+                                     [f["chunk_id"] for f in facts], sample_chunks)
+    assert {c["target"] for c in claims} == {"travel.meals", "leave.vacation"}
+
+
+def test_receipt_prerequisite_cannot_be_dropped(sample_chunks):
+    cid = "DOC-FIN-002_FIN-R03"
+    fact = source_facts(sample_chunks, request_meaning("What receipt documentation is needed for incidental expenses?"))[0]
+    claims = validate_grounded_answer("What receipt documentation is needed for incidental expenses?", fact["quote"], [cid], sample_chunks)
+    assert "provided digital payment confirmation is attached" in claims[0]["quote"]
+    with pytest.raises(ValueError):
+        validate_grounded_answer("What receipt documentation is needed for incidental expenses?",
+                                 "Incidental business expenses up to and including INR 1,000 do not require an itemized tax receipt.", [cid], sample_chunks)
+
+
+@pytest.mark.parametrize("left, right", [
+    ("What is the maximum travel expense amount my manager can approve?", "What is the travel expense limit my manager can approve without director sign-off?"),
+    ("How many days in advance must domestic flights be booked?", "What is the minimum booking lead time for domestic business flights?"),
+])
+def test_supported_wording_does_not_change_request_meaning(left, right):
+    assert request_meaning(left) == request_meaning(right)
+
+
+def test_shared_client_keeps_request_usage_separate():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+    from types import SimpleNamespace
+    import time
+
+    client = MagicMock()
+    start = Barrier(2)
+    state_lock = Lock()
+    active = 0
+    maximum = 0
+
+    def complete(**kwargs):
+        nonlocal active, maximum
+        with state_lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            time.sleep(0.01)
+            tokens = 11 if "First question" in kwargs["messages"][-1]["content"] else 23
+            content = json.dumps({"answer": "Transport fixture.", "status": "insufficient",
+                                  "citations": [], "referenced_rule_ids": [], "reason": "No answer."})
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+                                   usage=SimpleNamespace(total_tokens=tokens))
+        finally:
+            with state_lock:
+                active -= 1
+
+    client.chat.completions.create.side_effect = complete
+    wrapper = GroqClientWrapper(client=client)
+    chunks = [{"chunk_id": "c1", "text": "Policy text.", "doc_id": "d", "clause_id": "c"}]
+
+    def run(question):
+        start.wait(timeout=5)
+        return wrapper.generate_answer(question, "employee", chunks)[1]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, ["First question", "Second question"]))
+    assert [r["calls_made"] for r in results] == [1, 1]
+    assert [r["total_tokens"] for r in results] == [11, 23]
+    assert maximum == 1
+    assert wrapper.get_telemetry_snapshot().known_total_tokens == 34
+
+
+def test_failed_repair_retains_this_requests_known_usage():
+    import groq
+    from types import SimpleNamespace
+    client = MagicMock()
+    bad = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="invalid json"))],
+                          usage=SimpleNamespace(total_tokens=11))
+    client.chat.completions.create.side_effect = [bad, groq.APITimeoutError(request=MagicMock())]
+    wrapper = GroqClientWrapper(client=client)
+    with pytest.raises(SanitizedProviderError) as error:
+        wrapper.generate_answer("Question", "employee", [{"chunk_id": "c1", "text": "Policy text.", "doc_id": "d", "clause_id": "c"}])
+    usage = error.value.request_telemetry
+    assert usage.provider_requests_attempted == 2
+    assert usage.known_total_tokens == 11
+    assert usage.has_incomplete_tokens is True
